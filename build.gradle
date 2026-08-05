@@ -19,6 +19,10 @@ java {
     }
 }
 
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
+}
+
 ext {
     commonsCodecVersion = '1.22.0'
     junitVersion = '5.12.2'
@@ -181,6 +185,7 @@ def configureNativeAccess = { task ->
     // FFM downcalls are a restricted operation; without this the JVM prints a
     // warning on every run that would otherwise look like a harness failure.
     task.jvmArgs '--enable-native-access=ALL-UNNAMED'
+    task.jvmArgs '--add-modules=jdk.incubator.vector'
 }
 
 test {

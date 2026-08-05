@@ -194,7 +194,10 @@ A focused 8 MiB run (1 fork, 3 warmup and 3 measurement iterations) measured
 streaming updates: 1.23–1.24× Commons Codec on this machine. This is the scalar
 baseline, not the end state. The next CPU milestone is a Vector API
 `hash_many` kernel over independent 1 KiB chunks, followed by batched parent
-compression and wider streaming buffering.
+compression and wider streaming buffering. The first array-based Vector API
+experiment is retained behind `-Dfastblake.experimental.vector=true` but is
+disabled by default because measurement showed a severe regression. See
+`reference/performance/experiments.md` for the results and follow-up design.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

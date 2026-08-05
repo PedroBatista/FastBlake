@@ -67,7 +67,11 @@ public final class BenchmarkRunner {
         System.out.println("Benchmarking: " + String.join(", ", selected));
         System.out.println();
 
-        ChainedOptionsBuilder builder = new OptionsBuilder().parent(cmdLine);
+        ChainedOptionsBuilder builder = new OptionsBuilder()
+                .parent(cmdLine)
+                // JMH forks a new JVM, and incubator modules are not inherited
+                // reliably from the Gradle JavaExec process.
+                .jvmArgsAppend("--add-modules=jdk.incubator.vector");
         if (!cmdLine.getParameter("impl").hasValue()) {
             builder.param("impl", selected.toArray(String[]::new));
         }

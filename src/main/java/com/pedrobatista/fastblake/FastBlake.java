@@ -14,6 +14,12 @@ import java.util.Objects;
  */
 public final class FastBlake {
 
+    // E002 is retained for controlled follow-up experiments, but its
+    // array-based vector state is substantially slower than scalar code. Never
+    // enable an experimental kernel by default before the ledger shows a win.
+    private static final boolean USE_EXPERIMENTAL_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.vector");
+
     private static final int OUT_LEN = 32;
     private static final int KEY_LEN = 32;
     private static final int BLOCK_LEN = 64;
@@ -54,6 +60,10 @@ public final class FastBlake {
     private final int[] scratchState = new int[16];
     private final int[] scratchWords = new int[16];
     private final int[] scratchCv = new int[8];
+    private final int[] vectorPacked = USE_EXPERIMENTAL_VECTOR
+            ? new int[Blake3Vector.packedWordsLength()] : null;
+    private final int[] vectorCvs = USE_EXPERIMENTAL_VECTOR
+            ? new int[Blake3Vector.outputLength()] : null;
 
     private int chunkLength;
     private long chunksCompressed;
@@ -125,6 +135,21 @@ public final class FastBlake {
                 chunksCompressed++;
                 pushChunkCv(scratchCv, chunksCompressed);
                 chunkLength = 0;
+            }
+
+            if (USE_EXPERIMENTAL_VECTOR && chunkLength == 0
+                    && remaining > Blake3Vector.lanes() * CHUNK_LEN) {
+                int vectorBytes = Blake3Vector.lanes() * CHUNK_LEN;
+                Blake3Vector.hashChunks(input, position, chunksCompressed, key,
+                        modeFlags, vectorPacked, vectorCvs);
+                for (int lane = 0; lane < Blake3Vector.lanes(); lane++) {
+                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    chunksCompressed++;
+                    pushChunkCv(scratchCv, chunksCompressed);
+                }
+                position += vectorBytes;
+                remaining -= vectorBytes;
+                continue;
             }
 
             int take = Math.min(remaining, CHUNK_LEN - chunkLength);

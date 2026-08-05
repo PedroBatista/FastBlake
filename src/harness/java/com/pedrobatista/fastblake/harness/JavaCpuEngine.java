@@ -32,7 +32,7 @@ final class JavaCpuEngine implements Blake3Engine {
 
     @Override
     public String displayName() {
-        return "FastBlake CPU (Java, scalar)";
+        return "FastBlake CPU (Java scalar; experimental Vector API available)";
     }
 
     @Override
