@@ -34,5 +34,8 @@ Thumbs.db
 # Maven
 target/
 
+# Rust contender build output (the crate itself is tracked)
+native/**/target/
+
 # Ignore generated files
 out/

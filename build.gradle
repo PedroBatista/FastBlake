@@ -1,3 +1,7 @@
+import org.gradle.process.ExecOperations
+
+import javax.inject.Inject
+
 plugins {
     id 'java'
 }
@@ -9,10 +13,203 @@ repositories {
     mavenCentral()
 }
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+ext {
+    commonsCodecVersion = '1.22.0'
+    junitVersion = '5.12.2'
+    jmhVersion = '1.37'
+}
+
+// ---------------------------------------------------------------------------
+// Source layout
+//
+//   src/main     the implementations under development (Java CPU, later GPU)
+//   src/harness  contender adapters + official test vectors, shared by both
+//                consumers below so tests and benchmarks measure the same code
+//   src/test     conformance, run over every available contender
+//   src/jmh      benchmarks, run over every available contender
+//
+// Only `main` ships. Commons Codec, JMH and the harness never reach the jar.
+// ---------------------------------------------------------------------------
+sourceSets {
+    harness {
+        java.srcDirs = ['src/harness/java']
+        resources.srcDirs = ['src/harness/resources']
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+    test {
+        compileClasspath += sourceSets.harness.output
+        runtimeClasspath += sourceSets.harness.output
+    }
+    jmh {
+        java.srcDirs = ['src/jmh/java']
+        compileClasspath += sourceSets.main.output + sourceSets.harness.output
+        runtimeClasspath += sourceSets.main.output + sourceSets.harness.output
+    }
+}
+
+configurations {
+    testImplementation.extendsFrom harnessImplementation
+    jmhImplementation.extendsFrom harnessImplementation
+}
+
 dependencies {
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    // Apache Commons Codec is a contender and the correctness oracle. It is a
+    // harness dependency only -- `main` has no dependencies and never will.
+    harnessImplementation "commons-codec:commons-codec:${commonsCodecVersion}"
+
+    testImplementation "org.junit.jupiter:junit-jupiter:${junitVersion}"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    jmhImplementation "org.openjdk.jmh:jmh-core:${jmhVersion}"
+    jmhAnnotationProcessor "org.openjdk.jmh:jmh-generator-annprocess:${jmhVersion}"
+}
+
+// ---------------------------------------------------------------------------
+// Rust contender (optional)
+//
+// The reference Rust implementation is compiled to a cdylib and called through
+// the FFM API, so it is measured in-process on the same buffers as the Java
+// contenders. This is strictly best-effort: no Rust toolchain, a broken crate
+// build, or an unsupported platform must all leave `build`, `test` and `jmh`
+// fully working, with the Rust contender simply reported as unavailable.
+// ---------------------------------------------------------------------------
+interface InjectedExec {
+    @Inject
+    ExecOperations getExecOps()
+}
+
+// Gradle's daemon often has a narrower PATH than an interactive shell, so look
+// in the usual toolchain locations too before declaring cargo missing.
+def cargoExecutable = {
+    def dirs = []
+    def envPath = System.getenv('PATH')
+    if (envPath) {
+        dirs.addAll(envPath.split(File.pathSeparator).findAll { it }.collect { new File(it) })
+    }
+    dirs << new File(System.getProperty('user.home'), '.cargo/bin')
+    dirs << new File('/opt/homebrew/bin')
+    dirs << new File('/usr/local/bin')
+    def exeSuffix = System.getProperty('os.name').toLowerCase().contains('windows') ? '.exe' : ''
+    for (dir in dirs) {
+        def candidate = new File(dir, "cargo${exeSuffix}")
+        if (candidate.isFile() && candidate.canExecute()) {
+            return candidate.absolutePath
+        }
+    }
+    return null
+}()
+
+def nativeLibName = System.mapLibraryName('fastblake_rust')
+def rustProjectDir = layout.projectDirectory.dir('native/rust-blake3')
+def nativeStageDir = layout.buildDirectory.dir('native')
+
+tasks.register('cargoBuild') {
+    group = 'build'
+    description = 'Builds the Rust BLAKE3 contender. Skipped, not failed, when cargo is unavailable.'
+
+    def injected = objects.newInstance(InjectedExec)
+    def rustDir = rustProjectDir.asFile
+    def stageDir = nativeStageDir
+    def cargo = cargoExecutable
+    def libName = nativeLibName
+
+    inputs.files(fileTree(rustDir) {
+        include 'src/**'
+        include 'Cargo.toml'
+        include 'Cargo.lock'
+    }).withPropertyName('rustSources')
+    inputs.property('cargoExecutable', cargo ?: 'absent')
+    outputs.dir(stageDir).withPropertyName('nativeStage')
+
+    doLast {
+        def dest = stageDir.get().asFile
+        dest.mkdirs()
+        def staged = new File(dest, libName)
+        def status = new File(dest, 'rust-status.txt')
+        staged.delete()
+
+        if (cargo == null) {
+            status.text = "unavailable\nNo cargo executable found on PATH or in the usual toolchain " +
+                    "locations. Install Rust (https://rustup.rs) and re-run to enable the Rust contender."
+            logger.lifecycle('cargoBuild: cargo not found -- Rust contender disabled.')
+            return
+        }
+
+        def stdout = new ByteArrayOutputStream()
+        def result = injected.execOps.exec {
+            commandLine cargo, 'build', '--release'
+            workingDir rustDir
+            standardOutput = stdout
+            errorOutput = stdout
+            ignoreExitValue = true
+        }
+
+        if (result.exitValue != 0) {
+            status.text = "unavailable\ncargo build --release failed with exit code ${result.exitValue}. " +
+                    "Run it by hand in ${rustDir} to see why.\n\n${stdout}"
+            logger.lifecycle("cargoBuild: cargo build failed (exit ${result.exitValue}) -- Rust contender disabled.")
+            logger.info(stdout.toString())
+            return
+        }
+
+        def built = new File(rustDir, "target/release/${libName}")
+        if (!built.isFile()) {
+            status.text = "unavailable\ncargo build succeeded but ${built} was not produced. " +
+                    "Is the crate-type still cdylib for this platform?"
+            logger.lifecycle('cargoBuild: no shared library produced -- Rust contender disabled.')
+            return
+        }
+
+        staged.bytes = built.bytes
+        status.text = "available\n${built}"
+        logger.lifecycle("cargoBuild: staged ${libName} -- Rust contender enabled.")
+    }
+}
+
+// Both consumers need the staged library (or the status file explaining its
+// absence) before they run.
+def configureNativeAccess = { task ->
+    task.dependsOn tasks.named('cargoBuild')
+    task.systemProperty 'fastblake.native.dir', nativeStageDir.get().asFile.absolutePath
+    // FFM downcalls are a restricted operation; without this the JVM prints a
+    // warning on every run that would otherwise look like a harness failure.
+    task.jvmArgs '--enable-native-access=ALL-UNNAMED'
 }
 
 test {
     useJUnitPlatform()
+    configureNativeAccess(it)
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
+// ./gradlew jmh                                     -> every available contender
+// ./gradlew jmh -P'jmh.args=oneShot -p size=1024'   -> raw JMH args
+// ./gradlew jmh -P'jmh.args=-p impl=rust,commons'   -> pick contenders explicitly
+tasks.register('jmh', JavaExec) {
+    group = 'verification'
+    description = 'Runs the BLAKE3 benchmarks across every available contender.'
+    dependsOn tasks.named('jmhClasses')
+    mainClass = 'com.pedrobatista.fastblake.bench.BenchmarkRunner'
+    classpath = sourceSets.jmh.runtimeClasspath
+    configureNativeAccess(it)
+    def rawArgs = (project.findProperty('jmh.args') ?: '').toString().trim()
+    args = rawArgs.isEmpty() ? [] : rawArgs.split('\\s+').toList()
+}
+
+// Reports which contenders this machine can actually run, and why any are out.
+tasks.register('contenders', JavaExec) {
+    group = 'verification'
+    description = 'Prints the availability of every BLAKE3 contender on this machine.'
+    mainClass = 'com.pedrobatista.fastblake.harness.Contenders'
+    classpath = sourceSets.harness.runtimeClasspath
+    configureNativeAccess(it)
 }

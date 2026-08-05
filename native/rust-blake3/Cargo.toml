@@ -1,0 +1,23 @@
+[package]
+name = "fastblake_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Thin C ABI over the reference Rust BLAKE3, used as FastBlake's performance ceiling."
+
+[lib]
+name = "fastblake_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The reference implementation. Default features give runtime SIMD dispatch
+# (SSE2/SSE4.1/AVX2/AVX-512 on x86, NEON on aarch64) but keep hashing
+# single-threaded -- the `rayon` feature is deliberately NOT enabled, so this
+# measures one core against one Java thread.
+blake3 = "1.8.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
