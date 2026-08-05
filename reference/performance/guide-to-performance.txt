@@ -401,6 +401,250 @@ COMMON MYTHS TO REJECT
   optimization tool. Local ugliness is justified only by evidence.
 
 
+IMPLEMENTATION SURVEY AND LESSONS
+=================================
+
+Survey date: 2026-08-05. "Fastest" is meaningful only for a CPU, threading
+policy, input shape, API boundary, and measurement protocol. The repositories
+below were studied for algorithms and code shape; their published benchmark
+numbers are not directly comparable with FastBlake's JMH results.
+
+14. Java implementations
+------------------------
+
+Apache Commons Codec Blake3
+  Repository: https://github.com/apache/commons-codec
+  Role here: current scalar Java baseline.
+
+Observed design:
+
+* Straight reference-style incremental tree implementation.
+* Scalar int[16] compression with indexed G calls and Integer.rotateRight.
+* Allocates/copies compression results and tree nodes in several paths.
+* Does not batch independent chunks or parents and has no Vector API kernel.
+* Its measured large-buffer throughput is flat near 540 MiB/s on the current
+  machine. That flat curve is evidence that it never activates data parallelism.
+
+Lesson: Commons proves the portable API and scalar correctness floor, not the
+architecture to copy for maximum throughput. FastBlake must beat it first with
+a lower-allocation scalar core and then decisively with chunk-parallel SIMD.
+
+Bouncy Castle Blake3Digest
+  Repository: https://github.com/bcgit/bc-java
+
+Observed design:
+
+* Scalar compression over reusable int arrays, with a general incremental API.
+* Directly processes complete input blocks and buffers only the remainder.
+* Reuses compression scratch better than allocation-heavy reference ports, but
+  clones chaining values for its object stack and has no chunk-parallel SIMD.
+* Uses a rotating message-index schedule rather than dedicated wide kernels.
+
+Lesson: direct full-block consumption plus bounded remainder buffering is good;
+the object/CV stack and scalar-only compression are not the target architecture.
+Add Bouncy Castle as an optional scalar contender if a broader Java comparison
+is desired, but do not assume it is faster without running the same JMH harness.
+
+rctcwyvrn/blake3
+  Repository: https://github.com/rctcwyvrn/blake3
+
+Observed design: an explicitly unoptimized Java translation of the Rust
+reference implementation. It is useful as another readable oracle, not as a
+performance model.
+
+melix/blake3 branch cc/vectorized-blake3
+  Repository/branch: https://github.com/melix/blake3/tree/cc/vectorized-blake3
+  Historical OpenJDK discussion:
+  https://mail.openjdk.org/pipermail/panama-dev/2021-March/012718.html
+
+Observed design:
+
+* Uses four 32-bit lanes as the rows of one compression state. This is intra-
+  compression SIMD, not independent chunks across lanes.
+* Diagonalizes by spilling vectors into int arrays and rebuilding them.
+* Builds temporary message arrays, permuted arrays, state arrays, Vector arrays,
+  ByteBuffers, and output arrays throughout compression.
+* Uses only 128-bit vectors despite defining a preferred species.
+* Does not implement the high-value hash-many chunk/tree strategy.
+
+Lesson: this is evidence that "uses Vector API" is not equivalent to fast. Do
+not inherit its allocation and lane-extraction pattern. Its row-vector approach
+is still worth a clean, allocation-free diagnostic kernel for single blocks,
+parents, and XOF, because .NET demonstrates that such a kernel can be effective
+when the runtime exposes cheap architecture-specific shuffles. It is secondary
+to chunk-parallel SIMD for the 8 MiB workload.
+
+Survey conclusion for Java: no maintained production pure-Java implementation
+was found that combines BLAKE3 subtree scheduling with Vector API hash-many
+kernels. FastBlake's intended design fills that gap. This is a survey result,
+not a proof that no private or obscure implementation exists.
+
+15. Official Rust and C implementation
+--------------------------------------
+
+Repository: https://github.com/BLAKE3-team/BLAKE3
+
+This is the primary optimization model. It contains runtime-selected SSE2,
+SSE4.1, AVX2, AVX-512, NEON, and WASM SIMD implementations, plus optional
+multithreading.
+
+Extracted techniques:
+
+1. hash_many is the critical single-thread optimization. It hashes independent
+   chunks across 4/8/16 lanes and increments counters by lane.
+2. Keep chaining state transposed throughout all 16 blocks of a chunk. Do not
+   transpose state back after every block; the official source calls the avoided
+   cost small but measurable.
+3. Transpose message words in register from contiguous chunk loads. The 4-lane
+   kernels load square groups and apply unpack/transpose networks rather than
+   scalar gathers. Build equivalent VectorShuffle/rearrange candidates.
+4. Maintain a wide frontier of up to the active SIMD degree when walking back
+   up the tree. Batch parent compression instead of immediately collapsing each
+   pair with scalar code.
+5. Recursive subtree hashing splits at the largest power-of-two chunk subtree
+   leaving data on the right. This feeds full SIMD batches and maps naturally to
+   optional left/right joins for multicore execution.
+6. A subtree returns at least its top two CVs. The last parent is deliberately
+   not compressed until finalize, because it may be ROOT and must support XOF.
+7. Incremental update uses lazy merging. Before pushing a new CV, it merges the
+   previous stack top according to popcount(total chunks/bytes), leaving the new
+   right edge unmerged. This permits whole-update subtree parallelism without
+   losing root semantics.
+8. The largest subtree accepted from update must be both a power of two and
+   aligned with count_so_far. Because the size is a power of two, alignment is
+   checked with (subtreeLength - 1) & countSoFar instead of remainder.
+9. Partial chunks use a separate scalar chunk-state path. SIMD code receives
+   full independent work; tails do not complicate its hot loop.
+10. Parent batching handles an odd leftover CV by forwarding it unchanged.
+11. Platform dispatch happens outside compression rounds. The implementation
+    exposes explicit platform constructors for testing each backend.
+12. Not every primitive has every SIMD backend. For example, NEON may use the
+    portable single-compression path while using NEON for hash_many. Optimize
+    the common wide operation rather than demanding uniform SIMD coverage.
+13. AVX-512 has a separate xof_many path for long output. FastBlake should add
+    vectorized XOF only if callers request enough output to amortize it.
+
+FastBlake action: port the subtree-wide algorithm and invariants before tuning
+instruction details. It determines whether the SIMD kernel receives enough
+parallel work to matter.
+
+16. zeebo/blake3 (optimized Go)
+--------------------------------
+
+Repository: https://github.com/zeebo/blake3
+
+This is particularly relevant because Go, like Java, has managed memory and a
+high-level incremental hashing API.
+
+Extracted techniques:
+
+1. The hasher owns an 8192-byte buffer: exactly eight BLAKE3 chunks, matching
+   AVX2 degree. Fragmented writes accumulate until a complete batch exists, so
+   callers do not need SIMD-sized update calls.
+2. When the internal buffer is empty and more than one complete 8 KiB batch is
+   available, it points the SIMD kernel directly at caller input rather than
+   copying through the buffer. FastBlake should implement the same direct-input
+   bypass with Java array offsets.
+3. The buffering policy knowingly sacrifices roughly 100 ns of tiny-input setup
+   to stabilize large incremental throughput. That is the right trade for this
+   project's 8 MiB priority, but retain a <=1 KiB specialized path.
+4. The CV stack uses an occupancy bitmap. It batches up to eight ready parent
+   pairs in transposed form and compresses them through HashP together.
+5. Chunk outputs remain in transposed chainVector layout until they must enter
+   the ordinary stack. This reduces format churn.
+6. Little-endian Go builds reinterpret full byte blocks as uint32 arrays and
+   copy only the final partial block. Java cannot copy the unsafe pointer cast,
+   but IntVector.fromByteArray/MemorySegment/VarHandle loaders should target the
+   same zero-staging outcome.
+7. Published ARM64 results show the expected threshold: one or two chunks use
+   pure code; the four-chunk NEON backend wins from 4 KiB onward. Dispatch must
+   consider batch fullness, not just hardware support.
+
+FastBlake action: prototype per-hasher batch scratch sized to the selected SIMD
+degree, not blindly fixed at 8 KiB. For an Apple 128-bit IntVector kernel that
+means 4 KiB; for an 8-lane kernel 8 KiB; for 16 lanes 16 KiB. Compare this with
+a maximum-width reusable buffer and sub-width dispatch.
+
+17. Blake3.NET managed implementation
+-------------------------------------
+
+Repository: https://github.com/xoofx/Blake3.NET
+
+This is the closest modern managed-runtime analogue found. Version 3 provides
+fully managed scalar, 128-, 256-, and 512-bit SIMD plus thresholded multicore
+hashing.
+
+Extracted techniques:
+
+1. It has a specialized <=1 chunk one-shot path and a subtree-wide all-at-once
+   path for larger inputs. FastBlake should likewise avoid constructing general
+   tree machinery for <=1024 bytes.
+2. Chunk-parallel degree is selected at runtime: 16 for AVX-512, otherwise the
+   hardware vector width when it is 4 or 8, otherwise scalar.
+3. AVX2 hashes eight chunks together. It loads eight contiguous vectors from
+   the same block offset of eight chunks, then applies an explicit 8x8 unpack /
+   permute transpose network. It does not use general gathers.
+4. AVX-512 follows the same 16-chunk structure. Parent nodes also have dedicated
+   4/8-wide compression paths, confirming that a wide CV frontier is valuable.
+5. The one-block x86 compression uses four 128-bit row vectors and cheap fixed
+   shuffles. By contrast, ARM64 deliberately uses named scalar locals for one
+   compression while reserving NEON for four independent chunks. The optimal
+   single-node and hash-many kernels can be different on each architecture.
+6. Fixed-size temporary state uses stack allocation, avoiding heap traffic. Java
+   lacks explicit stackalloc, so use reusable hasher scratch or keep IntVectors
+   in locals; do not translate stackalloc into new arrays per call.
+7. Incremental hasher buffers are rented from ArrayPool and returned/cleared on
+   disposal. FastBlake instances can own small fixed arrays directly because
+   Java hasher construction is less frequent than block compression; compare a
+   ThreadLocal/pool only if construction allocation becomes measurable.
+8. Multicore UpdateWithJoin uses a 192 KiB overall threshold and requires at
+   least 32 KiB per worker. These constants are hypotheses for Java, not values
+   to copy. Add them to the threshold search space around powers of two.
+9. Multicore work operates on aligned subtrees and preserves identical update
+   semantics. Parallelism is an explicit method, preventing an ordinary update
+   from unexpectedly occupying the machine.
+
+FastBlake action: implement both kernel families as experiments:
+
+* primary: hash N independent chunks/parents across IntVector lanes;
+* secondary: hash one node using four 128-bit row vectors for scalar tails,
+  parent/root work, and XOF.
+
+Measure the secondary family against named-scalar locals on both AArch64 and
+x86-64. Do not assume the x86 result transfers to Apple Silicon.
+
+18. Resulting priority queue
+----------------------------
+
+P0 correctness architecture
+
+* Scalar oracle, exact root/XOF semantics, lazy merge, flat bounded CV stack.
+* Dedicated <=1 chunk path and subtree-wide >1 chunk path.
+
+P1 largest expected throughput wins
+
+* 4-lane IntVector chunk kernel for the current Apple/AArch64 machine.
+* In-register 4x4 message transpose; keep CV state transposed for 16 blocks.
+* Four-wide parent batching and direct caller-array processing.
+* Bounded 4 KiB streaming batch buffer with direct-input bypass.
+
+P2 portability and wider machines
+
+* 8-lane and 16-lane generated/specialized kernels and transpose networks.
+* Runtime selection with explicit benchmark overrides.
+* Partial-batch fallback ladder: 16 -> 8 -> 4 -> scalar where supported.
+
+P3 secondary kernels
+
+* One-node 128-bit row-vector kernel versus named-scalar compression.
+* Vectorized parent/root and long-XOF output only when measurements justify it.
+
+P4 whole-machine throughput
+
+* Aligned subtree join with size/bytes-per-worker threshold search.
+* Separate rust-mt/rayon baseline and separate benchmark reporting.
+
+
 IMPLEMENTATION ORDER
 ====================
 
