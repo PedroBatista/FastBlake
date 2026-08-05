@@ -209,6 +209,10 @@ A low-live-set variant behind `-Dfastblake.experimental.lowLiveVector=true`
 was also rejected: repeatedly reloading and retransposing each scheduled word
 reduced throughput further. All negative results remain documented rather than
 being rediscovered later.
+A round-local cache experiment behind
+`-Dfastblake.experimental.roundCacheVector=true` was slower again; Java lexical
+scope did not translate into useful register-lifetime control. Further SIMD
+work now requires generated-code evidence rather than another cache reshuffle.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

@@ -229,3 +229,38 @@ smaller round method to control compilation size. That retains 16
 materializations per round (the minimum for the permuted schedule) but prevents
 message vectors from remaining live across all seven rounds. Compiler logs and
 assembly inspection should precede its full 8 MiB measurement.
+
+## E006 — round-local message cache
+
+Date: 2026-08-06
+
+Change: four independent chunks remain in lanes. Each of the seven rounds loads
+the four rows from all four chunks, transposes them into 16 message vectors,
+executes that round, and exits a lexical scope intended to end the message
+cache's lifetime. This performs 16 source-vector loads per round rather than
+E005's 64. Enable with `-Dfastblake.experimental.roundCacheVector=true`.
+
+Correctness: full `./gradlew test` passed with the property enabled.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E006 | E001 scalar |
+|---|---:|---:|---:|---:|
+| one-shot | 552 MiB/s | 2496 MiB/s | 21 MiB/s | 679 MiB/s |
+| reused | 542 MiB/s | 2453 MiB/s | 20 MiB/s | 673 MiB/s |
+| streaming 4 KiB | 535 MiB/s | 2277 MiB/s | 670 MiB/s | 661 MiB/s |
+
+Decision: reject for default dispatch and retain as opt-in negative evidence.
+
+Comment: source-level lexical scopes did not produce the hoped-for machine
+register lifetime. E006 still exposes a large IR/live set during each round and
+adds seven full message load/transpose passes per block. It is slower than both
+E004's single block-wide cache and E005's two-message approach.
+
+Rule learned: stop iterating on cache lifetime by Java source structure alone.
+E004 through E006 cover the relevant caching continuum and all regress. Before
+another Vector API kernel, capture C2 compilation logs and generated machine
+code for a minimal compression microbenchmark. Determine whether vector
+rotates, two-source rearranges, endian MemorySegment loads, and vector values
+actually lower to NEON instructions without unexpected allocation or runtime
+stubs. The next implementation decision must be driven by that evidence.
