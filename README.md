@@ -87,7 +87,72 @@ JMH prints ns/op; the runner appends a MiB/s table with speedups against the
 `commons` baseline. Naming an unavailable contender explicitly fails fast with
 the reason, rather than running for ten minutes first.
 
-<!-- RESULTS -->
+### Threading
+
+**Every number below is single-threaded, on both sides**, and that is a
+deliberate choice rather than an oversight:
+
+- JMH runs one thread (`@State(Scope.Thread)`, no `@Threads`).
+- The `blake3` crate is compiled with only `default` + `std` — the `rayon`
+  feature is off, so `update` does not fan out across cores.
+- Commons Codec is scalar and single-threaded anyway.
+
+So the comparison is honest as far as it goes: one core against one core, which
+is the right way to judge implementation quality. But it leaves two axes
+unmeasured, and one of them matters a lot for what comes next.
+
+1. **Intra-hash parallelism** — one hash spread over many cores. BLAKE3's tree
+   structure makes every 1 KiB chunk independent, so this scales close to
+   linearly; it is the crate's headline feature, exposed as `update_rayon`.
+2. **Concurrent throughput** — many independent hashes on many threads. Already
+   supported: `-t N` works today, since each JMH thread gets its own buffers and
+   hasher. At 1 MiB with `-t 4`, per-thread throughput held at 516 MiB/s
+   (`commons`) and 2334 MiB/s (`rust`), i.e. it scales with cores rather than
+   contending.
+
+The catch is the GPU contender. A GPU hashing one buffer across thousands of
+device threads, compared against a deliberately single-threaded CPU number, is
+not a comparison — it is a handicap match that the GPU wins by construction.
+Before `java-gpu` lands, the ladder needs a multithreaded rung: a separate
+`rust-mt` contender built with the `rayon` feature, so the ceiling is visible in
+both regimes and the GPU is measured against a CPU that is also using the whole
+machine.
+
+### Results
+
+Apple M5 (10 core), Temurin JDK 25.0.4, Commons Codec 1.22.0, `blake3` crate
+1.8.5. 2 forks × 5×1s measurement iterations, single-threaded. MiB/s, higher is
+better; x-factor against the `commons` baseline.
+
+| size | `oneShot` commons | `oneShot` rust | `reusedInstance` commons | `reusedInstance` rust | `streaming4k` commons | `streaming4k` rust |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 B | 525 | 820 (1.56×) | 459 | 844 (1.84×) | 450 | 838 (1.86×) |
+| 1 KiB | 562 | 1274 (2.27×) | 558 | 1257 (2.25×) | 522 | 1262 (2.42×) |
+| 16 KiB | 545 | 2384 (4.37×) | 552 | 2374 (4.30×) | 549 | 2256 (4.11×) |
+| 256 KiB | 552 | 2386 (4.32×) | 542 | 2388 (4.41×) | 539 | 2254 (4.18×) |
+| 4 MiB | 543 | 2388 (4.40×) | 541 | 2387 (4.41×) | 538 | 2251 (4.19×) |
+
+Raw JSON: `build/jmh-contenders.json`. Re-measure on your own machine before
+drawing conclusions.
+
+What this says about where the work is:
+
+- **Commons Codec is flat at ~540 MiB/s from 1 KiB to 4 MiB. Rust triples from
+  820 to 2388.** Rust's curve is SIMD engaging as the input grows enough to fill
+  a lane batch — it saturates by 16 KiB, exactly where 16 chunks first become
+  available. Commons never engages anything, because there is nothing to engage.
+  That flat line is the headroom, and closing it is the entire point of
+  `java-cpu`.
+- **The gap is 4.4× at size, but only 1.6× at 64 B.** Small inputs are dominated
+  by per-call setup, not compression, and there SIMD has nothing to work with.
+  A Vector API implementation should expect to reach parity quickly on large
+  buffers and struggle to justify itself on tiny ones.
+- **`reset()` reuse buys nothing** — it is *slower* than a fresh hasher at 64 B
+  for both contenders. Per-call cost is setup, not allocation, so a
+  zero-allocation API is not where the small-input win lives.
+- **Streaming in 4 KiB pieces costs Rust ~6% at size and Commons nothing.**
+  Rust gives up a little chunk-batching width at the piece boundary; the scalar
+  implementation has no width to give up.
 
 ## How the Rust contender is wired
 
