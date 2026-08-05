@@ -205,6 +205,10 @@ The fully expanded four-chunk transpose kernel is likewise retained behind
 `-Dfastblake.experimental.chunkVector4=true`; its excessive live vector set and
 method size caused register pressure and late compilation, so it is not in
 default dispatch.
+A low-live-set variant behind `-Dfastblake.experimental.lowLiveVector=true`
+was also rejected: repeatedly reloading and retransposing each scheduled word
+reduced throughput further. All negative results remain documented rather than
+being rediscovered later.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

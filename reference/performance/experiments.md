@@ -192,3 +192,40 @@ into compiler-sized methods only after verifying that vector values do not
 escape. Use compilation logs and generated assembly to confirm C2 compilation,
 spill traffic, and whether `fromMemorySegment` plus two-source rearranges lower
 to the expected AArch64 instructions before writing another full kernel.
+
+## E005 — low-live-set cross-chunk SIMD
+
+Date: 2026-08-06
+
+Change: retain E004's four independent chunk lanes and named state vectors, but
+keep only two message vectors live. Each G reloads and transposes the two words
+it needs through a separate `loadWord` method. This lowers the live vector set
+from more than 34 to roughly 20 at the cost of repeated L1 loads and shuffles.
+Enable with `-Dfastblake.experimental.lowLiveVector=true`.
+
+Correctness: full `./gradlew test` passed with the property enabled.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E005 | E001 scalar |
+|---|---:|---:|---:|---:|
+| one-shot | 553 MiB/s | 2502 MiB/s | 36 MiB/s | 679 MiB/s |
+| reused | 543 MiB/s | 2453 MiB/s | 37 MiB/s | 673 MiB/s |
+| streaming 4 KiB | 538 MiB/s | 2275 MiB/s | 668 MiB/s | 661 MiB/s |
+
+Decision: reject for default dispatch; preserve behind its property as the
+low-live-set endpoint of the design space.
+
+Comment: reducing register pressure alone is not enough. E005 materializes 112
+message vectors per block instead of 16, and each materialization performs four
+loads plus transpose shuffles. It is roughly half E004's compiled one-shot
+throughput and about 18x slower than scalar. Streaming remains scalar and again
+confirms default-path stability.
+
+Rule learned: neither keeping all 16 transposed message vectors live nor
+retransposing every word is viable. The next plausible compromise is a
+round-local message cache whose lifetime ends after one round, combined with a
+smaller round method to control compilation size. That retains 16
+materializations per round (the minimum for the permuted schedule) but prevents
+message vectors from remaining live across all seven rounds. Compiler logs and
+assembly inspection should precede its full 8 MiB measurement.
