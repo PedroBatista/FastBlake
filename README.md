@@ -71,10 +71,11 @@ Three call shapes, because they stress different things:
 | `reusedInstance` | `reset()`-reuse. Raw compression throughput. |
 | `streaming4k` | 4 KiB incremental updates — the file/socket shape, which punishes anything needing the whole input up front to parallelise. |
 
-Sizes sweep `64, 1024, 16384, 262144, 4194304`. 64 B and 1 KiB sit at or below
-BLAKE3's 1024-byte chunk boundary where per-call overhead dominates; 16 KiB is
-the smallest input that can fill a 16-lane SIMD batch; the rest measure
-steady-state throughput.
+Sizes sweep `64, 1024, 16384, 262144, 4194304, 8388608`. 64 B and 1 KiB sit at
+or below BLAKE3's 1024-byte chunk boundary where per-call overhead dominates;
+16 KiB is the smallest input that can fill a 16-lane SIMD batch; the larger
+sizes measure steady-state throughput, with 8 MiB representing the project's
+typical workload.
 
 ```bash
 ./gradlew jmh                                          # every available contender
@@ -131,14 +132,15 @@ better; x-factor against the `commons` baseline.
 | 16 KiB | 545 | 2384 (4.37×) | 552 | 2374 (4.30×) | 549 | 2256 (4.11×) |
 | 256 KiB | 552 | 2386 (4.32×) | 542 | 2388 (4.41×) | 539 | 2254 (4.18×) |
 | 4 MiB | 543 | 2388 (4.40×) | 541 | 2387 (4.41×) | 538 | 2251 (4.19×) |
+| 8 MiB | 544 | 2420 (4.45×) | 538 | 2402 (4.46×) | 534 | 2240 (4.19×) |
 
 Raw JSON: `build/jmh-contenders.json`. Re-measure on your own machine before
 drawing conclusions.
 
 What this says about where the work is:
 
-- **Commons Codec is flat at ~540 MiB/s from 1 KiB to 4 MiB. Rust triples from
-  820 to 2388.** Rust's curve is SIMD engaging as the input grows enough to fill
+- **Commons Codec is flat at ~540 MiB/s from 1 KiB to 8 MiB. Rust triples from
+  820 to about 2400.** Rust's curve is SIMD engaging as the input grows enough to fill
   a lane batch — it saturates by 16 KiB, exactly where 16 chunks first become
   available. Commons never engages anything, because there is nothing to engage.
   That flat line is the headroom, and closing it is the entire point of

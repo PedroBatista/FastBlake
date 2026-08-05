@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit;
  * 1024-byte chunk boundary, where per-call overhead dominates and a GPU or a
  * native boundary crossing loses badly. 16 KiB is the smallest input that can
  * fill a 16-lane SIMD batch. The larger sizes measure steady-state throughput,
- * which is where SIMD and device offload are supposed to pay off.
+ * including the target workload's typical 8 MiB buffer size.
  *
  * <pre>
  * ./gradlew jmh
@@ -58,7 +58,7 @@ public class Blake3Benchmark {
     @Param({"commons"})
     public String impl;
 
-    @Param({"64", "1024", "16384", "262144", "4194304"})
+    @Param({"64", "1024", "16384", "262144", "4194304", "8388608"})
     public int size;
 
     private Blake3Engine engine;
