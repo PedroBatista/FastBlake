@@ -213,6 +213,10 @@ A round-local cache experiment behind
 `-Dfastblake.experimental.roundCacheVector=true` was slower again; Java lexical
 scope did not translate into useful register-lifetime control. Further SIMD
 work now requires generated-code evidence rather than another cache reshuffle.
+The primitive probe found that C2 does intrinsify the Vector API, but endian
+MemorySegment vector loads are about 25× slower than direct heap ByteVector
+loads plus reinterpretation on this runtime. The next experiment therefore
+changes the load mechanism alone; details are in the experiment ledger.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

@@ -264,3 +264,55 @@ code for a minimal compression microbenchmark. Determine whether vector
 rotates, two-source rearranges, endian MemorySegment loads, and vector values
 actually lower to NEON instructions without unexpected allocation or runtime
 stubs. The next implementation decision must be driven by that evidence.
+
+## E007 — Vector API primitive and C2 lowering probe
+
+Date: 2026-08-06
+
+Change: add `VectorPrimitiveBenchmark`, isolating 128-bit rotate-right,
+two-source rearrange, endian MemorySegment loads, direct heap byte-vector loads,
+and a BLAKE-like add/XOR/rotate dependency chain. Each benchmark performs 256
+repetitions. This is diagnostic infrastructure, not a hashing implementation.
+
+Command:
+`./gradlew jmh -P'jmh.args=VectorPrimitiveBenchmark -f1 -wi 5 -i 5'`
+
+| primitive, 256 repetitions | total | approximate per repetition |
+|---|---:|---:|
+| four scalar rotate chains | 61.201 ns | 0.239 ns for four scalar rotates |
+| one four-lane vector rotate chain | 178.891 ns | 0.699 ns |
+| vector BLAKE add/XOR/rotate | 393.157 ns | 1.536 ns |
+| two-source rearrange chain (two per repetition) | 409.100 ns | 0.799 ns/rearrange |
+| endian MemorySegment vector load | 1672.477 ns | 6.533 ns/load |
+| heap ByteVector load + reinterpret | 65.696 ns | 0.257 ns/load |
+
+Compilation evidence:
+
+- `-XX:+LogCompilation -XX:+PrintIntrinsics` recorded the focused
+  `vectorBlakeMix` run in `/private/tmp/fastblake-e007-hotspot.xml`.
+- `vectorBlakeMix` reached C2 level 4 (`compile_id=934`) after about 0.137 s;
+  this is not an interpreter or C1-only result.
+- VectorSupport binary and shift paths were recognized as intrinsics and the
+  vector wrappers were force-inlined by their annotations.
+- This Temurin distribution has no working `hsdis` library. `PrintAssembly`
+  emits AArch64 instruction words but not mnemonic disassembly, so exact
+  instruction-by-instruction confirmation was unavailable locally.
+
+Decision: keep the diagnostic benchmark. Do not use
+`IntVector.fromMemorySegment(..., LITTLE_ENDIAN)` for heap `byte[]` BLAKE3
+input on this runtime. Use `ByteVector.fromArray(...).reinterpretAsInts()` on
+little-endian AArch64; it is approximately 25.4x faster in isolation.
+
+Comment: the Vector API is intrinsified and C2-compiled, but that does not make
+every operation cheap. Four scalar rotate chains are about 2.9x faster than one
+four-lane vector rotate dependency chain. AArch64 NEON lacks a single general
+vector rotate-right instruction, so shifts/inserts are expected. Two-source
+rearranges also have meaningful latency. Most importantly, the endian
+MemorySegment load used by E004-E006 is catastrophically expensive relative to
+a direct heap byte load and reinterpret.
+
+Rule learned: the next cross-chunk experiment should first change only the load
+mechanism in the best prior cross-chunk layout (E004), using 128-bit
+`ByteVector.fromArray` loads and native little-endian reinterpretation. Keep it
+opt-in and architecture-guarded. This is now a measured, specific hypothesis;
+do not redesign caching and loading simultaneously.
