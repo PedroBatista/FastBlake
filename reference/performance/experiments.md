@@ -151,3 +151,44 @@ local, load four contiguous words from each chunk, and transpose 4x4 registers.
 No `IntVector[]`, indexed gathers, scalar word packing, or helper-owned mutable
 state may appear in the compression hot path. Inspect generated assembly before
 promoting any subsequent Vector API result.
+
+## E004 — four chunks, transpose loads, fully expanded named vectors
+
+Date: 2026-08-06
+
+Change: hash four independent chunks in 128-bit lanes. Each 64-byte block uses
+four endian-aware contiguous `IntVector.fromMemorySegment` loads per 16-byte
+row, followed by 4x4 register transposes. Compression uses 16 named state
+vectors, 16 named message vectors, and fully expanded G operations. There are
+no vector arrays, indexed gathers, or scalar message staging. Enable with
+`-Dfastblake.experimental.chunkVector4=true`.
+
+Correctness: full `./gradlew test` passed with the property enabled.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E004 | E001 scalar |
+|---|---:|---:|---:|---:|
+| one-shot | 552 MiB/s | 2473 MiB/s | 72 MiB/s | 679 MiB/s |
+| reused | 554 MiB/s | 2452 MiB/s | 41 MiB/s unstable | 673 MiB/s |
+| streaming 4 KiB | 536 MiB/s | 2272 MiB/s | 671 MiB/s | 661 MiB/s |
+
+Decision: reject for default dispatch and retain as opt-in evidence. The reused
+result is not a trustworthy steady-state score: iterations improved from 264
+ms to 112 ms as compilation occurred during measurement. Even the compiled
+level is far below scalar, so a longer confirmation run cannot change the
+decision.
+
+Comment: E004 fixed E002's array escape and scalar packing problems, but made
+all 16 message vectors live alongside 16 state vectors plus transpose
+temporaries. That exceeds the usable AArch64 SIMD register budget and strongly
+suggests heavy spilling. The approximately 1,000-line hot method also compiles
+late. Correct SIMD structure alone is insufficient if its Java IR and live set
+are hostile to C2.
+
+Rule learned: limit the live vector set. A follow-up should load/transpose only
+the message quartet needed by a small group of G operations, or split rounds
+into compiler-sized methods only after verifying that vector values do not
+escape. Use compilation logs and generated assembly to confirm C2 compilation,
+spill traffic, and whether `fromMemorySegment` plus two-source rearranges lower
+to the expected AArch64 instructions before writing another full kernel.
