@@ -1,0 +1,513 @@
+FASTBLAKE HIGH-PERFORMANCE JVM IMPLEMENTATION GUIDE
+===================================================
+
+Purpose
+-------
+
+This is a project-specific engineering playbook, not a generic Java performance
+article. FastBlake must implement BLAKE3 correctly and pursue the highest
+sustained throughput practical on the JVM. Unusual, duplicated, generated, or
+low-level code is acceptable in a proven hot path. An optimization is not
+accepted merely because it looks clever or is fast in a toy benchmark.
+
+Target environment and workload
+-------------------------------
+
+* Primary runtime: HotSpot on JDK 25.
+* Primary workload: buffers around 8 MiB; smaller buffers also occur.
+* Primary metric: single-threaded steady-state MiB/s, compared on identical
+  bytes and call shapes with Apache Commons Codec and the official Rust crate.
+* Required modes: ordinary hash, keyed hash, key derivation, and arbitrary XOF
+  output.
+* Required APIs: one-shot, reusable state, and incremental update.
+* Important secondary shape: an 8 MiB input delivered in 4 KiB update calls.
+* The production jar must remain pure JVM and dependency-free.
+
+Current measured ceiling on the development machine (Apple M5, JDK 25.0.4):
+
+                         Commons scalar     Rust SIMD       Rust / Commons
+  8 MiB one-shot          544 MiB/s         2420 MiB/s       4.45x
+  8 MiB reused state      538 MiB/s         2402 MiB/s       4.46x
+  8 MiB, 4 KiB updates    534 MiB/s         2240 MiB/s       4.19x
+
+These numbers are a local baseline, not a portable promise. Re-measure after
+changes in CPU, JDK, JVM flags, power mode, or thermal conditions.
+
+
+NON-NEGOTIABLE RULES FOR IMPLEMENTERS AND LLMS
+==============================================
+
+1. Correctness and evidence
+---------------------------
+
+1. Never trade away BLAKE3 semantics. Every optimization must pass all official
+   vectors in hash, keyed-hash, derive-key, and XOF modes.
+2. Preserve incremental semantics across 64-byte block and 1024-byte chunk
+   boundaries. Preserve repeatable finalize, reset, offsets, and non-clobbering.
+3. Do not use timing equality or data-dependent branches for digest comparison
+   if a comparison API is later added. Hash computation itself has public input
+   lengths, but keyed modes still must not introduce key-dependent control flow.
+4. Keep a simple scalar implementation as the executable specification and
+   tail path. Differential-test optimized kernels against it with randomized
+   inputs, fragmented updates, modes, offsets, and XOF lengths.
+5. Before and after every performance patch, run conformance and a targeted JMH
+   benchmark. Record command, JDK, CPU, score, error, allocation rate, and diff.
+6. Reject a speed claim when confidence intervals overlap materially or when it
+   cannot be reproduced across forks. Prefer a meaningful effect over noise.
+7. Change one performance idea at a time. Do not combine unrelated changes in
+   one measurement because causality is then lost.
+8. Never infer generated machine code from Java source. Inspect it.
+
+2. Optimize the actual work
+---------------------------
+
+1. Optimize 8 MiB first. Keep 64 B and 1 KiB benchmarks because they expose
+   setup cost and BLAKE3's chunk boundary, but do not let them dictate the large
+   buffer architecture.
+2. Treat the three call shapes separately. A fast one-shot path may batch the
+   complete input. The streaming path must retain enough full chunks to form
+   SIMD batches without changing update/finalize semantics.
+3. Track both ns/op and MiB/s. Also track bytes allocated per operation. A
+   throughput gain that creates proportional garbage is suspect in real use.
+4. Measure latency distribution and concurrent throughput separately from the
+   existing single-thread throughput benchmark. Do not mix those claims.
+5. Include setup, allocation, input handling, tree reduction, and final output
+   in normal benchmark boundaries. A kernel-only benchmark is diagnostic only.
+
+
+BLAKE3-SPECIFIC IMPLEMENTATION STRATEGY
+=======================================
+
+3. Build the scalar core for the JIT
+------------------------------------
+
+1. Use int arithmetic. Java's defined two's-complement int overflow matches the
+   required modulo-2^32 arithmetic. Use logical right shift, never arithmetic
+   right shift, when constructing rotations manually.
+2. Make IV, flags, lengths, and message schedules static final constants. Do
+   not rebuild schedules or allocate tables per call.
+3. Benchmark two compression layouts:
+
+   A. Sixteen named int locals, with all seven rounds explicitly unrolled.
+   B. A reusable int[16] state with carefully unrolled accesses.
+
+   Named locals can eliminate indexing and bounds checks but can increase code
+   size and register pressure. Arrays make code smaller but may spill or retain
+   bounds checks. Generated assembly decides the winner.
+4. Fully unroll the fixed seven rounds if it improves real throughput. Prewrite
+   the message permutation for each round so the hot loop does not index a
+   schedule table or permute an array at runtime.
+5. Inline the G mixing operation manually or through a small static method only
+   after confirming C2 inlines it. Excessive helper decomposition can block
+   optimization; one enormous method can also exceed inlining/code-size limits.
+6. Express rotate-right both ways and benchmark on each target architecture:
+   Integer.rotateRight(x, n), and (x >>> n) | (x << (32 - n)). HotSpot normally
+   recognizes rotations, but generated code is the authority.
+7. Keep counters as long outside compression, then split once into low/high int
+   words. Do not repeatedly convert or box counters in the inner rounds.
+8. Avoid clones, streams, lambdas, iterators, varargs, records, temporary lists,
+   Optional, ByteBuffer creation, and exception construction in the hot path.
+9. Hoist validation and mode selection outside loops. Use a checked public
+   boundary and a compact trusted internal kernel.
+10. Structure loops so one dominating bounds check proves all subsequent array
+    accesses safe. Test whether C2 eliminates checks; do not delete validation
+    blindly for hoped-for bounds-check elimination.
+
+4. Load little-endian words efficiently
+----------------------------------------
+
+Test all plausible loaders using the real compression loop:
+
+* explicit byte loads and shifts;
+* a cached little-endian byte-array VarHandle;
+* Vector API byte-array loads/reinterpretation;
+* MemorySegment access for an optional segment-facing API.
+
+Rules:
+
+1. Never allocate ByteBuffer wrappers per update or block.
+2. Cache VarHandle/species/shuffle objects in static final fields.
+3. Separate the full-block loop from the final partial block. A branch-free
+   full-block loader matters more than making the rare tail elegant.
+4. Do not read beyond the Java array even if a native implementation commonly
+   overreads into padding. Java access must remain memory safe.
+5. Prefer naturally aligned sequential access, but do not assume unaligned
+   access is slow on every CPU. Measure x86-64 and AArch64 independently.
+6. A manual byte loader may generate many sign-extension operations. Mask only
+   where required and inspect whether C2 folds loads into efficient instructions.
+
+5. SIMD across independent chunks
+---------------------------------
+
+The primary Vector API design should put independent chunks in vector lanes.
+Each vector lane holds the same state/message word from a different 1 KiB
+chunk. One vectorized G operation therefore advances several independent
+compressions. This is the same fundamental degree-of-parallelism strategy used
+by optimized BLAKE3 implementations.
+
+Do not assume that putting the 16 words of one compression state in adjacent
+lanes is faster. BLAKE3's column/diagonal mixing would then require repeated
+cross-lane rearrangements and normally wastes the natural chunk parallelism.
+Such a design is an experiment, not the default.
+
+Vector rules:
+
+1. JDK 25 uses the tenth-incubator Vector API. Compile and run with
+   --add-modules jdk.incubator.vector and keep the incubator dependency isolated
+   so migration is localized.
+2. Begin with IntVector.SPECIES_PREFERRED, but benchmark explicit 128-, 256-,
+   and 512-bit kernels where supported. Preferred width is not guaranteed to be
+   the fastest after transposition, register pressure, and downclock effects.
+3. Expected chunk batch width is species.length(): commonly four int lanes for
+   128-bit NEON, eight for 256-bit AVX2, and sixteen for 512-bit AVX-512.
+4. Specialize the hot kernel per vector species. Do not put a species-dependent
+   branch inside the compression rounds.
+5. Keep vector values as vectors. Avoid lane extraction, toArray(), boxing,
+   identity operations, and vector-object storage in arrays inside the rounds.
+6. Use lanewise integer add, xor, and rotate operations. Confirm they lower to
+   actual SIMD instructions rather than fallback Java code.
+7. Treat input transposition as a first-class cost. Compare:
+
+   * scalar assembly of one word from each chunk followed by vector creation;
+   * indexed/gather loads;
+   * a reusable structure-of-arrays staging buffer;
+   * ByteVector loads followed by little-endian reinterpret/shuffles.
+
+   Gather and shuffle instructions vary greatly across CPUs. The fastest
+   compression kernel can lose overall after packing costs.
+8. Process as many complete chunk batches as possible, then a smaller supported
+   vector kernel or scalar tail. Never pad with fictitious chunks unless masks
+   and flags make the result provably equivalent.
+9. Keep per-batch chaining values in flat primitive storage. Reuse scratch
+   arrays owned by the hasher; do not allocate a matrix per batch.
+10. Measure register spilling. Seven unrolled rounds over sixteen vector state
+    words can exceed available vector registers, especially with message words
+    live simultaneously. Recompute cheap values or split method structure if it
+    reduces spills.
+11. Consider two-vector or multi-batch software pipelining only after the basic
+    kernel is proven. It may hide load latency but often worsens register pressure.
+12. Test AVX-512 separately. Wider lanes may improve BLAKE3, but instruction
+    frequency effects and spill costs are CPU-specific.
+
+6. Chunk scheduling and tree reduction
+---------------------------------------
+
+1. BLAKE3 chunks are 1024 bytes and blocks are 64 bytes. Keep these independent
+   concepts and names distinct in code and documentation.
+2. For a large one-shot input, hash full chunks in the widest profitable SIMD
+   batches, producing chaining values, then reduce parent nodes according to
+   the BLAKE3 tree rules.
+3. Use the chunk counter's trailing-zero/tree-stack logic from the specification
+   rather than constructing a general tree of objects.
+4. Store the CV stack in one fixed/reused primitive array. Maximum depth is
+   bounded by input length/counter width; no node allocations are necessary.
+5. Parent compression is small and may not have enough independent work for the
+   widest kernel near the root. Compare scalar parents, level-batched vector
+   parents, and hybrid reduction. Include packing overhead.
+6. For streaming updates, retain at most the bounded state needed to batch full
+   chunks. Never buffer the entire stream merely to improve parallelism.
+7. Do not prematurely finalize the last chunk: ROOT, CHUNK_END, PARENT, keyed,
+   derive-context, and derive-material flags must be applied exactly.
+8. Fast paths may be specialized for aligned full chunks, but all partial-input
+   and XOF behavior must converge on the same tested semantics.
+
+7. Allocation and object layout
+-------------------------------
+
+1. Target zero allocation for update(), reset(), and finalize-into-caller-buffer
+   after hasher construction. Verify with JMH's gc profiler/JFR, not assumption.
+2. oneShot(byte[]) returning byte[] necessarily allocates its result. Avoid all
+   other per-call allocation where practical.
+3. Keep mutable hasher state in primitive fields and fixed primitive arrays.
+   Prefer flat arrays over arrays of objects.
+4. Reuse scratch owned by each hasher; instances are already documented as not
+   thread-safe. Never use one global mutable scratch buffer.
+5. Do not depend on escape analysis to eliminate hot-path arrays, lambdas, or
+   wrapper objects. C2 scalar replacement is conditional and is not general
+   stack allocation. Measure allocation directly.
+6. Object pooling is not automatically beneficial. Pool only expensive or
+   repeatedly allocated state after measurement; pooling can add retention,
+   synchronization, cache pollution, and stale-state bugs.
+7. Off-heap storage does not make arithmetic faster by itself. For byte[] input,
+   copying to native memory is usually a loss. Use MemorySegment when it avoids
+   an existing copy or serves a real external-memory API.
+8. Avoid false sharing if per-thread hashers or worker queues are introduced.
+   Thread-confined state is preferred; pad shared counters only when hardware
+   counters demonstrate contention.
+
+8. Dispatch, inlining, and code shape
+-------------------------------------
+
+1. Keep the production hot call graph monomorphic. final classes, static
+   kernels, and stable mode-specific state help C2 inline and specialize.
+2. The benchmark's Blake3Engine interface is acceptable outside the measured
+   kernel, but production compression must not perform interface dispatch per
+   block or per round.
+3. Select scalar/vector architecture once per hasher or call, not per chunk.
+4. Select hash/keyed/KDF mode once and encode its flags, not with a polymorphic
+   callback in compression.
+5. Constants must be compile-time visible when specialization depends on them.
+6. Duplicated species-specific or mode-specific kernels are acceptable when
+   they produce a measured gain and tests cover every copy.
+7. Generated source is acceptable for unrolled rounds/schedules. Check the
+   generator and generated output into source control, make generation
+   deterministic, and test it against the scalar oracle.
+8. Avoid synchronized, volatile, atomics, fences, and concurrent collections in
+   thread-confined hashing. They are justified only by a real sharing contract.
+
+9. Multicore design is a separate contender
+--------------------------------------------
+
+1. Keep single-thread SIMD and whole-machine parallel hashing as separate
+   benchmarks and implementations. Never compare a multithread GPU number only
+   against a one-thread CPU baseline.
+2. For 8 MiB, prototype splitting ranges of complete chunks among a fixed number
+   of platform worker threads, then deterministically reduce their subtree CVs.
+3. Do not use virtual threads for CPU-bound hashing. They do not create compute
+   capacity and add scheduling machinery.
+4. Establish a size threshold. Fork/join/task submission is usually a loss on
+   small inputs. Benchmark threshold and worker count on each machine class.
+5. Avoid one task per 1 KiB chunk. Assign coarse contiguous ranges to workers to
+   preserve locality and amortize scheduling.
+6. Keep worker state thread-local and write results to disjoint cache lines or
+   contiguous regions that are consumed only after joining.
+7. Benchmark against Rust with rayon enabled using the same total core count.
+
+
+MEASUREMENT AND MACHINE-CODE INSPECTION
+=======================================
+
+10. JMH protocol
+----------------
+
+1. Use JMH; never time with one currentTimeMillis/nanoTime loop.
+2. Keep multiple forks. Warmup iterations within one VM do not replace forks,
+   because compilation profiles and VM state can differ.
+3. Consume/return outputs so computation cannot be removed. Keep deterministic
+   input but add separate randomized differential tests.
+4. Use representative 8 MiB data, plus boundary sizes. Avoid reporting only the
+   best iteration or only a throughput ratio.
+5. Run one benchmark process at a time. Close browsers, builds, indexing, and
+   other sustained CPU tasks when collecting publishable numbers.
+6. On laptops, use AC power, stable performance mode, and monitor thermal
+   throttling. Randomize or alternate contender order if heat creates bias.
+7. Add -prof gc to prove allocation claims. Use async-profiler/JFR for CPU,
+   allocation, cache-miss, and lock evidence where available.
+8. Use perfasm or PrintAssembly/JITWatch to inspect the compiled hot method.
+   Confirm vector width, rotations, bounds-check removal, absence of fallback
+   calls, spills, and unexpected memory traffic.
+9. Save raw JSON for comparisons and include environment metadata. A README
+   summary is not the source data.
+10. Add kernel microbenchmarks only to explain end-to-end results: compression,
+    endian load, transpose, parent reduction, scalar tail, and XOF blocks.
+11. Check compiler logs for failed inlining, uncommon traps, deoptimization, and
+    methods that never reached C2.
+12. Use hardware performance counters when possible: cycles, instructions,
+    IPC, branches/misses, cache misses, loads/stores, and vector instructions.
+
+11. Required experiment matrix
+------------------------------
+
+For each serious kernel candidate, measure:
+
+* 64 B, 1 KiB, 16 KiB, 256 KiB, 4 MiB, and 8 MiB;
+* one-shot, reused state, and 4 KiB streaming;
+* scalar and every supported vector width;
+* plain, keyed, and derive modes at least in focused kernel validation;
+* full and partial SIMD batches;
+* aligned and deliberately offset input/output;
+* one thread, then separately N-thread scaling;
+* allocation bytes/op and generated assembly;
+* AArch64 and x86-64 before making architecture-independent claims.
+
+
+EXOTIC TECHNIQUES: EXPERIMENTS, NOT DEFAULTS
+============================================
+
+12. JVM and OS deployment experiments
+-------------------------------------
+
+These can matter in controlled appliances or benchmarks. They must not become
+library correctness requirements or hidden defaults.
+
+1. CPU affinity / isolated cores: reduces scheduler migration and noise. Pin
+   benchmark and worker threads only in controlled deployments; measure system
+   effects and keep housekeeping threads elsewhere.
+2. NUMA placement: first-touch input and scratch on the worker's NUMA node.
+   Relevant on multi-socket systems, mostly irrelevant on the current laptop.
+3. Fixed CPU governor / disabled turbo: improves repeatability but may reduce
+   peak throughput. Report the setting.
+4. Large pages: may reduce TLB pressure for large heaps, but an 8 MiB sequential
+   hash kernel may already be dominated elsewhere. Measure startup/deployment
+   cost and portability.
+5. -XX:+AlwaysPreTouch with fixed -Xms/-Xmx: removes later heap first-touch page
+   faults at startup cost. It is a service deployment option, not a hash trick.
+6. Epsilon GC: useful only for bounded benchmark/short-lived experiments with a
+   proven allocation budget. Never prescribe disabling collection for a normal
+   library consumer.
+7. Parallel GC can maximize throughput for allocation-heavy batch applications;
+   G1/ZGC target different latency trade-offs. A zero-allocation hash kernel
+   should make collector choice nearly irrelevant to steady-state compression.
+8. Class-data sharing/AOT/warmup snapshots improve startup, not necessarily the
+   long-running 8 MiB kernel. Do not confuse startup with peak throughput.
+9. Direct I/O, mmap, or MemorySegment may remove copies in a file pipeline, but
+   benchmark end-to-end I/O separately from in-memory hashing.
+10. Prefetching through software touch-ahead or Unsafe is architecture-specific
+    and can hurt sequential hardware prefetchers. Only retain it with counter
+    evidence on supported machines.
+
+13. Dangerous low-level options
+-------------------------------
+
+1. Do not use sun.misc.Unsafe by default. Its memory-access methods are
+   deprecated for removal, it weakens safety, and ordinary byte[] plus Vector
+   API should cover the primary design. A quarantined optional kernel requires
+   overwhelming measured benefit, architecture tests, and a safe fallback.
+2. Do not rely on undocumented HotSpot intrinsics or internal annotations in the
+   public implementation. JVM updates may silently remove the benefit.
+3. Runtime-generated bytecode or hidden classes can specialize species/modes,
+   but add warmup, verification, security, and maintenance costs. Prefer checked-
+   in generated Java source first.
+4. JNI/FFM native calls can establish a ceiling but violate the pure-JVM product
+   goal. Native crossing is not a FastBlake implementation strategy unless the
+   project goal changes explicitly.
+5. Deliberate unsafe overreads, guard-page tricks, manual address arithmetic,
+   and process-lifetime memory leaks are prohibited for the shipped library.
+
+
+COMMON MYTHS TO REJECT
+======================
+
+* "Java abstractions are always slow." HotSpot can erase many abstractions, but
+  only a measured compiled call graph tells us whether it did.
+* "Objects allocate on the stack after escape analysis." HotSpot commonly uses
+  scalar replacement; elimination is conditional and arrays are often retained.
+* "Object pooling is always faster." It can be slower and less local than young-
+  generation allocation.
+* "Off-heap means faster." It often adds copying and more expensive access.
+* "SPECIES_PREFERRED is automatically optimal." It is the preferred supported
+  shape, not a benchmark result for this algorithm.
+* "Wider SIMD always wins." Transposition, shuffles, spilling, and frequency can
+  reverse the result.
+* "Streams/lambdas are slow." They are simply unnecessary risk in this tiny hot
+  kernel; prove allocation/code shape instead of repeating folklore.
+* "final makes code fast." It can help call-site reasoning, but profile and
+  inlining behavior matter more.
+* "Turning off GC fixes latency." It does not remove allocation, page faults,
+  cache traffic, resource leaks, or eventual exhaustion.
+* "A microbenchmark proves application speed." It proves only its measured call
+  shape on its measured environment.
+* "Pretty code and fast code are opposites." Clarity outside the kernel is an
+  optimization tool. Local ugliness is justified only by evidence.
+
+
+IMPLEMENTATION ORDER
+====================
+
+Phase 1: Correct scalar implementation
+
+* Implement all modes, streaming, tree stack, reset, finalize, and XOF.
+* Pass official and randomized differential tests.
+* Establish scalar allocation and throughput baselines.
+
+Phase 2: Scalar kernel tuning
+
+* Compare loaders, state layouts, rotation forms, unrolling, and method shapes.
+* Inspect C2 output; keep only reproducible end-to-end gains.
+
+Phase 3: Vector chunk kernel
+
+* Implement independent chunks across IntVector lanes.
+* Compare transposition strategies and vector widths.
+* Add scalar/short-batch tails and vector parent experiments.
+
+Phase 4: Streaming integration
+
+* Batch complete chunks across update calls with bounded buffering.
+* Preserve exact incremental behavior and zero-allocation steady state.
+
+Phase 5: Optional multicore contender
+
+* Add coarse subtree parallelism and a measured threshold.
+* Compare fairly with Rust rayon and report scaling separately.
+
+Phase 6: Platform specializations
+
+* Retain separate AArch64/x86 kernels only where measurements justify them.
+* Add CI/conformance coverage and safe dispatch/fallback for every specialization.
+
+
+SOURCE HIERARCHY
+================
+
+When claims conflict, prefer sources in this order:
+
+1. BLAKE3 specification and official source/test vectors.
+2. OpenJDK JEPs, JDK API documentation, HotSpot source/issues, and generated
+   machine code from the exact supported JDK.
+3. Reproducible JMH results and hardware-counter evidence on target machines.
+4. Peer-reviewed papers and books by recognized performance engineers.
+5. Engineering articles with code, environment, and raw measurements.
+6. Forum anecdotes and generic optimization lists only as experiment ideas.
+
+Primary online references
+-------------------------
+
+* BLAKE3 specification repository:
+  https://github.com/BLAKE3-team/BLAKE3-specs
+* Official BLAKE3 implementations, reference implementation, and test vectors:
+  https://github.com/BLAKE3-team/BLAKE3
+* BLAKE3 IETF Internet-Draft vendored in reference/:
+  ../draft-aumasson-blake3-00.txt
+* JDK 25 Vector API, JEP 508:
+  https://openjdk.org/jeps/508
+* JDK 25 Vector API documentation:
+  https://docs.oracle.com/en/java/javase/25/docs/api/jdk.incubator.vector/module-summary.html
+* Foreign Function & Memory API, JEP 454:
+  https://openjdk.org/jeps/454
+* Java Microbenchmark Harness:
+  https://github.com/openjdk/jmh
+* JMH samples:
+  https://github.com/openjdk/jmh/tree/master/jmh-samples/src/main/java/org/openjdk/jmh/samples
+* Java Flight Recorder documentation:
+  https://docs.oracle.com/en/java/javase/25/jfapi/
+* async-profiler:
+  https://github.com/async-profiler/async-profiler
+* JITWatch:
+  https://github.com/AdoptOpenJDK/jitwatch
+* Epsilon GC, JEP 318:
+  https://openjdk.org/jeps/318
+* Unsafe memory-access deprecation, JEP 471:
+  https://openjdk.org/jeps/471
+
+Books and long-form references
+------------------------------
+
+* Scott Oaks, Java Performance: In-Depth Advice for Tuning and Programming
+  Java Applications, 2nd edition. Useful for HotSpot, JIT, GC, and measurement.
+* Charlie Hunt, Binu John, Java Performance. Older, but strong on methodology,
+  profiling, runtime behavior, and hardware fundamentals.
+* Aleksey Shipilev, Java/JVM Anatomy Quarks. Not a conventional book; concise
+  experiments explaining object layout, barriers, profiling, and JIT effects.
+* Brendan Gregg, Systems Performance, 2nd edition. Essential for CPU, caches,
+  memory, OS scheduling, flame graphs, and evidence-driven diagnosis.
+* Ulrich Drepper, What Every Programmer Should Know About Memory. Older hardware
+  details need validation, but the cache/locality model remains valuable.
+* Agner Fog, Optimizing Software in C++ and instruction tables. Language differs,
+  but instruction latency, throughput, SIMD, cache, and branch analysis apply
+  when inspecting JIT-generated x86 code.
+* Henry S. Warren, Hacker's Delight, 2nd edition. Bit manipulation techniques;
+  use only transformations proven equivalent to BLAKE3 and benchmarked on C2.
+* Daniel Lemire's papers and technical writing on SIMD, parsing, bit operations,
+  and benchmarking. Translate ideas through the Vector API and verify assembly.
+
+
+FINAL RULE
+==========
+
+No technique in this document is a command to make the code strange. It is a
+command to form a hypothesis, preserve correctness, measure the complete target
+workload, inspect what HotSpot actually emitted, and keep the change only when
+the evidence is repeatable. FastBlake may be ugly inside a small, well-tested
+kernel. The rest of the project should remain simple enough that the kernel can
+be trusted, replaced, and measured.
