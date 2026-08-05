@@ -2,9 +2,10 @@
 
 A pure-JVM BLAKE3 implementation, optimised for throughput.
 
-Status: **harness complete, implementations not written.** The comparison
-pipeline — correctness and performance, four contenders — runs today. Two of the
-four contenders are real; the two FastBlake ones are the work ahead.
+Status: **CPU implementation and comparison harness complete.** FastBlake now
+implements the full BLAKE3 API in dependency-free Java. The scalar kernel is the
+correctness and performance baseline for the forthcoming SIMD kernel; GPU
+offload remains planned work.
 
 ```
 ./gradlew contenders   # what can run here, and why anything can't
@@ -18,7 +19,7 @@ four contenders are real; the two FastBlake ones are the work ahead.
 |---|---|---|
 | `commons` | Apache Commons Codec `Blake3`, scalar Java | The floor. Always available. |
 | `rust` | Reference [`blake3`][crate] crate via FFM, SIMD, single-threaded | The ceiling. Optional. |
-| `java-cpu` | FastBlake CPU — Vector API | **To build.** |
+| `java-cpu` | FastBlake CPU — allocation-free scalar Java | Implemented and always available. |
 | `java-gpu` | FastBlake GPU — device offload | **Planned.** |
 
 Everything is measured through one interface, `Blake3Engine`, so all four face
@@ -26,7 +27,7 @@ identical call shapes on identical bytes. Adding a contender is one class plus
 one line in `Contenders` — no test or benchmark changes.
 
 **Absence is never failure.** A contender that cannot run here — no Rust
-toolchain, no GPU, not written yet — reports *why* and is skipped. A machine
+toolchain or no GPU — reports *why* and is skipped. A machine
 with no Rust gets the same green build with one fewer column. That property is
 tested, not assumed: breaking the crate build on purpose leaves `test` and `jmh`
 passing with `rust` correctly reported as unavailable.
@@ -59,7 +60,8 @@ per contender:
 - `reset()` returns to the initial state,
 - input and output offsets are honoured without clobbering neighbouring bytes.
 
-362 assertions with Rust present, 182 without.
+The suite covers hundreds of cases with Rust present and remains fully usable
+without a native toolchain.
 
 ## Benchmarks
 
@@ -178,12 +180,21 @@ platform that produces no shared library each record a reason in
 that directory as authoritative — a stale artifact in the crate's own `target/`
 will **not** resurrect a contender the current build failed to produce.
 
-## Next step
+## Current FastBlake CPU implementation
 
-Implement `FastBlake` (currently an API skeleton whose methods throw), then
-delete the `unavailableReason()` override in `JavaCpuEngine`. Conformance
-against the official vectors, all three benchmark shapes, and the comparison
-table are already wired and start producing numbers immediately.
+`FastBlake` supports ordinary hashing, keyed hashing, context-based key
+derivation, arbitrary-length XOF output, incremental updates, repeatable
+finalization and reset. Its update hot path reuses flat primitive scratch and a
+flat chaining-value stack; completed chunks allocate nothing. The final chunk
+is deliberately retained until finalization so the correct `ROOT` node remains
+available for XOF output.
+
+A focused 8 MiB run (1 fork, 3 warmup and 3 measurement iterations) measured
+679 MiB/s one-shot, 673 MiB/s with instance reuse, and 661 MiB/s with 4 KiB
+streaming updates: 1.23–1.24× Commons Codec on this machine. This is the scalar
+baseline, not the end state. The next CPU milestone is a Vector API
+`hash_many` kernel over independent 1 KiB chunks, followed by batched parent
+compression and wider streaming buffering.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

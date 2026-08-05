@@ -9,10 +9,8 @@ import com.pedrobatista.fastblake.FastBlake;
  * gap to the Rust contender as the JVM allows. The levers are the Vector API for
  * BLAKE3's 8-way/16-way chunk parallelism, and flattening per-call setup.
  *
- * <p><b>To switch this contender on:</b> implement {@link FastBlake}, then delete
- * the {@link #unavailableReason()} override below. Everything else — conformance
- * against the official vectors, all three benchmark shapes, the comparison
- * table — is already wired and starts producing numbers immediately.
+ * <p>The scalar implementation is always available. Vectorized kernels can be
+ * selected internally when the runtime and input shape support them.
  */
 final class JavaCpuEngine implements Blake3Engine {
 
@@ -34,13 +32,7 @@ final class JavaCpuEngine implements Blake3Engine {
 
     @Override
     public String displayName() {
-        return "FastBlake CPU (Java, Vector API)";
-    }
-
-    @Override
-    public String unavailableReason() {
-        // Delete this override once FastBlake is implemented.
-        return "not implemented yet — FastBlake is still an API skeleton";
+        return "FastBlake CPU (Java, scalar)";
     }
 
     @Override
