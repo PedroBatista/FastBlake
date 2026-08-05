@@ -113,3 +113,41 @@ Correctness after dispatch change: full `./gradlew test` passed. The default
 path has no material regression. These confirmation figures came from a
 FastBlake-only run using the same fork/warmup/measurement counts; the immediately
 preceding full comparison supplied the contemporaneous Commons and Rust values.
+
+## E003 — named row vectors with intra-block SIMD
+
+Date: 2026-08-06
+
+Change: represent the 16 compression words as four named 128-bit row vectors.
+Column G functions operate lane-wise; diagonal G functions rotate lanes with
+fixed shuffles. Message schedules use indexed Vector API loads. Unlike E002,
+there are no vector arrays and no cross-chunk byte packing. Enable with
+`-Dfastblake.experimental.blockVector=true`.
+
+Correctness: full `./gradlew test` passed with the property enabled, covering
+all modes, official vectors, XOF, and incremental boundary shapes.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E003 | E001 scalar | E003 vs E001 |
+|---|---:|---:|---:|---:|---:|
+| one-shot | 551 MiB/s | 2501 MiB/s | 64 MiB/s | 679 MiB/s | 0.09x |
+| reused | 542 MiB/s | 2441 MiB/s | 63 MiB/s | 673 MiB/s | 0.09x |
+| streaming 4 KiB | 536 MiB/s | 2282 MiB/s | 63 MiB/s | 661 MiB/s | 0.10x |
+
+Decision: reject for default dispatch. Retain separately from E002 because it
+tests a different SIMD layout and is useful negative evidence.
+
+Comment: BLAKE3's G function has dependencies between its four scalar words;
+putting the four columns into vector lanes exposes only four-way work within a
+single block and requires lane shuffles for every diagonal half-round. Worse,
+the permuted message schedule requires indexed gathers. On this Apple M5/JDK 25
+combination those operations overwhelm the saved scalar arithmetic. This is
+slower than E002 and about 10.5x slower than E001.
+
+Rule learned: do not vectorize columns inside one BLAKE3 block on this JVM.
+Return to independent chunks per lane, but keep every lane-vector as a named
+local, load four contiguous words from each chunk, and transpose 4x4 registers.
+No `IntVector[]`, indexed gathers, scalar word packing, or helper-owned mutable
+state may appear in the compression hot path. Inspect generated assembly before
+promoting any subsequent Vector API result.

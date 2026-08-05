@@ -196,7 +196,10 @@ baseline, not the end state. The next CPU milestone is a Vector API
 `hash_many` kernel over independent 1 KiB chunks, followed by batched parent
 compression and wider streaming buffering. The first array-based Vector API
 experiment is retained behind `-Dfastblake.experimental.vector=true` but is
-disabled by default because measurement showed a severe regression. See
+disabled by default because measurement showed a severe regression. A second
+intra-block row-vector experiment is retained behind
+`-Dfastblake.experimental.blockVector=true` and is also disabled after indexed
+gathers and diagonal shuffles proved even slower. See
 `reference/performance/experiments.md` for the results and follow-up design.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure

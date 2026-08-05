@@ -19,6 +19,8 @@ public final class FastBlake {
     // enable an experimental kernel by default before the ledger shows a win.
     private static final boolean USE_EXPERIMENTAL_VECTOR =
             Boolean.getBoolean("fastblake.experimental.vector");
+    private static final boolean USE_EXPERIMENTAL_BLOCK_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.blockVector");
 
     private static final int OUT_LEN = 32;
     private static final int KEY_LEN = 32;
@@ -34,7 +36,7 @@ public final class FastBlake {
     private static final int DERIVE_KEY_CONTEXT = 32;
     private static final int DERIVE_KEY_MATERIAL = 64;
 
-    private static final int[] IV = {
+    static final int[] IV_WORDS = {
             0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
             0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
     };
@@ -76,7 +78,7 @@ public final class FastBlake {
 
     /** Returns a hasher in ordinary hashing mode. */
     public static FastBlake initHash() {
-        return new FastBlake(IV, 0);
+        return new FastBlake(IV_WORDS, 0);
     }
 
     /** Returns a keyed hasher. The key must contain exactly 32 bytes. */
@@ -93,7 +95,7 @@ public final class FastBlake {
     /** Returns a key-derivation hasher over a UTF-8 context string. */
     public static FastBlake initKeyDerivationFunction(byte[] context) {
         Objects.requireNonNull(context, "context");
-        FastBlake contextHasher = new FastBlake(IV, DERIVE_KEY_CONTEXT);
+        FastBlake contextHasher = new FastBlake(IV_WORDS, DERIVE_KEY_CONTEXT);
         contextHasher.update(context);
         byte[] contextKey = contextHasher.doFinalize(KEY_LEN);
         int[] words = new int[8];
@@ -306,8 +308,12 @@ public final class FastBlake {
 
     private static void compress(int[] cv, int[] block, long counter, int blockLength,
                                  int flags, int[] state) {
+        if (USE_EXPERIMENTAL_BLOCK_VECTOR) {
+            Blake3BlockVector.compress(cv, block, counter, blockLength, flags, state);
+            return;
+        }
         System.arraycopy(cv, 0, state, 0, 8);
-        System.arraycopy(IV, 0, state, 8, 4);
+        System.arraycopy(IV_WORDS, 0, state, 8, 4);
         state[12] = (int) counter;
         state[13] = (int) (counter >>> 32);
         state[14] = blockLength;
