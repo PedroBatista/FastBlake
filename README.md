@@ -217,9 +217,11 @@ streaming updates: 1.61–1.62× Commons Codec on this machine. The production
 compressor uses 16 named integer locals and seven fully expanded rounds; the
 former array-and-loop compressor remains selectable with
 `-Dfastblake.experimental.legacyScalar=true` for diagnostic comparisons. The
-next CPU milestone is a Vector API
-`hash_many` kernel over independent 1 KiB chunks, followed by batched parent
-compression and wider streaming buffering. The first array-based Vector API
+Vector API `hash_many` kernel over independent 1 KiB chunks has since landed as
+E011, described below; the remaining CPU milestones are batching that kernel
+across streaming updates, batched parent compression, and the scalar data-path
+work (little-endian VarHandle loader, direct-input bypass, message locals) that
+compounds with both. The first array-based Vector API
 experiment is retained behind `-Dfastblake.experimental.vector=true` but is
 disabled by default because measurement showed a severe regression. A second
 intra-block row-vector experiment is retained behind

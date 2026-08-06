@@ -30,6 +30,18 @@ Current measured ceiling on the development machine (Apple M5, JDK 25.0.4):
   8 MiB reused state      538 MiB/s         2402 MiB/s       4.46x
   8 MiB, 4 KiB updates    534 MiB/s         2240 MiB/s       4.19x
 
+Where FastBlake stands between those two, at the E011 measurement (8 MiB,
+1 fork, 3 warmup and 3 measurement iterations):
+
+                         E009 scalar        E011 SIMD       E011 / Rust
+  8 MiB one-shot          894 MiB/s         1584 MiB/s       63%
+  8 MiB reused state      883 MiB/s         1569 MiB/s       63%
+  8 MiB, 4 KiB updates    874 MiB/s          874 MiB/s       38%
+
+E009 is the production default. E011 is opt-in behind
+-Dfastblake.experimental.scratchChunkVector=true and does not yet batch across
+4 KiB updates, which is why the streaming row is unchanged.
+
 These numbers are a local baseline, not a portable promise. Re-measure after
 changes in CPU, JDK, JVM flags, power mode, or thermal conditions.
 
@@ -152,6 +164,18 @@ Such a design is an experiment, not the default.
 
 Vector rules:
 
+0. ALLOCATION GATE, BEFORE EVERYTHING ELSE. Measure bytes allocated per input
+   byte, in a fork running only that kernel, before recording any throughput
+   number. Use -prof gc or ThreadMXBean.getThreadAllocatedBytes. A kernel whose
+   allocation scales with input is not measuring the algorithm it claims to
+   implement; discard its throughput instead of reasoning about it. Build the
+   kernel one rung at a time and re-measure after every addition, stopping at
+   the first rung with input-proportional allocation and restructuring there.
+   This is not general advice about garbage: E002-E008 each skipped it, each
+   allocated 159-255 bytes per input byte, and each produced a wrong causal
+   explanation from a score that measured wrapper allocation and GC. E011
+   applied the gate and reached 1584 MiB/s. See experiments.md E010 and E011.
+
 1. JDK 25 uses the tenth-incubator Vector API. Compile and run with
    --add-modules jdk.incubator.vector and keep the incubator dependency isolated
    so migration is localized.
@@ -175,15 +199,30 @@ Vector rules:
 
    Gather and shuffle instructions vary greatly across CPUs. The fastest
    compression kernel can lose overall after packing costs.
+
+   Settled on AArch64 by E011: transpose each four-chunk message block once
+   into a reusable primitive int[64] in word-major order and load scheduled
+   message words from that L1-resident scratch. Do NOT keep sixteen message
+   words live as vector values. Every kernel that did (E004 and E008 as a
+   block-wide vector cache, E005 retransposing per use, E006 per round) failed
+   the allocation gate. Keeping messages in a primitive array is what let the
+   sixteen state vectors stay scalar-replaced.
 8. Process as many complete chunk batches as possible, then a smaller supported
    vector kernel or scalar tail. Never pad with fictitious chunks unless masks
    and flags make the result provably equivalent.
 9. Keep per-batch chaining values in flat primitive storage. Reuse scratch
    arrays owned by the hasher; do not allocate a matrix per batch.
-10. Measure register spilling. Seven unrolled rounds over sixteen vector state
-    words can exceed available vector registers, especially with message words
-    live simultaneously. Recompute cheap values or split method structure if it
-    reduces spills.
+10. The dominant hazard is escape analysis, not register spilling. Vector scalar
+    replacement fails abruptly and non-monotonically as the compiler graph grows:
+    E011 measured six fully expanded rounds at effectively zero allocation and
+    seven at 43,776 bytes per block invocation, a cliff no spilling model
+    predicts. Replacing the expanded rounds with a compact seven-iteration
+    schedule loop restored zero allocation. Smaller is also not reliably safer:
+    an isolated 128-bit add-only chain boxed at 48 bytes per iteration while a
+    longer add/xor/rotate chain did not. Minimize the compiler graph, prefer a
+    compact loop over full expansion, and re-run rule 0 after any change to
+    method size. Do not infer allocation from source shape, from a successful
+    C2 compilation, or from a register-pressure argument.
 11. Consider two-vector or multi-batch software pipelining only after the basic
     kernel is proven. It may hide load latency but often worsens register pressure.
 12. Test AVX-512 separately. Wider lanes may improve BLAKE3, but instruction
@@ -624,9 +663,22 @@ P0 correctness architecture
 P1 largest expected throughput wins
 
 * 4-lane IntVector chunk kernel for the current Apple/AArch64 machine.
-* In-register 4x4 message transpose; keep CV state transposed for 16 blocks.
+  DONE in E011 at 1584 MiB/s, opt-in behind
+  -Dfastblake.experimental.scratchChunkVector=true.
+* Message transpose into a reusable primitive int[64] word-major scratch, with
+  the 16 CV state words held as named IntVector locals across the 16 blocks.
+  Supersedes the in-register 4x4 message transpose this list previously
+  recommended: that shape is what E004-E008 built and it never passed the
+  allocation gate. See vector rules 0, 7 and 10.
 * Four-wide parent batching and direct caller-array processing.
-* Bounded 4 KiB streaming batch buffer with direct-input bypass.
+* Bounded 4 KiB streaming batch buffer with direct-input bypass. Still open:
+  E011's streaming shape remains at the scalar 874 MiB/s because 4 KiB updates
+  never enter the four-chunk branch.
+* Scalar data-path work that compounds with the above and is not yet done: a
+  cached little-endian VarHandle loader (measured 3.51x on the loader alone,
+  about 6.7% end-to-end), a direct-input bypass avoiding the per-byte copy
+  through the 1 KiB chunk buffer, and message words as named locals instead of
+  an int[16] round trip.
 
 P2 portability and wider machines
 

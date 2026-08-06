@@ -210,6 +210,15 @@ unskippable.
 
 ### 1. Re-open 4-lane NEON, built allocation-first — target ~2× (894 → ~1800–2400 MiB/s)
 
+> **Outcome (E011).** Executed. The measured result is 1584 MiB/s one-shot,
+> 1.77× the scalar default and 63% of Rust, with allocation flat at fixed setup
+> cost. The estimate above was optimistic by roughly 15%. The structural
+> proposal below — primitive `int[64]` message scratch, 16 named state vectors —
+> is what carried it, together with one thing not anticipated here: seven fully
+> expanded rounds cross a C2 escape-analysis cliff, and a compact seven-iteration
+> round loop is required to stay allocation-free. See `experiments.md` § E011 and
+> `e011-allocation-first-vector-plan.md`.
+
 The headroom is demonstrated, not speculative: the reference Rust implementation
 reaches 2500 MiB/s using exactly this 4-lane NEON chunk-parallel structure on
 this machine. The reason Java failed to reach it is now known and mechanical.
