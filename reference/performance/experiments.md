@@ -1559,3 +1559,32 @@ state traffic on each of 56 calls. Decision: reject for production and retain
 only as a benchmark control. Full commands, raw-result names, qualifications,
 and the counter-unblock procedure are in
 `reference/performance/results/e017-n97.md`.
+
+## E018 — partial unrolling and the three-copy cliff
+
+Date: 2026-08-06
+
+E017's next fork tested whether compression's instruction count could be
+reduced by partially unrolling the seven-round Vector API loop. Raising C2's
+global `LoopUnrollLimit` produced no useful improvement. Explicit 2x and 3x
+forms with a peeled seventh round contain respectively three and four static
+round-body copies; both cross escape analysis and reach about 43,776 B/op.
+
+A guarded 2x form handles the odd tail with only two static copies. It passes
+the allocation and constructor-correctness gates. After the larger compilation
+had seven warmup iterations, CPU-3 counters measured 227.476 ns, 688.4 cycles,
+1,942.0 instructions and 136.2 branches per block, versus 239.551 ns, 696.6
+cycles, 1,992.3 instructions and 139.5 branches for the compact loop. That is a
+5.0% isolated time improvement but only 2.5% fewer instructions and 2.3% fewer
+branches. hdis shows why composition is risky: stable C2 code grows from 4,720
+to 20,872 bytes.
+
+The risk materialized in the exact production-kernel gate. The integrated
+guarded form remained correct and allocation-free but took 6,515.209 ns per
+four-chunk batch versus 4,286.171 ns after restoring the compact loop, a
+**52.0% regression**. Decision: reject partial unrolling and leave production
+unchanged. Loop bookkeeping is quantitatively too small to explain the
+Java/Rust gap, while source duplication destroys full-method compiler quality.
+The next candidate should be a custom-JDK constant ROR8/ROR16 lowering to
+AVX2 `vpshufb`, preserving the compact Java graph. Full results and commands are
+in `reference/performance/results/e018-n97.md`.

@@ -330,6 +330,13 @@ cycle gap is therefore instruction volume, not poor issue utilization or a
 cache bottleneck. Details and reproducible commands are in the E017 result
 document.
 
+E018 rules out Java-source partial unrolling as the remedy. The best
+allocation-free guarded 2x block removes only 2.5% of instructions in
+isolation; its C2 body grows from 4.7 KiB to 20.9 KiB, and integration regresses
+the exact four-chunk kernel by 52%. Production therefore retains the compact
+seven-iteration loop; the next useful target is custom-JDK AVX2 lowering of
+constant ROR8/ROR16 without expanding the Java Vector API graph.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
