@@ -192,13 +192,27 @@ JAVA_TOOL_OPTIONS="-Dfastblake.experimental.<kernel>=true" \
 
 | kernel | ns/op | B/op | B per input byte | env A B/input byte | gc.count |
 |---|---:|---:|---:|---:|---:|
+| E002 `vector` | 62,353,318 | 503,567,842 | **60.030** | not measured | 19 |
+| E003 `blockVector` | 140,902,632 | 835,584,039 | **99.610** | not measured | 10 |
 | E008 `heapChunkVector` | 965,715,828 | 1,333,932,852 | **159.017** | 158.76 | 4 |
 | E004 `chunkVector4` | 1,022,644,560 | 1,333,934,658 | **159.017** | 158.90 | 3 |
 | E006 `roundCacheVector` | 1,169,385,487 | 1,786,700,064 | **212.991** | 212.99 | 2 |
 | E005 `lowLiveVector` | 1,407,521,087 | 2,138,849,552 | **254.971** | 254.61 | 3 |
 
-Derived throughput: 8.28, 7.82, 6.84 and 5.68 MiB/s respectively — the same rank
-order as environment A, and worse in absolute terms as expected on a slower part.
+Derived throughput: 128.3, 56.8, 8.28, 7.82, 6.84 and 5.68 MiB/s respectively.
+The four kernels E010 measured keep the same rank order as environment A, and
+are worse in absolute terms as expected on a slower part.
+
+E002 and E003 were **not** in E010's allocation driver; their causal
+explanations were left explicitly unverified rather than disproved. This entry
+closes that gap. Both allocate heavily — 60.03 and 99.61 bytes per input byte —
+so both fail the allocation gate, and their E002/E003 rejection rationales
+(array escape and scalar packing; lane shuffles and indexed gathers overwhelming
+the saved arithmetic) join E004–E008's as unproven. Every Vector API kernel in
+this project except E011 is an allocating kernel.
+
+E002 is the interesting one, because it is the only width-generic kernel in the
+tree — see Result 6.
 
 This is the strongest result in the document. The allocation figures agree with
 environment A to three significant figures across a **different architecture,
@@ -402,6 +416,78 @@ explored, it is not a redesign — it is a species change plus an eight-lane
 transpose, on a kernel whose compiler shape is already proven on both
 architectures.
 
+## Result 6 — where the width is hard-coded, and why
+
+Audit of every `VectorSpecies` declaration in the tree:
+
+| file | species | is 4 lanes semantic? |
+|---|---|---|
+| `Blake3Vector` (E002) | `SPECIES_PREFERRED` | **no — fully width-generic** |
+| `Blake3BlockVector` (E003) | `SPECIES_128` | **yes** — intrinsic to the algorithm |
+| `Blake3ChunkVector4` (E004) | `SPECIES_128` | no — arbitrary batch size |
+| `Blake3ChunkVectorLowLive` (E005) | `SPECIES_128` | no |
+| `Blake3ChunkVectorRoundCache` (E006) | `SPECIES_128` | no |
+| `Blake3ChunkVectorHeap` (E008) | `SPECIES_128` | no |
+| `Blake3ChunkVectorScratch` (E011) | `SPECIES_128` | no |
+| `VectorPrimitiveBenchmark`, `VectorAllocationBenchmark` | `SPECIES_128` | diagnostic only |
+
+Only E003's 128 is a real constraint. It places the four words of a BLAKE3 state
+*row* in lanes and rotates them with fixed `VectorShuffle`s (`LEFT_1`, `LEFT_2`,
+`LEFT_3` over exactly four lanes) for the diagonal half-rounds. BLAKE3's state is
+4x4; that kernel cannot be widened, and it was rejected on other grounds anyway.
+
+Every chunk-parallel kernel — E004 through E008 and E011 — puts one *chunk* per
+lane. Lane count there is just batch size. Nothing in BLAKE3 requires four.
+
+The hard-coding entered at E003's "rule learned", which prescribed "load four
+contiguous words from each chunk, and transpose 4x4 registers". On environment A
+that was free: `IntVector.SPECIES_PREFERRED` is 128-bit on NEON, so "four lanes",
+"a 4x4 transpose" and "the full machine width" were the same number and never had
+to be distinguished. E004 adopted 4 for the transpose geometry and every
+successor inherited it. The assumption only became visible on a machine where
+preferred width and 4 differ.
+
+Two pieces of evidence that width-generality was the original intent and was lost
+rather than rejected. First, E002 is titled "preferred-width Vector API chunk
+compression" and is written generically throughout — `LANES = SPECIES.length()`,
+`packedWordsLength() = 16 * LANES`, `outputLength() = 8 * LANES`, and loops over
+`LANES` rather than a literal. Second, and more telling, **`FastBlake` still
+sizes its scratch buffers for the preferred width**: `vectorPacked` is
+`new int[Blake3Vector.packedWordsLength()]` and `vectorCvs` is
+`new int[Blake3Vector.outputLength()]` (`FastBlake.java:82-95`), for *all* the
+vector kernels including E011. On this machine those are `int[128]` and
+`int[64]`, while `Blake3ChunkVectorScratch` only ever touches the first 64 and 32
+entries. The harness is already provisioned for eight lanes; only the kernels
+narrowed.
+
+**E002 does not, however, show that preferred width is sufficient on its own.**
+It runs at eight lanes on this machine and still only reaches 128.3 MiB/s, half
+the scalar path, because it allocates 60 bytes per input byte (Result 2). Width
+and the allocation-free compiler shape are independent requirements: E002 has the
+width and fails the gate, E011 has the shape and is half-width. The win is
+grafting E011's shape onto E002's genericity, which is what idea 1 proposes.
+
+What a width change actually touches in `Blake3ChunkVectorScratch`, none of which
+is a one-line species swap:
+
+- the transpose stride, `destination = word * 4` and
+  `for (lane = 0; lane < 4; lane++)` with `offset + lane * 1024` (lines 48-57);
+- the counter staging, which occupies `messages[0..3]` for the low words and
+  `messages[4..7]` for the high words (lines 28-37) — that layout collides with
+  the message scratch as soon as the lane count changes;
+- CV extraction, 32 explicit `cvN.lane(0..3)` statements (lines 172-203), which
+  would become 64 at eight lanes;
+- the message scratch length, `16 * LANES` rather than a literal 64;
+- in `FastBlake`, the dispatch guard `remaining > 4 * CHUNK_LEN`, the
+  `for (lane = 0; lane < 4; lane++)` CV push loop, and the four
+  `chunksCompressed++` increments (lines 173-185).
+
+Changing only the species constant would compile and would silently mis-hash:
+the transpose stride would no longer match the species length, so lanes 4-7 would
+read from the wrong offsets, and half the chunk CVs would never be extracted. The
+conformance suite would catch it — but it is a coordinated change to six
+locations, not a one-line swap.
+
 ## What this document does not establish
 
 Recorded so these gaps are not mistaken for coverage.
@@ -412,10 +498,10 @@ Recorded so these gaps are not mistaken for coverage.
   particularly for finding 5b, which is specifically about core width. Finding
   5b should be read as "E009's advantage depends on core width, demonstrated by
   one narrow core", not as a general x86-64 result.
-- **E002 (`vector`) and E003 (`blockVector`) were conformance-tested only.** No
-  allocation or throughput measurement was taken for them here, exactly as E010
-  omitted them. Their causal explanations remain unverified on both
-  architectures.
+- **E002 and E003 now have measured allocation (Result 2), but only on
+  environment B.** Both fail the gate here; neither was measured on environment
+  A, so the E010-style comparison that exists for E004–E008 does not exist for
+  them.
 - **No mnemonic assembly was inspected.** This Temurin build has no `hsdis`
   library either (`$JAVA_HOME/lib/hsdis*` does not exist), so the same limitation
   as environment A applies: allocation behaviour is proven, but the exact

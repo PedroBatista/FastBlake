@@ -245,7 +245,20 @@ scalar path and 63% of Rust on the Apple M5. E012 validated it on x86-64, where
 it is a *larger* relative win — 2.54x the scalar path — while still passing the
 allocation gate and the full official-vector suite. It remains opt-in behind
 `-Dfastblake.experimental.scratchChunkVector=true` while streaming batching is
-completed. A fully expanded seven-round variant is
+completed.
+
+E013 answered the width question E012 raised. `Blake3ChunkVectorWide` is E011's
+kernel with the species and every derived stride taken from
+`IntVector.SPECIES_PREFERRED`, so one chunk per lane means as many chunks as the
+machine is wide; enable it with
+`-Dfastblake.experimental.wideChunkVector=true`. It is correct, passes the
+allocation gate at 0.00071 B/input byte, and does not hit the seven-round cliff
+at eight lanes — and it is **3–4% slower** than the four-lane kernel on AVX2, so
+it is not promoted. Doubling the width helped compression by only 5% per byte,
+while the *scalar* byte-shift transpose — about 30% of the kernel, and untouched
+by any amount of vector width — got 21% worse per byte from striding across
+eight chunks instead of four. The transpose, not the lane count, is now the
+largest identified target in the SIMD path. A fully expanded seven-round variant is
 retained only as diagnostic evidence: it crosses a C2 cliff and allocates
 43,776 bytes per block invocation, while the compact loop allocates effectively
 zero.

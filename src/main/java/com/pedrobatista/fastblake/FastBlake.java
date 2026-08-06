@@ -34,10 +34,24 @@ public final class FastBlake {
                     && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
     private static final boolean USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.scratchChunkVector");
+    // E013 is E011's kernel at the machine's preferred vector width. On a
+    // 128-bit target the two are the same shape and the same lane count; the
+    // property exists so the width change can be measured on its own.
+    private static final boolean USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.wideChunkVector");
     // E009 promoted the named-local compressor. Keep the former loop as a
     // diagnostic control so its baseline remains directly reproducible.
     private static final boolean USE_LEGACY_SCALAR =
             Boolean.getBoolean("fastblake.experimental.legacyScalar");
+
+    /** True when any experimental kernel needing the vector scratch is on. */
+    private static final boolean ANY_VECTOR_KERNEL = USE_EXPERIMENTAL_VECTOR
+            || USE_EXPERIMENTAL_CHUNK_VECTOR4
+            || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
+            || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
+            || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
+            || USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
+            || USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR;
 
     private static final int OUT_LEN = 32;
     private static final int KEY_LEN = 32;
@@ -79,20 +93,15 @@ public final class FastBlake {
     private final int[] scratchState = new int[16];
     private final int[] scratchWords = new int[16];
     private final int[] scratchCv = new int[8];
-    private final int[] vectorPacked = USE_EXPERIMENTAL_VECTOR
-            || USE_EXPERIMENTAL_CHUNK_VECTOR4
-            || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
-            || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
-            || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
-            || USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
-            ? new int[Blake3Vector.packedWordsLength()] : null;
-    private final int[] vectorCvs = USE_EXPERIMENTAL_VECTOR
-            || USE_EXPERIMENTAL_CHUNK_VECTOR4
-            || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
-            || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
-            || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
-            || USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
-            ? new int[Blake3Vector.outputLength()] : null;
+    // Sized for the widest kernel any enabled property can select. Blake3Vector
+    // and Blake3ChunkVectorWide both scale with the preferred species, so this
+    // already covers the four-lane kernels on a wider machine.
+    private final int[] vectorPacked = ANY_VECTOR_KERNEL
+            ? new int[Math.max(Blake3Vector.packedWordsLength(),
+                    Blake3ChunkVectorWide.packedWordsLength())] : null;
+    private final int[] vectorCvs = ANY_VECTOR_KERNEL
+            ? new int[Math.max(Blake3Vector.outputLength(),
+                    Blake3ChunkVectorWide.outputLength())] : null;
 
     private int chunkLength;
     private long chunksCompressed;
@@ -168,6 +177,20 @@ public final class FastBlake {
                 chunksCompressed++;
                 pushChunkCv(scratchCv, chunksCompressed);
                 chunkLength = 0;
+            }
+
+            if (USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR && chunkLength == 0
+                    && remaining > Blake3ChunkVectorWide.LANES * CHUNK_LEN) {
+                Blake3ChunkVectorWide.hashChunks(input, position, chunksCompressed,
+                        key, modeFlags, vectorPacked, vectorCvs);
+                for (int lane = 0; lane < Blake3ChunkVectorWide.LANES; lane++) {
+                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    chunksCompressed++;
+                    pushChunkCv(scratchCv, chunksCompressed);
+                }
+                position += Blake3ChunkVectorWide.LANES * CHUNK_LEN;
+                remaining -= Blake3ChunkVectorWide.LANES * CHUNK_LEN;
+                continue;
             }
 
             if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR && chunkLength == 0

@@ -636,10 +636,18 @@ Same protocol as E010: 8 MiB one-shot, one isolated fork per kernel, `-prof gc`.
 
 | kernel | env B B/op | env B B/input byte | env A B/input byte |
 |---|---:|---:|---:|
+| E002 `vector` | 503,567,842 | **60.03** | not measured |
+| E003 `blockVector` | 835,584,039 | **99.61** | not measured |
 | E008 `heapChunkVector` | 1,333,932,852 | **159.02** | 158.76 |
 | E004 `chunkVector4` | 1,333,934,658 | **159.02** | 158.90 |
 | E006 `roundCacheVector` | 1,786,700,064 | **213.00** | 212.99 |
 | E005 `lowLiveVector` | 2,138,849,552 | **254.97** | 254.61 |
+
+E002 and E003 were outside E010's allocation driver and their rejection
+rationales were left explicitly unverified. This entry closes that gap: both
+allocate heavily and both fail the gate, so **every Vector API kernel in this
+project except E011 is an allocating kernel**, and none of the E002–E008 causal
+explanations survive. Derived throughput here: 128.3 and 56.8 MiB/s.
 
 The figures agree with environment A to three significant figures on a different
 architecture, OS, and JVM build. C2's failure to eliminate `IntVector` wrappers
@@ -754,12 +762,25 @@ measured per architecture like allocation is. Every future performance claim
 must name its environment; E012 shows that two of this project's headline ratios
 (E009's 1.61x and E011's 63%-of-Rust) do not transfer.
 
+Species audit (Result 6 in the detail document): only `Blake3BlockVector`'s
+`SPECIES_128` is semantic — it holds a BLAKE3 state *row* in lanes and shuffles
+over exactly four, so 4x4 is the algorithm. Every chunk-parallel kernel
+(E004–E008, E011) puts one *chunk* per lane, where the lane count is only a batch
+size. Their 128 traces to E003's rule learned, which prescribed "transpose 4x4
+registers"; on environment A four lanes *was* the preferred width, so batch size
+and machine width were the same number and never had to be separated. E002 is the
+only width-generic kernel and already runs eight lanes here — and still fails the
+gate at 60 B/input byte, which shows width and the allocation-free shape are
+independent requirements. Note that `FastBlake` already sizes `vectorPacked` and
+`vectorCvs` from `Blake3Vector`'s *preferred*-width helpers, so the harness is
+provisioned for eight lanes today; only the kernels narrowed.
+
 Not established by this entry, so these gaps are not mistaken for coverage: only
 one x86-64 machine was tested and it is an E-core-only part with no P-core and
 no AVX-512, so finding 5b is "E009's advantage depends on core width, shown on
-one narrow core", not a general x86-64 result; E002 and E003 were
-conformance-tested only, with no allocation or throughput measured, exactly as
-E010 left them; no mnemonic assembly was inspected because this Temurin build
+one narrow core", not a general x86-64 result; E002 and E003 have allocation
+figures only on environment B, so the cross-architecture comparison that exists
+for E004–E008 does not exist for them; no mnemonic assembly was inspected because this Temurin build
 also lacks `hsdis`, so whether `VectorOperators.ROR` lowers well on AVX2 — which
 has no general 32-bit vector rotate below AVX-512's `VPRORD` — is untested and
 is a plausible secondary contributor; `heapChunkVector`'s big-endian guard
@@ -777,3 +798,127 @@ Two cheap items should precede it: add `rust-version = "1.85"` to
 loses the ceiling contender on this machine; and re-run
 `VectorPrimitiveBenchmark` to settle the AVX2 `ROR` question before committing to
 a wider kernel's rotate strategy.
+
+## E013 — preferred-width chunk kernel: correct, allocation-free, and slower
+
+Date: 2026-08-06
+Environment: **B** (Intel N97, AVX2 256-bit, `SPECIES_PREFERRED` = 8 int lanes)
+
+Change: add `Blake3ChunkVectorWide`, structurally identical to E011's
+`Blake3ChunkVectorScratch` — reusable primitive word-major message scratch, 16
+named state vectors, compact seven-round schedule loop — with the species and
+every derived stride taken from `IntVector.SPECIES_PREFERRED` instead of a
+hard-coded `SPECIES_128`. One chunk per lane, so the batch is as wide as the
+machine. Enable with `-Dfastblake.experimental.wideChunkVector=true`. The
+four-lane E011 kernel is retained unchanged and remains the 128-bit path.
+Also adds `WideVectorAllocationBenchmark`, the E011 ladder re-parameterised on
+the preferred width, plus an issue-width probe and a register-pressure probe.
+
+Motivation: E012 found the hard-coded 128-bit species cost roughly half the
+available width on AVX2 while the Rust crate dispatched to its 8-way kernel.
+
+Correctness: full `./gradlew test` passed with the property enabled — 542 tests
+with all contenders present, covering hash, keyed-hash, derive-key, XOF and
+incremental boundary shapes. Default dispatch unchanged and re-verified.
+
+Allocation gate (run before any throughput figure, per E010). Ladder, one fork
+per method, `-prof gc`:
+
+| rung at 8 lanes | time | allocation | GC |
+|---|---:|---:|---:|
+| wide transpose to scratch | 200.000 ns | 0.001 B/op | 0 |
+| wide seven rounds, compact loop | 445.241 ns | 0.003 B/op | 0 |
+| wide sixteen-block chunk loop | 9497.050 ns | 0.066 B/op | 0 |
+
+Full kernel, 8 MiB one-shot, isolated fork: **5992.889 B/op**, 0.000714 B per
+input byte, zero collections — indistinguishable from E011's 5990.676. Every
+rung passes. The seven-round cliff did **not** reappear at the wider lane count,
+which was the specific risk E012 flagged.
+
+Throughput, 8 MiB, 2 forks × 5 warmup × 5 measurement iterations:
+
+| 8 MiB shape | E013 wide (8 lanes) | E011 (4 lanes) | E009 scalar |
+|---|---:|---:|---:|
+| one-shot | 615 | 642 | 253 |
+| reused | 617 | 637 | 255 |
+| streaming 4 KiB | 252 (scalar route) | 253 | 259 |
+
+**Doubling the vector width made the kernel 3–4% slower.**
+
+Decision: reject for promotion; retain behind
+`-Dfastblake.experimental.wideChunkVector=true`. It is correct, allocation-free
+and structurally right, and it is the kernel a machine with wider *execution*
+should use — but it does not win here and must not become the default on this
+evidence. E011 remains the SIMD candidate; E009 remains the production default.
+
+### Why: the bottleneck is the scalar transpose, not the vector width
+
+Two probes, each in its own fork.
+
+Issue width — the same BLAKE-shaped dependency chain, same operation count, at
+both widths (2 forks × 5 × 8 iterations):
+
+| chain | time | ratio |
+|---|---:|---:|
+| 128-bit | 2735.789 ns | 1.00 |
+| 256-bit | 3645.607 ns | **1.333** |
+
+A 256-bit operation costs 1.333x a 128-bit one while doing twice the work, so at
+the primitive level width is worth about **1.50x**. The execution units are not
+simply 128 bits wide; the width is real and should have paid.
+
+Register pressure — `wideChunkLoop` with the eight chaining vectors moved to a
+primitive array, dropping the live vector set by eight:
+
+| variant | time |
+|---|---:|
+| wide chunk loop | 9497.050 ns |
+| wide chunk loop, chaining values in scratch | 9365.046 ns |
+
+1.4%, inside the protocol's 3% inconclusive band. **Hypothesis not supported.**
+Recorded so it is not retried in this form; note it is a weak discriminator,
+because the chaining vectors are touched once per block while the 16 state
+vectors are touched by every operation and cannot be removed.
+
+Decomposition, all measured at `-f1 -wi 5 -i 5`:
+
+| component | 4 lanes | 8 lanes | change |
+|---|---:|---:|---|
+| transpose, per block | 82.366 ns / 256 B | 200.000 ns / 512 B | |
+| transpose, per byte | 0.3217 ns | 0.3906 ns | **+21.4% worse** |
+| chunk loop, per byte | 1.1311 ns | 1.1593 ns | +2.5% worse |
+| transpose share of loop | 28.4% | 33.7% | |
+| compression, per byte | 0.8093 ns | 0.7687 ns | **−5.0% better** |
+
+This locates the problem precisely. The compression *did* get faster per byte at
+8 lanes — but only 5%, not the 50% the primitive probe predicts, and the scalar
+transpose got 21% worse per byte, which more than cancels it.
+
+The transpose is the explanation for the regression. It is plain scalar
+byte-shift code that gains nothing from wider vectors, it is already ~30% of the
+kernel, and widening makes it worse: it strides across eight 1 KiB chunks
+instead of four, so each block touches 8 KiB of input rather than 4 KiB, over
+eight prefetch streams rather than four, against a 32 KiB L1d.
+
+Why compression gained only 5% rather than 50% is not established. The residual
+hypothesis is that 16 state plus 2 message vectors is 18 live values against
+x86-64's 16 architectural vector registers — a count that does not improve with
+width, while each spill moves twice the bytes. That is consistent with the
+measurements but unconfirmed: mnemonic assembly is unavailable on this JVM
+(no `hsdis`), so spill traffic was not observed directly.
+
+Rule learned: `SPECIES_PREFERRED` is the right *default* for a chunk-parallel
+kernel and the hard-coded 128 was still a portability defect worth fixing — but
+width is not a throughput guarantee, and it must be measured per machine like
+allocation is. More importantly, this experiment mislocated the bottleneck
+before measuring it: **about 30% of this kernel is scalar byte-shift transpose,
+and no amount of vector width touches it.** That is now the largest identified
+target in the SIMD path.
+
+Next experiment: vectorize the transpose. E007 measured
+`ByteVector.fromArray(...).reinterpretAsInts()` at roughly 25x an endian
+`MemorySegment` load, and E008 retained it; the transpose is exactly the place
+that loader belongs, loading contiguous 16-byte rows per chunk and transposing
+in registers rather than assembling words a byte at a time. Gate on allocation
+per rung, and measure it at both widths — a cheaper transpose changes the
+width trade-off, and may make E013 win where it currently loses.
