@@ -1,4 +1,4 @@
-# E010 — why every Vector API kernel failed: box elimination, not register pressure
+# E010 — vector allocation invalidates the E004–E008 throughput interpretation
 
 Date: 2026-08-06
 Type: diagnostic investigation (no production code changed)
@@ -6,26 +6,36 @@ Ledger entry: see `experiments.md` § E010, which summarises and links here.
 
 ## Summary
 
-E002–E008 were each rejected with an explanation built on register pressure,
+E002–E008 were each rejected with explanations built on register pressure,
 spilling, method size, or the Vector API being unsuited to this JVM. Those
-explanations are wrong, or at best incidental.
+explanations were made without an allocation measurement and are unverified.
 
-**Every rejected vector kernel allocates 159–255 bytes of heap per input byte.
-The scalar default allocates zero.** C2 is failing to eliminate `IntVector`
-boxes, so each vector operation heap-allocates a wrapper object and runs through
-generic fallback code. Those kernels never executed a NEON instruction in the
-hot path. Their 20–32 MiB/s scores measure boxed scalar code plus a garbage
-collection storm — they are not evidence about SIMD.
+**Every cross-chunk kernel measured here (E004–E008) allocates 159–255 bytes of
+heap per input byte. The scalar default allocates zero.** C2 is failing to eliminate enough
+`IntVector` wrappers for these to be allocation-free kernels. Their 20–32 MiB/s
+scores are dominated by wrapper allocation and a garbage-collection storm, so
+they are not evidence about attainable allocation-free SIMD throughput.
+
+This does **not** prove that no NEON instruction executed. Vector intrinsics and
+heap allocation can coexist in one compiled method, and mnemonic assembly was
+not available on this JVM. What is proven is that the experimental vector
+branches ran and failed the required zero-allocation condition.
 
 This matters beyond bookkeeping: the "rules learned" recorded in E006 and E008
 steer future work *away* from chunk-parallel SIMD, which is the single largest
 known throughput opportunity and the one the reference Rust implementation uses
 to reach 2500 MiB/s.
 
+E002 and E003 were not included in the allocation driver reported below. They
+also skipped the mandatory allocation gate, so their causal explanations need
+revalidation, but this document does not assign measured allocation figures to
+them.
+
 The guide already required this check — §7.1 ("Target zero allocation … verify
 with JMH's gc profiler/JFR, not assumption") and §10.7 ("Add -prof gc to prove
-allocation claims"). It was never run for E002–E008. One allocation gate would
-have caught E002 immediately and saved six experiments.
+allocation claims"). It was never run for E002–E008. Running it at the start
+would have exposed the allocation failure before the later cross-chunk
+conclusions were drawn.
 
 ## Environment
 
@@ -56,6 +66,12 @@ region. Heap fixed at `-Xmx2g`.
 Roughly 4 GB of garbage to hash 24 MB. Cross-checked with `-Xlog:gc` over
 6 × 8 MiB: the scalar path causes **0** young collections, `heapChunkVector`
 causes **34**.
+
+A later focused JMH cross-check used 8 MiB one-shot, one isolated fork, and
+`-prof gc`. Both the Gradle process and JMH child printed the
+`heapChunkVector=true` `JAVA_TOOL_OPTIONS`; JMH measured 1,330,120,188.8 B/op,
+or 158.56 B/input byte, at 32 MiB/s. This proves the property propagated and the
+experimental branch executed. It does not identify the exact instruction mix.
 
 Note the ordering: E005 `lowLiveVector`, which was explicitly designed to reduce
 the live vector set, allocates the *most*. Under the register-pressure theory it

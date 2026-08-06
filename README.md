@@ -204,24 +204,21 @@ intra-block row-vector experiment is retained behind
 `-Dfastblake.experimental.blockVector=true` and is also disabled after indexed
 gathers and diagonal shuffles proved even slower. See
 `reference/performance/experiments.md` for the results and follow-up design.
-The fully expanded four-chunk transpose kernel is likewise retained behind
-`-Dfastblake.experimental.chunkVector4=true`; its excessive live vector set and
-method size caused register pressure and late compilation, so it is not in
-default dispatch.
-A low-live-set variant behind `-Dfastblake.experimental.lowLiveVector=true`
-was also rejected: repeatedly reloading and retransposing each scheduled word
-reduced throughput further. All negative results remain documented rather than
-being rediscovered later.
-A round-local cache experiment behind
-`-Dfastblake.experimental.roundCacheVector=true` was slower again; Java lexical
-scope did not translate into useful register-lifetime control. Further SIMD
-work now requires generated-code evidence rather than another cache reshuffle.
+The later E010 allocation audit supersedes the causal explanations originally
+attached to these Vector API results. The properties reached the JMH forks and
+the vector branches ran, but the cross-chunk kernels allocated 159–255 heap
+bytes per input byte because C2 failed to eliminate vector wrapper objects.
+Their low throughput measures allocation and GC overhead, not the ceiling of
+allocation-free SIMD; register-pressure and cache-layout conclusions from
+E002–E008 are therefore unproven. The kernels remain opt-in diagnostic
+artifacts, and future SIMD work starts with a mandatory per-fork allocation
+gate.
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
 to the best four-chunk layout. Correctness passed and the isolated loads stayed
-about 25× faster, but the complete 8 MiB kernel reached only about 73--74 MiB/s
-after compilation, versus roughly 670 MiB/s for scalar. It remains available
+about 25× faster, but the complete kernel allocated roughly 159 bytes per input
+byte, invalidating its throughput as a SIMD comparison. It remains available
 behind `-Dfastblake.experimental.heapChunkVector=true` on little-endian systems;
 the production dispatch remains scalar. Details are in the experiment ledger.
 

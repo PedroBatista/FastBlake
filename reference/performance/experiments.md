@@ -17,7 +17,8 @@ may combine details from several attempts.
   number. Use `-prof gc` or `ThreadMXBean.getThreadAllocatedBytes`. A kernel
   allocating materially more than zero is not measuring the algorithm it claims
   to implement; discard its throughput figure instead of recording it as
-  evidence. E002-E008 skipped this and drew six wrong conclusions.
+  evidence. E002-E008 skipped this, so their causal performance conclusions
+  require revalidation even where allocation was not subsequently measured.
 - Compare on the same machine and JVM. Thermal state and background load can
   move short runs, so treat differences below roughly 3% as inconclusive until
   confirmed by a longer run.
@@ -69,6 +70,15 @@ Decision: keep as the scalar baseline and fallback.
 
 Comment: this is already consistently faster than Commons but remains about
 3.7x behind Rust at 8 MiB. Independent-chunk SIMD is the next experiment.
+
+> **E010 audit notice for E002–E008:** the experimental properties did reach
+> the forked JVMs and these branches did execute. However, the cross-chunk
+> kernels measured by E010 (E004–E008) allocated 159–255 heap bytes per input
+> byte because C2 did not eliminate Vector API wrapper objects. Their
+> throughput and correctness remain
+> factual, but their explanations about register pressure, spilling, cache
+> layout, or the viability of SIMD are not established. Read E010 before using
+> any “rule learned” from these entries.
 
 ## E002 — preferred-width Vector API chunk compression
 
@@ -412,15 +422,17 @@ lifetime, and must beat 894/883/874 MiB/s rather than the obsolete E001
 baseline. The next scalar experiment should isolate full-block word loading;
 the guide's cached little-endian VarHandle is a plausible single-variable test.
 
-## E010 — vector box elimination, not register pressure, explains E002-E008
+## E010 — vector allocation invalidates E004-E008 throughput interpretation
 
 Date: 2026-08-06
 
 Type: diagnostic investigation. No production code changed. Full record with all
 raw numbers, commands, and reasoning: `e010-vector-allocation-diagnosis.md`.
 
-Change: measured bytes allocated per input byte for every kernel — the check
-required by the guide (§7.1, §10.7) that E002-E008 never ran.
+Change: measured bytes allocated per input byte for the E004–E008 cross-chunk
+kernels — the check required by the guide (§7.1, §10.7) that the earlier
+experiments skipped. E002 and E003 were not included in this allocation run;
+their causal interpretations remain unverified rather than disproved.
 
 | kernel | throughput | allocated per input byte |
 |---|---:|---:|
@@ -433,10 +445,20 @@ required by the guide (§7.1, §10.7) that E002-E008 never ran.
 Roughly 4 GB of garbage to hash 24 MB. Cross-checked with `-Xlog:gc`: 0 young
 collections for scalar, 34 for `heapChunkVector` over the same work.
 
-Finding: C2 is not eliminating `IntVector` boxes in these kernels. Every vector
-operation heap-allocates a wrapper and runs through generic fallback code. The
-kernels never executed NEON in the hot path, so their 20-32 MiB/s scores measure
-boxed scalar code plus a GC storm. They are not evidence about SIMD.
+Finding: C2 is not eliminating `IntVector` boxes in these kernels. Their
+20-32 MiB/s scores are dominated by wrapper allocation and a GC storm, so they
+are not evidence about the attainable performance of allocation-free SIMD.
+Allocation alone does not prove whether individual intrinsified operations
+also executed NEON instructions; mnemonic assembly was unavailable. Therefore
+the earlier machine-code and register-pressure explanations are unproven.
+
+Focused JMH audit after this document was added: `heapChunkVector`, 8 MiB
+one-shot, one isolated fork with `-prof gc`, reported 32 MiB/s and
+1,330,120,188.8 B/op (158.56 allocated bytes/input byte), with five collections
+in the measurement iteration. `JAVA_TOOL_OPTIONS` was printed by both the
+Gradle benchmark process and the JMH child JVM, proving that the property
+reached the fork; the allocation signature and throughput match the standalone
+E010 driver and prove the experimental dispatch ran.
 
 Two competing hypotheses were tested and discarded. `DontCompileHugeMethods`
 blocks JIT compilation above 8000 bytecodes and E006's kernel is 11,433 bytes,
@@ -466,7 +488,8 @@ lowering strategy" was needed, steering work away from chunk-parallel SIMD. That
 is the single largest known throughput opportunity — the reference Rust
 implementation reaches 2500 MiB/s with exactly the 4-lane NEON structure these
 experiments were attempting. The direction was right; the kernels were simply
-never running as vectors.
+running their vector branches but not as the allocation-free vector kernels the
+experiments intended to test.
 
 Rule learned: a throughput number from a kernel with unmeasured allocation is not
 a result. When re-opening chunk-parallel SIMD, build the kernel incrementally and
