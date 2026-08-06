@@ -15,7 +15,7 @@ import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Warmup;
 
-/** E017 exact probes for the current four-chunk production-candidate kernel. */
+/** Exact probes for the current four-chunk and preferred-width chunk kernels. */
 @State(Scope.Thread)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -36,9 +36,12 @@ public class ChunkVectorKernelBenchmark {
     };
 
     private final byte[] chunks = new byte[4 * 1024];
+    private final byte[] wideChunks = new byte[Blake3ChunkVectorWide.LANES * 1024];
     private final int[] key = FastBlake.IV_WORDS.clone();
     private final int[] messages = new int[64];
     private final int[] output = new int[32];
+    private final int[] wideMessages = new int[Blake3ChunkVectorWide.packedWordsLength()];
+    private final int[] wideOutput = new int[Blake3ChunkVectorWide.outputLength()];
     private final int[] vectorWords = new int[32];
     private final int[] initialState = new int[64];
     private final int[] stateScratch = new int[64];
@@ -46,6 +49,9 @@ public class ChunkVectorKernelBenchmark {
     public ChunkVectorKernelBenchmark() {
         for (int i = 0; i < chunks.length; i++) {
             chunks[i] = (byte) (i * 131 + 17);
+        }
+        for (int i = 0; i < wideChunks.length; i++) {
+            wideChunks[i] = (byte) (i * 131 + 17);
         }
         for (int i = 0; i < vectorWords.length; i++) {
             vectorWords[i] = i * 0x9e3779b9 + 0x6a09e667;
@@ -62,6 +68,13 @@ public class ChunkVectorKernelBenchmark {
     public int completeFourChunkBatch() {
         Blake3ChunkVectorScratch.hashChunks(chunks, 0, 0, key, 0, messages, output);
         return output[0] ^ output[31];
+    }
+
+    /** Load, transpose, compress 16 blocks, chain and extract one preferred-width batch. */
+    @Benchmark
+    public int completePreferredWidthBatch() {
+        Blake3ChunkVectorWide.hashChunks(wideChunks, 0, 0, key, 0, wideMessages, wideOutput);
+        return wideOutput[0] ^ wideOutput[wideOutput.length - 1];
     }
 
     /** Exact lane-by-lane CV extraction used at the end of the current kernel. */

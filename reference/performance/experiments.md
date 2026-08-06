@@ -1619,3 +1619,39 @@ this VM because the new rule already handles YMM vectors and the old width loss
 was only 2.5%. Full implementation notes, failure analysis, build details,
 counters and raw artifact names are in
 `reference/performance/results/e019-n97.md`.
+
+## E020 — preferred-width retest on the AVX2-rotate VM
+
+Date: 2026-08-06
+
+E020 retested E013's eight-lane kernel with E019's compiler lowering and added
+an exact complete-batch benchmark so four and eight lanes could be normalized
+per input byte. All 542 forced-wide conformance tests pass with normal OSR and
+Rust present. The exact kernels remain at the allocation-profiler floor.
+
+The 2x2 counter control gives the important result. On the stock JDK the exact
+eight-lane kernel is 5.2% faster per byte than four lanes; on the patched JDK it
+is 4.7% faster. The patch improves four lanes by 20.3% and eight lanes by 19.8%
+in elapsed time. It benefits both widths almost equally rather than uniquely
+unlocking YMM. At the patched width comparison, instructions per KiB fall 44.6%
+but IPC falls from 3.65 to 2.21, limiting the width gain. hdis confirms real YMM
+operations and the intended 16 `vpshufb`, 16 `vpsrld`, 16 `vpslld`, and 16
+`vpor` static rotate split in the hot method.
+
+A longer 8 MiB composition diagnostic measured 1020/998 MiB/s one-shot/reused
+for eight lanes, versus 909/898 MiB/s for the current four-lane route and
+1658/1647 MiB/s for Rust. The exact result is the stronger width comparison;
+the end-to-end methods have wider variance and use different update routes.
+The existing wide route also cannot batch 4 KiB updates and falls back to the
+scalar path, measuring 398 MiB/s in a short diagnostic.
+
+Decision: record the architectural result but make no production change.
+FastBlake is a public library and cannot require a private JDK build. E016
+already tried the code-only `ByteVector.rearrange` expression: it produced the
+right isolated `vpshufb`, but integrating only ROR16 allocated 205,426,540 B per
+8 MiB hash and cut throughput from 774 to 245 MiB/s. Until a stock JDK provides
+the direct lowering, or a library-only expression passes the full allocation
+and composition gates, E019/E020 have no shippable speedup. Keep ordinary
+`VectorOperators.ROR`, keep both SIMD kernels experimental, and treat the data
+as evidence for an upstream HotSpot improvement. Full results are in
+`reference/performance/results/e020-n97.md`.

@@ -344,8 +344,20 @@ remains at the profiler floor. On the N97 the exact four-chunk kernel drops from
 4385 to 3601 ns and from 12,207 to 10,138 cycles; a diagnostic 8 MiB run improves
 one-shot from 817 to 941 MiB/s and streaming from 788 to 932 MiB/s. Java is now
 about 56% of pinned Rust on contiguous input and 87% on streaming. The change
-is still an experimental HotSpot patch, not part of the shipped library; next
-is a retest of the 256-bit kernel under the new lowering.
+is still an experimental HotSpot patch, not part of the shipped library; E020
+below retests the 256-bit kernel under the new lowering.
+
+E020 completes that retest. In an exact load/compress/extract probe, the
+eight-lane kernel is 4.7% faster per byte than four lanes on the patched VM;
+the same comparison is already 5.2% faster on the unmodified VM. The rotate
+patch improves both widths by about 20%, rather than uniquely unlocking YMM.
+A longer diagnostic reaches 1020 MiB/s one-shot at eight lanes, about 62% of
+Rust, but this is not a public-library result: it requires the private VM, and
+the only stock-JDK source expression tried for `vpshufb` allocated 205 MB per
+8 MiB hash when integrated. Production therefore does not select either SIMD
+kernel. E019/E020 are retained as evidence for an upstream HotSpot improvement;
+FastBlake continues to require a stock-JDK, allocation-free win before
+promotion.
 
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
