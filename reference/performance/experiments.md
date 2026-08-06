@@ -12,6 +12,12 @@ may combine details from several attempts.
 - Quick comparison command:
   `./gradlew jmh -P'jmh.args=-p impl=commons,rust,java-cpu -p size=8388608 -f1 -wi 3 -i 3'`
 - Report MiB/s, not only ns/op, and retain the JMH fork/warmup/iteration count.
+- Allocation gate (mandatory, added by E010): measure bytes allocated per input
+  byte, in a JVM running only that kernel, *before* recording any throughput
+  number. Use `-prof gc` or `ThreadMXBean.getThreadAllocatedBytes`. A kernel
+  allocating materially more than zero is not measuring the algorithm it claims
+  to implement; discard its throughput figure instead of recording it as
+  evidence. E002-E008 skipped this and drew six wrong conclusions.
 - Compare on the same machine and JVM. Thermal state and background load can
   move short runs, so treat differences below roughly 3% as inconclusive until
   confirmed by a longer run.
@@ -405,3 +411,68 @@ Future vector work should borrow E009's constant schedules and compact state
 lifetime, and must beat 894/883/874 MiB/s rather than the obsolete E001
 baseline. The next scalar experiment should isolate full-block word loading;
 the guide's cached little-endian VarHandle is a plausible single-variable test.
+
+## E010 — vector box elimination, not register pressure, explains E002-E008
+
+Date: 2026-08-06
+
+Type: diagnostic investigation. No production code changed. Full record with all
+raw numbers, commands, and reasoning: `e010-vector-allocation-diagnosis.md`.
+
+Change: measured bytes allocated per input byte for every kernel — the check
+required by the guide (§7.1, §10.7) that E002-E008 never ran.
+
+| kernel | throughput | allocated per input byte |
+|---|---:|---:|
+| E009 scalar (default) | 827 MiB/s | 0.00 B |
+| E008 `heapChunkVector` | 32 MiB/s | 158.76 B |
+| E004 `chunkVector4` | 31 MiB/s | 158.90 B |
+| E006 `roundCacheVector` | 21 MiB/s | 212.99 B |
+| E005 `lowLiveVector` | 22 MiB/s | 254.61 B |
+
+Roughly 4 GB of garbage to hash 24 MB. Cross-checked with `-Xlog:gc`: 0 young
+collections for scalar, 34 for `heapChunkVector` over the same work.
+
+Finding: C2 is not eliminating `IntVector` boxes in these kernels. Every vector
+operation heap-allocates a wrapper and runs through generic fallback code. The
+kernels never executed NEON in the hot path, so their 20-32 MiB/s scores measure
+boxed scalar code plus a GC storm. They are not evidence about SIMD.
+
+Two competing hypotheses were tested and discarded. `DontCompileHugeMethods`
+blocks JIT compilation above 8000 bytecodes and E006's kernel is 11,433 bytes,
+but `-XX:-DontCompileHugeMethods` moves it only from 21.0 to 20.7 MiB/s. C1 does
+refuse these methods outright ("COMPILE SKIPPED: out of virtual registers in LIR
+generator"), but `-XX:-TieredCompilation` changes nothing (32.6 to 32.4 MiB/s for
+E008). Neither is the cause.
+
+Supporting result: box elimination is fragile and non-monotonic in code size. In
+isolated JVMs, a 128-bit `add` chain allocates 48 B/iter at 4.911 ns, while
+`add + xor + ROR` allocates nothing at 1.770 ns. The simplest loop boxes; adding
+work stops the boxing. It cannot be predicted from source, only measured — and
+the same bytecode gives different answers when other code shares the JVM, so
+each kernel must be isolated.
+
+Also measured: the cached little-endian `VarHandle` loader nominated by E009's
+rule learned is 3.51x faster than the current manual byte shifts over 8 MiB
+(0.835 ms to 0.238 ms), worth about 6.7% end-to-end on its own.
+
+Decision: do not change any dispatch. Add the allocation gate to the measurement
+protocol above. Prior entries stand as written; this entry corrects their
+interpretation without rewriting them.
+
+Comment: the practical damage was in the rules learned. E006 and E008 concluded
+that the Vector API layouts were exhausted and that a "structurally different
+lowering strategy" was needed, steering work away from chunk-parallel SIMD. That
+is the single largest known throughput opportunity — the reference Rust
+implementation reaches 2500 MiB/s with exactly the 4-lane NEON structure these
+experiments were attempting. The direction was right; the kernels were simply
+never running as vectors.
+
+Rule learned: a throughput number from a kernel with unmeasured allocation is not
+a result. When re-opening chunk-parallel SIMD, build the kernel incrementally and
+check bytes/byte after every addition, stopping at the first non-zero reading
+rather than writing a complete kernel and measuring at the end. The untried
+structural variant to sample first is transposing message words once per block
+into a scratch `int[64]` and keeping only the 16 state vectors as vector values;
+E004-E008 all kept messages as live vector values and none tried reading them
+back from an array.
