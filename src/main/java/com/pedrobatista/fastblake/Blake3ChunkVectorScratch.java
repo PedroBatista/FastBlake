@@ -1,5 +1,8 @@
 package com.pedrobatista.fastblake;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
@@ -7,6 +10,12 @@ import jdk.incubator.vector.VectorSpecies;
 /** E011 allocation-first four-chunk kernel with primitive transposed messages. */
 final class Blake3ChunkVectorScratch {
     private static final VectorSpecies<Integer> S = IntVector.SPECIES_128;
+
+    // E014: the message transpose was about 30% of this kernel as byte shifts.
+    // This VarHandle always reads little-endian regardless of platform byte
+    // order, so it keeps the kernel endian-neutral and needs no guard.
+    private static final VarHandle LE_INT = MethodHandles
+            .byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
     private static final int[][] SCHEDULE = {
         {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
         {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
@@ -50,10 +59,7 @@ final class Blake3ChunkVectorScratch {
                 int destination = word * 4;
                 for (int lane = 0; lane < 4; lane++) {
                     int p = offset + lane * 1024 + blockOffset + withinBlock;
-                    messages[destination + lane] = (input[p] & 0xff)
-                            | ((input[p + 1] & 0xff) << 8)
-                            | ((input[p + 2] & 0xff) << 16)
-                            | (input[p + 3] << 24);
+                    messages[destination + lane] = (int) LE_INT.get(input, p);
                 }
             }
             IntVector v0 = cv0;

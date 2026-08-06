@@ -564,6 +564,17 @@ fork must inherit the property. Both the host and the child print
 
 ## Ideas, ranked by expected value
 
+> **Outcome note.** Ideas 1 and 4 below have since been run; this section is
+> left as written. Idea 1 became **E013**: the preferred-width kernel is
+> correct, allocation-free, does not hit the seven-round cliff at eight lanes —
+> and is 3–4% *slower* than four lanes on this machine. Its decomposition found
+> that ~30% of the kernel was scalar byte-shift transpose, which no vector width
+> touches. Replacing that transpose with a little-endian `VarHandle` became
+> **E014** and gained 28–30% on both kernels, far more than the width change it
+> was meant to support. The "vectorize the transpose" suggestion at the end of
+> Result 5c was measured in E014 and rejected: in-register 4x4 transposes are
+> 2.3x slower than the plain VarHandle read. See `experiments.md` §§ E013, E014.
+
 ### 1. Preferred-width chunk kernel — target ~2x E011 on AVX2 machines
 
 Parameterise `Blake3ChunkVectorScratch` on `IntVector.SPECIES_PREFERRED`, or add
