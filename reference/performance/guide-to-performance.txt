@@ -663,17 +663,19 @@ P0 correctness architecture
 P1 largest expected throughput wins
 
 * 4-lane IntVector chunk kernel for the current Apple/AArch64 machine.
-  DONE in E011 at 1584 MiB/s, opt-in behind
+  DONE in E011 at 1584 MiB/s before E014, opt-in behind
   -Dfastblake.experimental.scratchChunkVector=true.
 * Message transpose into a reusable primitive int[64] word-major scratch, with
   the 16 CV state words held as named IntVector locals across the 16 blocks.
-  Supersedes the in-register 4x4 message transpose this list previously
-  recommended: that shape is what E004-E008 built and it never passed the
-  allocation gate. See vector rules 0, 7 and 10.
+  E014 replaced manual byte-shift assembly with a cached little-endian VarHandle,
+  gaining 28-30% on the N97 kernels. An allocation-free vector-load plus 4x4
+  in-register transpose was also measured and rejected at 2.34x slower than the
+  VarHandle. See vector rules 0, 7 and 10.
 * Four-wide parent batching and direct caller-array processing.
 * Bounded 4 KiB streaming batch buffer with direct-input bypass. Still open:
-  E011's streaming shape remains at the scalar 874 MiB/s because 4 KiB updates
-  never enter the four-chunk branch.
+  4 KiB updates never enter the chunk-vector branch. The pre-E014 M5 follow-up
+  measured about 900 MiB/s on the scalar route; E014 measured 251-252 MiB/s on
+  the N97 scalar route. Current post-E014 M5 streaming throughput is unmeasured.
 * Scalar data-path work that compounds with the above and is not yet done: a
   cached little-endian VarHandle loader (measured 3.51x on the loader alone,
   about 6.7% end-to-end), a direct-input bypass avoiding the per-byte copy
@@ -682,7 +684,8 @@ P1 largest expected throughput wins
 
 P2 portability and wider machines
 
-* 8-lane and 16-lane generated/specialized kernels and transpose networks.
+* 8-lane and 16-lane generated/specialized kernels with measured load strategies;
+  do not assume a vector transpose network wins after E014's 4x4 rejection.
 * Runtime selection with explicit benchmark overrides.
 * Partial-batch fallback ladder: 16 -> 8 -> 4 -> scalar where supported.
 

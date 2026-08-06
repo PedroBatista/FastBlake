@@ -274,25 +274,20 @@ scalar path, 3.90× Commons, and 49% of Rust on this machine. Both remain opt-in
 pending the streaming batch buffer and an environment A confirmation. The
 intuitive alternative — doing the transpose with vector loads and in-register
 4×4 rearranges — was measured and **rejected at 2.3× slower** than the plain
-VarHandle read. A fully expanded seven-round variant is
-it is not promoted. An isolated-component decomposition estimates that doubling
-the width helped compression by only 5% per byte, while the *scalar* byte-shift
-transpose — about 30% of the measured kernel shape, and untouched by merely
-widening the vectors — got 21% worse per byte from striding across eight chunks
-instead of four. This makes the transpose the leading measured contributor, not
-a proven complete causal explanation; confirming cache and spill behavior needs
-assembly or hardware counters. A fully expanded seven-round variant is
-retained only as diagnostic evidence: it crosses a C2 cliff and allocates
+VarHandle read. A fully expanded seven-round variant is retained only as
+diagnostic evidence: it crosses a C2 cliff and allocates
 43,776 bytes per block invocation, while the compact loop allocates effectively
 zero.
 
-A follow-up on the Apple M5 found no regression after E013: the fixed and
-preferred-width kernels measured 1600/1598 and 1594/1592 MiB/s for
-one-shot/reuse respectively. Both are four-lane kernels on NEON and the
-difference is below 1%. Kernel selection is not automatic yet: the N97 result
-proves that `SPECIES_PREFERRED` is a capability signal, not a guarantee that the
-widest kernel is fastest. Current measured profiles favor the 128-bit kernel on
-both M5 and N97; other AVX2 cores and AVX-512 still require measurements.
+A pre-E014 follow-up on the Apple M5 found no regression from E013 itself: the
+fixed and preferred-width kernels measured 1600/1598 and 1594/1592 MiB/s for
+one-shot/reuse respectively. Both were four-lane kernels on NEON and differed by
+less than 1%. Those runs used the old byte-shift loader and therefore do not
+measure the current E014 code. Kernel selection is not automatic yet: the N97
+result proves that `SPECIES_PREFERRED` is a capability signal, not a guarantee
+that the widest kernel is fastest. Current width comparisons favor 128 bits on
+both M5 and N97; current post-E014 M5 throughput remains unmeasured, while other
+AVX2 cores and AVX-512 also require measurements.
 
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector

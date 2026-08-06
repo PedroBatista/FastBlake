@@ -853,7 +853,7 @@ does not win here and must not become the default on this evidence. A wider
 machine should use it only after measurement on that CPU demonstrates a win.
 E011 remains the SIMD candidate; E009 remains the production default.
 
-### Why: the bottleneck is the scalar transpose, not the vector width
+### Why: the scalar transpose is the leading measured contributor
 
 Two probes, each in its own fork.
 
@@ -923,7 +923,7 @@ shows that **roughly 30% of this measured kernel shape is scalar byte-shift
 transpose, and merely increasing `IntVector` width does not accelerate it.** It
 is now the largest measured target in the SIMD path.
 
-Next experiment: vectorize the transpose. E007 measured
+Next experiment proposed at the end of E013: vectorize the transpose. E007 measured
 `ByteVector.fromArray(...).reinterpretAsInts()` at roughly 25x an endian
 `MemorySegment` load, and E008 retained it; the transpose is exactly the place
 that loader belongs, loading contiguous 16-byte rows per chunk and transposing
@@ -931,20 +931,18 @@ in registers rather than assembling words a byte at a time. Gate on allocation
 per rung, and measure it at both widths — a cheaper transpose changes the
 width trade-off, and may make E013 win where it currently loses.
 
-### Evaluation of the E013 follow-up ideas
+### Resolution of the E013 follow-up ideas after E014
 
-The ideas are ordered by evidential value, not implementation convenience.
+This status reconciles the E013 proposals with the E014 experiment that followed.
 
-1. **Vectorize the input load/transpose: proceed.** This directly attacks the
-   largest measured non-vector component. Implement it as new opt-in kernels at
-   explicit 128- and 256-bit widths, preserving E011 and E013 as controls. Start
-   with contiguous little-endian `ByteVector.fromArray(...).reinterpretAsInts()`
-   loads and register rearrangement. Do not replace the endian-neutral path or
-   claim a win until correctness, allocation, and 8 MiB throughput gates pass on
-   both M5 and N97. Benchmark the load/transpose rung alone and the complete
-   kernel: improving the isolated rung without improving the hash is insufficient.
+1. **Vectorize the input load/transpose: measured and rejected in E014.** The
+   proposed contiguous `ByteVector` loads plus in-register rearrangement were
+   correct and allocation-free, but measured 2.34x slower than a cached
+   little-endian `VarHandle` read. E014 adopted the VarHandle instead and improved
+   the complete N97 kernels by 28–30%. Do not implement another vector-transpose
+   kernel without a materially different shuffle network or new ISA evidence.
 
-2. **Retest register pressure after the transpose changes: defer.** The existing
+2. **Retest register pressure after the loader change: defer.** The existing
    scratch-CV probe changed the wide loop by only 1.4%, inside the 3% inconclusive
    band. Removing values touched once per block is a weak test of the 18
    frequently live state/message vectors. Assembly, spill counters, or a kernel
@@ -965,20 +963,20 @@ The ideas are ordered by evidential value, not implementation convenience.
    N97. It does not predict whole-kernel speedup because it excludes transposition,
    loads, stores, live-range pressure, tree reduction, and frontend effects.
 
-5. **Streaming batching remains independent and high-value.** Both SIMD kernels
-   take the scalar route for 4 KiB updates, so neither the width experiment nor a
-   faster transpose improves that workload until complete chunks are buffered
-   into SIMD-sized batches. Keep this as a separate experiment so buffering cost
-   is not confused with compression improvements.
+5. **Streaming batching remains independent and high-value.** E014 confirmed that
+   both SIMD kernels still take the scalar route for 4 KiB updates, so its faster
+   loader did not improve that workload. Complete chunks must be buffered into
+   SIMD-sized batches. Keep this as a separate experiment so buffering cost is
+   not confused with compression improvements.
 
-### E013 follow-up — Apple M5 regression and dispatch audit
+### E013 follow-up — Apple M5 regression and dispatch audit (pre-E014)
 
 Date: 2026-08-06
 Environment: **A** (Apple M5, NEON 128-bit, preferred species = 4 int lanes)
 
-The current `main` revision after the N97 work was recompiled and the full
-official-vector suite passed with `wideChunkVector` enabled. Focused 8 MiB
-runs, one fork with 3 warmup and 3 measurement iterations:
+The E013 revision after the N97 work, before E014 changed both kernels' loaders,
+was recompiled and the full official-vector suite passed with `wideChunkVector`
+enabled. Focused 8 MiB runs, one fork with 3 warmup and 3 measurement iterations:
 
 | shape | E011 fixed 128-bit | E013 preferred-width | original E011 quick run |
 |---|---:|---:|---:|
@@ -986,10 +984,11 @@ runs, one fork with 3 warmup and 3 measurement iterations:
 | reused | 1598 MiB/s | 1592 MiB/s | 1569 MiB/s |
 | streaming 4 KiB | 902 MiB/s | 900 MiB/s | 874 MiB/s |
 
-Assessment: no M5 regression. E011 and E013 both select four lanes here and
-differ by less than 1%, well inside the protocol's 3% inconclusive band. The
-small improvement over the historical run is ordinary run-to-run/JIT/thermal
-variation, not a claimed optimization.
+Assessment: no M5 regression from E013. E011 and E013 both select four lanes
+here and differ by less than 1%, well inside the protocol's 3% inconclusive
+band. The small improvement over the historical run is ordinary
+run-to-run/JIT/thermal variation, not a claimed optimization. These figures do
+not describe the current E014 loader; its M5 throughput remains unmeasured.
 
 Dispatch audit: the code is width-capable but not yet CPU-policy-aware.
 `scratchChunkVector` always selects four lanes and `wideChunkVector` always
@@ -1154,9 +1153,9 @@ campaign can be closed and picked up cleanly later.
   the M5 — agreement to three significant figures across a different
   architecture, OS, and JVM build. C2's failure to scalar-replace `IntVector`
   wrappers is a compiler property, not an AArch64 one. E012 also closed E010's
-  own gap by measuring E002 (60.03) and E003 (99.61): **every Vector API kernel
-  in this project except E011 is an allocating kernel**, so no E002–E008 causal
-  explanation survives.
+  own gap by measuring E002 (60.03) and E003 (99.61): **among E002–E012, every
+  Vector API kernel except E011 is an allocating kernel**, so no E002–E008 causal
+  explanation survives. E013 is the second allocation-free kernel.
 - **E011's seven-round escape-analysis cliff.** 43,776 bytes per invocation on
   *both* architectures — the same number. Six expanded rounds scalarize, seven do
   not, and a compact loop restores it, on both. E011's "minimize the compiler
@@ -1170,9 +1169,12 @@ campaign can be closed and picked up cleanly later.
   is exposing instruction-level parallelism to a wide out-of-order core, and this
   is a narrow Gracemont E-core. E009 is still the right default and still ahead,
   but 1.61x is an environment A figure.
-- **E011's standing against Rust.** 63% there, 38% here before E014. The cause
-  was mechanical: `SPECIES_128` is full width on NEON and half width on AVX2,
-  while the crate dispatches to `blake3_hash_many_avx2`.
+- **E011's standing against Rust.** 63% there, 38% here before E014. Width was an
+  obvious capability difference — `SPECIES_128` is full width on NEON and half
+  width on AVX2, while Rust dispatches to `blake3_hash_many_avx2` — but E013
+  disproved the stronger causal claim: merely moving Java to eight lanes was
+  3–4% slower. Core width, rotate lowering, loading, and register pressure remain
+  possible contributors to the cross-machine gap.
 
 ### What the campaign changed in the code
 
