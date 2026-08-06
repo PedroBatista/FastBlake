@@ -2,10 +2,13 @@
 
 A pure-JVM BLAKE3 implementation, optimised for throughput.
 
-Status: **CPU implementation and comparison harness complete.** FastBlake now
-implements the full BLAKE3 API in dependency-free Java. The scalar kernel is the
-correctness and performance baseline for the forthcoming SIMD kernel; GPU
-offload remains planned work.
+Status: **CPU implementation and comparison harness complete; SIMD kernel
+validated on two architectures and awaiting streaming support before
+promotion.** FastBlake implements the full BLAKE3 API in dependency-free Java.
+The allocation-free scalar kernel is the production default and the correctness
+baseline. An opt-in chunk-parallel Vector API kernel reaches 3.25× it on large
+contiguous inputs, and stays opt-in only because 4 KiB streaming updates still
+fall back to scalar. GPU offload remains planned work.
 
 ```
 ./gradlew contenders   # what can run here, and why anything can't
@@ -241,7 +244,10 @@ gate.
 E011 follows that gate with reusable primitive transposed-message scratch and a
 compact seven-round loop. It is the first correct allocation-free SIMD win:
 1584 MiB/s one-shot and 1569 MiB/s reused at 8 MiB, about 1.77x the production
-scalar path and 63% of Rust on the Apple M5. E012 validated it on x86-64, where
+scalar path and 63% of Rust on the Apple M5. **Those M5 figures predate E014 and
+no longer describe the code in the tree** — E014 replaced the transpose that
+kernel used, and its M5 throughput has not been re-measured since. E012
+validated it on x86-64, where
 it is a *larger* relative win — 2.54x the scalar path — while still passing the
 allocation gate and the full official-vector suite. It remains opt-in behind
 `-Dfastblake.experimental.scratchChunkVector=true` while streaming batching is
@@ -254,6 +260,21 @@ machine is wide; enable it with
 `-Dfastblake.experimental.wideChunkVector=true`. It is correct, passes the
 allocation gate at 0.00071 B/input byte, and does not hit the seven-round cliff
 at eight lanes — and it is **3–4% slower** than the four-lane kernel on AVX2, so
+it is not promoted. Doubling the width helped compression by only 5% per byte,
+while the *scalar* byte-shift transpose — about 30% of the kernel, and untouched
+by any amount of vector width — got 21% worse per byte from striding across
+eight chunks instead of four.
+
+E014 acted on that. Replacing the transpose's manual byte-shift word assembly
+with a cached little-endian `VarHandle` read — 2.96× faster in isolation, and
+endian-neutral, so no guard is needed — gained **+28% on the four-lane kernel
+and +30% on the preferred-width one**, from a one-line loader change. At 8 MiB
+the four-lane SIMD kernel now reaches 822 MiB/s one-shot: 3.25× the production
+scalar path, 3.90× Commons, and 49% of Rust on this machine. Both remain opt-in
+pending the streaming batch buffer and an environment A confirmation. The
+intuitive alternative — doing the transpose with vector loads and in-register
+4×4 rearranges — was measured and **rejected at 2.3× slower** than the plain
+VarHandle read. A fully expanded seven-round variant is
 it is not promoted. An isolated-component decomposition estimates that doubling
 the width helped compression by only 5% per byte, while the *scalar* byte-shift
 transpose — about 30% of the measured kernel shape, and untouched by merely

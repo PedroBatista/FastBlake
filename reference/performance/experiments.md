@@ -1000,3 +1000,251 @@ preferred/eight lanes lose by 3–4% on the N97. The correct future policy needs
 separate specialized kernels plus a measured profile/override, not an
 assumption that lane count predicts throughput. Known profiles today are M5 →
 128-bit and N97 → 128-bit; AVX2 P-cores and AVX-512 remain unknown.
+
+## E014 — little-endian VarHandle transpose: +28% on the SIMD kernels
+
+Date: 2026-08-06
+Environment: **B** (Intel N97, AVX2)
+
+Change: replace the per-word manual byte-shift assembly in the chunk-parallel
+message transpose with a cached little-endian `VarHandle` int read, in both
+`Blake3ChunkVectorScratch` (E011, four lanes) and `Blake3ChunkVectorWide`
+(E013, preferred width). Nothing else changed: same word-major scratch layout,
+same named state vectors, same compact seven-round loop, same dispatch.
+
+```java
+private static final VarHandle LE_INT = MethodHandles
+        .byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+// messages[destination + lane] = (int) LE_INT.get(input, p);
+```
+
+Motivation: E013's decomposition found the scalar transpose was ~30% of the
+kernel, gained nothing from vector width, and got 21% worse per byte as the
+batch widened. E010 Evidence 4 had already measured this loader at 3.51x the
+manual shifts for the scalar path, and E009's own rule learned nominated it.
+
+Endian-neutrality is preserved and still needs no guard: the VarHandle always
+interprets the bytes as little-endian, byte-swapping on a big-endian platform,
+which is exactly BLAKE3's definition. Plain `get` on a byte-array view does not
+require alignment; only atomic access modes do.
+
+### Rung 1 — the transpose in isolation
+
+`TransposeBenchmark`, 2 forks × 5 warmup × 5 measurement iterations, `-prof gc`.
+All three variants were first verified to produce byte-identical word-major
+scratch for all 16 blocks of a chunk before being timed.
+
+| transpose variant | time | vs current | allocation |
+|---|---:|---:|---:|
+| manual byte shifts (E011/E013 shipping) | 78.730 ns | 1.00x | 0.001 B/op |
+| **little-endian `VarHandle`** | **26.616 ns** | **2.96x** | ~0 B/op |
+| vector loads + in-register 4x4 transpose | 62.185 ns | 1.27x | ~0 B/op |
+
+The vector transpose — 16-byte `ByteVector.fromArray(...).reinterpretAsInts()`
+loads plus two-source rearranges, the shape E012 nominated as the obvious next
+step — is **2.34x slower than the VarHandle** and only 1.27x better than the
+byte shifts it replaces. E007 measured two-source rearranges at 0.799 ns each;
+this transpose needs 32 of them plus 16 loads and 16 stores per block, and that
+shuffle traffic costs more than the byte assembly it removes. Recorded as a
+rejected variant: the fast *loader* E007 and E008 identified is real, but
+feeding it through an in-register transpose gives the gain straight back.
+
+### Correctness and allocation gate
+
+Full `./gradlew test` passed with each property enabled: 542 tests, all
+contenders, every mode and incremental boundary shape. Default dispatch
+unchanged.
+
+Allocation, 8 MiB one-shot, isolated fork per kernel, `-prof gc`:
+
+| kernel | B/op | B per input byte | GC |
+|---|---:|---:|---:|
+| E011 + E014 `scratchChunkVector` | 5971.880 | 0.000712 | 0 |
+| E013 + E014 `wideChunkVector` | 5973.128 | 0.000712 | 0 |
+
+Unchanged from before the transpose swap, as expected — the VarHandle is a
+plain primitive read.
+
+### Throughput
+
+8 MiB, 2 forks × 5 warmup × 5 measurement iterations:
+
+| 8 MiB shape | E011+E014 | E011 before | E013+E014 | E013 before | E009 scalar | Commons | Rust |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| one-shot | **822** | 642 | 802 | 615 | 253 | 211 | 1668 |
+| reused | **820** | 637 | 803 | 617 | 255 | 210 | 1713 |
+| streaming 4 KiB | 251 | 253 | 252 | 252 | 259 | 210 | 1100 |
+
+**+28% on the four-lane kernel and +30% on the preferred-width kernel**, from
+one loader change. E013's decomposition predicted 1.23x for a 2.96x faster
+transpose occupying 28.4% of the loop; the measured 1.28x is close, and the
+small excess is consistent with the byte-shift version also costing issue slots
+the VarHandle does not.
+
+Standing after E014, all environment B:
+
+| ratio at 8 MiB, one-shot | before E014 | after E014 |
+|---|---:|---:|
+| best SIMD vs E009 scalar | 2.54x | **3.25x** |
+| best SIMD vs Commons | 3.04x | **3.90x** |
+| best SIMD as a fraction of Rust | 38% | **49%** |
+
+Decision: keep both kernels opt-in; do not promote yet. E011+E014 is now
+3.25x the production scalar path and the strongest SIMD result this project has
+recorded, but promotion still needs the streaming batch buffer (4 KiB updates
+remain on the scalar route at 251 MiB/s) and a confirmation run on environment
+A, since the transpose change has only been measured on x86-64.
+
+**E013 still loses to E011, by 2.5%.** The transpose fix helped both kernels by
+about the same proportion, so it did not change the width verdict: making the
+transpose cheaper did not make eight lanes pay. E013's conclusion stands.
+
+Rule learned: the biggest available win was not in the vector code at all. Three
+consecutive experiments (E004–E008 layouts, E013 width) tried to make the SIMD
+faster while ~30% of the kernel sat in scalar byte-shift loading that none of
+them touched. Decompose a kernel and measure the parts before optimising the
+part you assume is hot. Note also that the intuitive follow-up — do the
+transpose with vectors, since vectors are what this kernel is about — measured
+2.3x worse than the boring primitive read.
+
+Next experiments, in order:
+
+1. Apply the same VarHandle to the **scalar** word loader, which still uses
+   manual byte shifts. E010 Evidence 4 measured 3.51x on the loader and ~6.7%
+   end-to-end for E009. This changes the production default, so it needs its own
+   entry and a longer confirmation.
+2. Streaming batch buffer, the last item gating E011's promotion.
+3. Re-measure E011+E014 and E013+E014 on environment A. The transpose was 30% of
+   the kernel on x86-64; its share on the M5 is unmeasured, and E013's width
+   verdict may differ where `SPECIES_PREFERRED` is 128-bit and the wide and
+   narrow kernels are the same thing.
+
+### E014 effect on earlier recorded figures
+
+E011's environment A results — 1584 MiB/s one-shot and 1569 MiB/s reused, "about
+1.77x the production scalar path and 63% of Rust" — were measured with the
+manual byte-shift transpose that E014 has now removed from
+`Blake3ChunkVectorScratch`. Those figures stand as written for the kernel as it
+existed then, per this ledger's no-rewrite rule, but **they no longer describe
+the code in the tree**. The current kernel's environment A throughput is
+unmeasured. The same applies to the README's 63%-of-Rust figure and to E012's
+environment A column wherever it quotes E011.
+
+On environment B the same change was worth +28%. If it transfers, E011+E014 on
+the M5 would be materially above 1584 MiB/s and above 63% of Rust, but that is a
+projection, not a measurement, and must not be quoted as a result until run.
+
+## Conclusion — the x86-64 validation campaign, E012 to E014
+
+Date: 2026-08-06
+
+The task was to validate this ledger on Intel x86-64, since everything through
+E011 was measured on a single Apple M5. Three entries came out of it. This
+section states what is now settled, what changed, and what is still open, so the
+campaign can be closed and picked up cleanly later.
+
+### What was proven portable
+
+- **Correctness.** All ten dispatch configurations — the default, the legacy
+  scalar control, and all eight experimental kernels — pass the full
+  official-vector suite on x86-64: 542 tests each, every mode, XOF, and
+  incremental boundary shape.
+- **E010's allocation diagnosis.** E004–E008 allocate 159.02, 159.02, 212.99 and
+  254.97 bytes per input byte here against 158.76, 158.90, 212.99 and 254.61 on
+  the M5 — agreement to three significant figures across a different
+  architecture, OS, and JVM build. C2's failure to scalar-replace `IntVector`
+  wrappers is a compiler property, not an AArch64 one. E012 also closed E010's
+  own gap by measuring E002 (60.03) and E003 (99.61): **every Vector API kernel
+  in this project except E011 is an allocating kernel**, so no E002–E008 causal
+  explanation survives.
+- **E011's seven-round escape-analysis cliff.** 43,776 bytes per invocation on
+  *both* architectures — the same number. Six expanded rounds scalarize, seven do
+  not, and a compact loop restores it, on both. E011's "minimize the compiler
+  graph" rule is portable guidance about C2, not about NEON.
+- **E011's allocation gate.** 0.00071 B per input byte with zero collections
+  here, against 0.00066 on the M5.
+
+### What did not transfer
+
+- **E009's scalar advantage.** 1.61x Commons on the M5, 1.20x here. Its mechanism
+  is exposing instruction-level parallelism to a wide out-of-order core, and this
+  is a narrow Gracemont E-core. E009 is still the right default and still ahead,
+  but 1.61x is an environment A figure.
+- **E011's standing against Rust.** 63% there, 38% here before E014. The cause
+  was mechanical: `SPECIES_128` is full width on NEON and half width on AVX2,
+  while the crate dispatches to `blake3_hash_many_avx2`.
+
+### What the campaign changed in the code
+
+Only two things, both opt-in, neither promoted:
+
+1. **E013** made the chunk-parallel kernel width-generic
+   (`Blake3ChunkVectorWide`, `-Dfastblake.experimental.wideChunkVector=true`).
+   The hard-coded species was a genuine portability defect and is now fixed —
+   but the fix is 3–4% *slower* than four lanes on this machine, so it is
+   evidence, not an improvement. Only `Blake3BlockVector`'s 128-bit species was
+   ever semantic; every chunk-parallel kernel's was inherited from E003's
+   "transpose 4x4 registers" rule, which was free on a machine where four lanes
+   *was* the preferred width.
+2. **E014** replaced the transpose's manual byte-shift word assembly with a
+   cached little-endian `VarHandle` read, in both kernels. +28% and +30%.
+
+### The methodological finding
+
+E013's decomposition is the most useful thing this campaign produced. About 30%
+of the chunk-parallel kernel was scalar byte-shift loading, and **five
+consecutive experiments optimised around it** — E004 through E008 reshaped vector
+caching and layout, E013 doubled the vector width — while none of them touched
+it. E010 had already measured that exact loader at 3.51x, and E009's own rule
+learned nominated it; it was applied to neither path. When E014 finally applied
+it, one loader change beat every layout experiment in the ledger's history.
+
+Two corollaries, both measured rather than argued:
+
+- The intuitive fix was wrong. Doing the transpose *with vectors* — the natural
+  instinct in a kernel whose whole point is vectors — is 2.3x slower than the
+  plain primitive read, because the in-register rearranges cost more than the
+  byte assembly they remove.
+- A stated hypothesis was tested and failed. E013's register-pressure
+  explanation was checked by moving the eight chaining vectors to scratch: 1.4%,
+  inside the noise band. Recorded as unsupported rather than quietly dropped.
+
+Add to the protocol, alongside the allocation gate: **decompose a kernel and
+measure its parts before optimising the part you assume is hot.** A component
+that is not vector code will not be improved by better vector code, and will not
+show up in a whole-kernel throughput number as anything but "still slow".
+
+### Standing at close of campaign, environment B, 8 MiB
+
+| shape | Commons | E009 default | E011+E014 | E013+E014 | Rust |
+|---|---:|---:|---:|---:|---:|
+| one-shot | 211 | 253 | **822** | 802 | 1668 |
+| reused | 210 | 255 | **820** | 803 | 1713 |
+| streaming 4 KiB | 210 | 259 | 251 | 252 | 1100 |
+
+Best SIMD is 3.25x the production scalar path, 3.90x Commons, and 49% of Rust.
+
+### Open items, in priority order
+
+1. **Apply the E014 loader to the scalar path.** It still uses manual byte
+   shifts. E010 measured 3.51x on the loader and ~6.7% end-to-end for E009. This
+   changes the production default and needs its own entry.
+2. **Streaming batch buffer.** 4 KiB updates stay on the scalar route at
+   ~251 MiB/s. This is the last item gating E011's promotion out of opt-in.
+3. **Re-measure on environment A.** E011's recorded M5 figures predate E014 and
+   no longer describe the code. E013's width verdict is also untested where
+   `SPECIES_PREFERRED` is 128-bit.
+4. **Re-measure on a wide x86-64 core.** Every environment B conclusion about
+   core width rests on one narrow E-core with no AVX-512. A Golden Cove or Zen
+   part would settle whether E009's 1.20x and E013's width loss are typical of
+   x86-64 or specific to Gracemont — and on an AVX-512 machine the crate would be
+   running its 16-way kernel, changing E013's trade-off again.
+5. **Confirm `ROR` lowering on AVX2**, which has no general 32-bit vector rotate
+   below AVX-512's `VPRORD`. Still unmeasured; `VectorPrimitiveBenchmark` exists
+   to answer it.
+6. **Document the Rust minimum version** (1.85, for `edition2024` via
+   `cpufeatures`). A one-line `rust-version` in `Cargo.toml` turns a confusing
+   contender skip into an actionable message.
+
+Items 5 and 6 are cheap. Item 1 is the largest remaining measured win. Item 3 is
+required before any figure in this ledger's environment A column is quoted again.
