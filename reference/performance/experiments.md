@@ -1588,3 +1588,34 @@ Java/Rust gap, while source duplication destroys full-method compiler quality.
 The next candidate should be a custom-JDK constant ROR8/ROR16 lowering to
 AVX2 `vpshufb`, preserving the compact Java graph. Full results and commands are
 in `reference/performance/results/e018-n97.md`.
+
+## E019 — custom-JDK AVX2 ROR8/ROR16 lowering
+
+Date: 2026-08-06
+
+E019 implemented the compiler experiment nominated by E018. On `UseAVX=2`, C2
+now preserves constant packed-int rotate-right nodes and lowers ROR8/ROR16 to a
+single memory-source `vpshufb`; ROR12/ROR7 retain their shift/shift/OR fallback.
+The stable full-kernel body contains 16 shuffles and 16 of each fallback
+instruction, exactly matching the intended BLAKE3 rotate split.
+
+Two correctness bugs in the first matcher versions were caught before timing:
+an unguarded pre-existing EVEX rule caused `SIGILL` on the N97, and an incomplete
+temporary-register contract miscompiled OSR. With an explicit EVEX predicate
+and both AVX2 macro destinations declared temporary, all 542 forced SIMD tests
+pass with normal OSR and Rust present. Allocation remains at the profiler floor.
+
+Paired CPU-3 counters improve the exact four-chunk kernel from 4,385 to 3,601 ns
+and from 12,207 to 10,138 cycles, both about **17%**, while retired instructions
+fall only 2.0% and IPC rises from 3.08 to 3.64. The dependency-chain shortening
+therefore matters more than the raw instruction count alone. A shorter 8 MiB
+composition run improves one-shot from 817 to 941 MiB/s and streaming from 788
+to 932 MiB/s. Java reaches about 56% of pinned Rust on contiguous input and 87%
+on streaming.
+
+Decision: accept as strong compiler-level evidence, not yet as a generally safe
+JDK patch. The next FastBlake experiment is to retest E013's 256-bit kernel on
+this VM because the new rule already handles YMM vectors and the old width loss
+was only 2.5%. Full implementation notes, failure analysis, build details,
+counters and raw artifact names are in
+`reference/performance/results/e019-n97.md`.

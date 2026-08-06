@@ -337,6 +337,16 @@ the exact four-chunk kernel by 52%. Production therefore retains the compact
 seven-iteration loop; the next useful target is custom-JDK AVX2 lowering of
 constant ROR8/ROR16 without expanding the Java Vector API graph.
 
+E019 validates that compiler target. A custom JDK 28 lowers packed-int ROR8 and
+ROR16 to one `vpshufb` each on AVX2 while leaving ROR12/ROR7 as
+shift/shift/OR. All 542 forced SIMD tests pass with normal OSR, and allocation
+remains at the profiler floor. On the N97 the exact four-chunk kernel drops from
+4385 to 3601 ns and from 12,207 to 10,138 cycles; a diagnostic 8 MiB run improves
+one-shot from 817 to 941 MiB/s and streaming from 788 to 932 MiB/s. Java is now
+about 56% of pinned Rust on contiguous input and 87% on streaming. The change
+is still an experimental HotSpot patch, not part of the shipped library; next
+is a retest of the 256-bit kernel under the new lowering.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
