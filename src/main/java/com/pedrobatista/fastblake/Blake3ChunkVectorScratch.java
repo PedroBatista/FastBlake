@@ -16,6 +16,9 @@ final class Blake3ChunkVectorScratch {
     // order, so it keeps the kernel endian-neutral and needs no guard.
     private static final VarHandle LE_INT = MethodHandles
             .byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+    // E016: keep VectorOperators.ROR in this large kernel. Byte-shuffle ROR8
+    // and ROR16 lower to vpshufb in isolation, but made C2 allocate Vector
+    // wrappers in proportion to input size when integrated here.
     private static final int[][] SCHEDULE = {
         {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
         {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
@@ -208,4 +211,3 @@ final class Blake3ChunkVectorScratch {
         output[31] = cv7.lane(3);
     }
 }
-

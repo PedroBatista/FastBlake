@@ -221,10 +221,11 @@ compressor uses 16 named integer locals and seven fully expanded rounds; the
 former array-and-loop compressor remains selectable with
 `-Dfastblake.experimental.legacyScalar=true` for diagnostic comparisons. The
 Vector API `hash_many` kernel over independent 1 KiB chunks has since landed as
-E011, described below; the remaining CPU milestones are batching that kernel
-across streaming updates, batched parent compression, and the scalar data-path
-work (little-endian VarHandle loader, direct-input bypass, message locals) that
-compounds with both. The first array-based Vector API
+E011, described below; the remaining CPU milestones are reducing the measured
+SIMD kernel cost and confirming automatic dispatch across architectures. E016
+completed the streaming batch buffer and promoted the scalar little-endian
+VarHandle loader; direct-input bypass and message-local experiments remain
+possible follow-ups. The first array-based Vector API
 experiment is retained behind `-Dfastblake.experimental.vector=true` but is
 disabled by default because measurement showed a severe regression. A second
 intra-block row-vector experiment is retained behind
@@ -250,8 +251,9 @@ measured 1750 MiB/s one-shot and 1769 MiB/s reused; this is a one-fork quick
 result rather than a long confirmation. E012 validated it on x86-64, where
 it is a *larger* relative win — 2.54x the scalar path — while still passing the
 allocation gate and the full official-vector suite. It remains opt-in behind
-`-Dfastblake.experimental.scratchChunkVector=true` while streaming batching is
-completed.
+`-Dfastblake.experimental.scratchChunkVector=true`; E016 has now completed its
+streaming batching, while a long environment A rerun and wider CPU coverage
+remain before automatic dispatch.
 
 E013 answered the width question E012 raised. `Blake3ChunkVectorWide` is E011's
 kernel with the species and every derived stride taken from
@@ -271,8 +273,8 @@ endian-neutral, so no guard is needed — gained **+28% on the four-lane kernel
 and +30% on the preferred-width one**, from a one-line loader change. At 8 MiB
 the four-lane SIMD kernel now reaches 822 MiB/s one-shot: 3.25× the production
 scalar path, 3.90× Commons, and 49% of Rust on this machine. Both remain opt-in
-pending the streaming batch buffer and a long environment A confirmation. The
-intuitive alternative — doing the transpose with vector loads and in-register
+pending a long environment A confirmation and broader dispatch measurements.
+The intuitive alternative — doing the transpose with vector loads and in-register
 4×4 rearranges — was measured and **rejected at 2.3× slower** than the plain
 VarHandle read. A fully expanded seven-round variant is retained only as
 diagnostic evidence: it crosses a C2 cliff and allocates
@@ -295,6 +297,18 @@ the four M5 lanes with only two parents and then one: 1713/1690 MiB/s versus the
 1750/1769 baseline. It remains opt-in behind
 `-Dfastblake.experimental.parentVector=true` as negative evidence. A future
 parent experiment must aggregate at least eight leaves before reducing them.
+
+E016 used the custom JDK 28 hdis build to compare Java and Rust on the Intel
+N97. Rust's AVX2 kernel uses `vpshufb` for ROR8/ROR16 while Java emits
+shift/shift/OR. Isolated shuffle probes were 2.17–2.27× faster, but inserting
+even ROR16 into the full Vector kernel crossed an escape-analysis cliff and was
+rejected. The accepted four-chunk pending buffer instead lifted 4 KiB streaming
+from 361 to 747 MiB/s, matching Java's 747/779 MiB/s one-shot/reused class, with
+fixed-size allocation and full conformance. The production scalar VarHandle
+loader also improved one-shot/reused from 362/363 to 390/378 MiB/s, with
+streaming neutral at 365 MiB/s. Rust remains ahead at 1561/1574/1027 MiB/s; the
+next investigation is paired hardware counters and phase-level probes before
+changing the large, spill-heavy compression kernel again.
 
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector

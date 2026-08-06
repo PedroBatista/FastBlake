@@ -1,6 +1,8 @@
 package com.pedrobatista.fastblake;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -62,6 +64,8 @@ public final class FastBlake {
     private static final int BLOCK_LEN = 64;
     private static final int CHUNK_LEN = 1024;
     private static final int MAX_DEPTH = 54;
+    private static final VarHandle LITTLE_ENDIAN_INT =
+            MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
 
     private static final int CHUNK_START = 1;
     private static final int CHUNK_END = 2;
@@ -90,6 +94,12 @@ public final class FastBlake {
     private final int[] key = new int[8];
     private final int modeFlags;
     private final byte[] chunk = new byte[CHUNK_LEN];
+    // E016: retain one complete four-chunk SIMD batch across update() calls.
+    // A following byte proves every chunk in this buffer is non-final, at
+    // which point the whole batch can be committed without changing BLAKE3's
+    // rightmost-chunk/ROOT semantics.
+    private final byte[] vectorPending = USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
+            ? new byte[4 * CHUNK_LEN] : null;
     private final int[] cvStack = new int[MAX_DEPTH * 8];
 
     // Scratch used only by mutating update/reset operations. Finalization owns
@@ -108,6 +118,7 @@ public final class FastBlake {
                     Blake3ChunkVectorWide.outputLength())] : null;
 
     private int chunkLength;
+    private int vectorPendingLength;
     private long chunksCompressed;
     private int cvStackLength;
 
@@ -165,6 +176,10 @@ public final class FastBlake {
     public FastBlake update(byte[] input, int offset, int length) {
         Objects.requireNonNull(input, "input");
         Objects.checkFromIndexSize(offset, length, input.length);
+
+        if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
+            return updateScratchVector(input, offset, length);
+        }
 
         int remaining = length;
         int position = offset;
@@ -283,6 +298,37 @@ public final class FastBlake {
         return this;
     }
 
+    /** Incremental path that retains one four-chunk batch for the SIMD kernel. */
+    private FastBlake updateScratchVector(byte[] input, int offset, int length) {
+        int position = offset;
+        int remaining = length;
+        int batchBytes = 4 * CHUNK_LEN;
+        while (remaining > 0) {
+            if (vectorPendingLength == batchBytes) {
+                Blake3ChunkVectorScratch.hashChunks(vectorPending, 0, chunksCompressed,
+                        key, modeFlags, vectorPacked, vectorCvs);
+                pushVectorChunkCvs(4);
+                vectorPendingLength = 0;
+            }
+
+            if (vectorPendingLength == 0 && remaining > batchBytes) {
+                Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
+                        key, modeFlags, vectorPacked, vectorCvs);
+                pushVectorChunkCvs(4);
+                position += batchBytes;
+                remaining -= batchBytes;
+                continue;
+            }
+
+            int take = Math.min(remaining, batchBytes - vectorPendingLength);
+            System.arraycopy(input, position, vectorPending, vectorPendingLength, take);
+            vectorPendingLength += take;
+            position += take;
+            remaining -= take;
+        }
+        return this;
+    }
+
     /**
      * Writes extended output without consuming this hasher.
      */
@@ -296,13 +342,41 @@ public final class FastBlake {
         int[] state = new int[16];
         int[] words = new int[16];
         int[] rightCv = new int[8];
-        Output root = chunkOutput(chunk, chunkLength, chunksCompressed, key, modeFlags,
-                words, state);
+        byte[] finalChunk = chunk;
+        int finalChunkLength = chunkLength;
+        long finalChunkCounter = chunksCompressed;
+        int[] finalStack = cvStack;
+        int finalStackLength = cvStackLength;
 
-        for (int stackIndex = cvStackLength - 1; stackIndex >= 0; stackIndex--) {
+        if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
+            finalStack = Arrays.copyOf(cvStack, cvStack.length);
+            byte[] pendingChunk = new byte[CHUNK_LEN];
+            int chunksBeforeLast = vectorPendingLength == 0
+                    ? 0 : (vectorPendingLength - 1) / CHUNK_LEN;
+            for (int pending = 0; pending < chunksBeforeLast; pending++) {
+                System.arraycopy(vectorPending, pending * CHUNK_LEN,
+                        pendingChunk, 0, CHUNK_LEN);
+                chunkChainingValue(pendingChunk, CHUNK_LEN, finalChunkCounter,
+                        key, modeFlags, rightCv, words, state);
+                finalChunkCounter++;
+                finalStackLength = pushChunkCv(finalStack, finalStackLength, rightCv,
+                        finalChunkCounter, key, modeFlags, words, state);
+            }
+            int lastOffset = chunksBeforeLast * CHUNK_LEN;
+            finalChunkLength = vectorPendingLength - lastOffset;
+            if (finalChunkLength > 0) {
+                System.arraycopy(vectorPending, lastOffset, pendingChunk, 0, finalChunkLength);
+            }
+            finalChunk = pendingChunk;
+        }
+
+        Output root = chunkOutput(finalChunk, finalChunkLength, finalChunkCounter,
+                key, modeFlags, words, state);
+
+        for (int stackIndex = finalStackLength - 1; stackIndex >= 0; stackIndex--) {
             root.chainingValue(rightCv, state);
             int[] parentWords = new int[16];
-            System.arraycopy(cvStack, stackIndex * 8, parentWords, 0, 8);
+            System.arraycopy(finalStack, stackIndex * 8, parentWords, 0, 8);
             System.arraycopy(rightCv, 0, parentWords, 8, 8);
             root = new Output(key, parentWords, 0, BLOCK_LEN, modeFlags | PARENT);
         }
@@ -323,10 +397,28 @@ public final class FastBlake {
     /** Restores the initial state while retaining mode and key. */
     public FastBlake reset() {
         chunkLength = 0;
+        vectorPendingLength = 0;
         chunksCompressed = 0;
         cvStackLength = 0;
         Arrays.fill(chunk, (byte) 0);
+        if (vectorPending != null) {
+            Arrays.fill(vectorPending, (byte) 0);
+        }
         return this;
+    }
+
+    /** Local-stack counterpart used by repeatable finalization of a pending batch. */
+    private static int pushChunkCv(int[] stack, int stackLength, int[] newCv,
+                                   long totalChunks, int[] key, int flags,
+                                   int[] words, int[] state) {
+        long count = totalChunks;
+        while ((count & 1) == 0) {
+            int leftOffset = --stackLength * 8;
+            parentCv(stack, leftOffset, newCv, key, flags, newCv, words, state);
+            count >>>= 1;
+        }
+        System.arraycopy(newCv, 0, stack, stackLength * 8, 8);
+        return stackLength + 1;
     }
 
     private void pushChunkCv(int[] newCv, long totalChunks) {
@@ -514,11 +606,7 @@ public final class FastBlake {
 
     private static void bytesToWords(byte[] input, int offset, int[] words, int count) {
         for (int i = 0; i < count; i++) {
-            int p = offset + i * 4;
-            words[i] = (input[p] & 0xff)
-                    | ((input[p + 1] & 0xff) << 8)
-                    | ((input[p + 2] & 0xff) << 16)
-                    | (input[p + 3] << 24);
+            words[i] = (int) LITTLE_ENDIAN_INT.get(input, offset + i * Integer.BYTES);
         }
     }
 

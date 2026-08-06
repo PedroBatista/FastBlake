@@ -1337,3 +1337,173 @@ of the current VarHandle leaf kernel on environment A. Against the pre-E014
 follow-up (1600/1598 MiB/s), it reaches 1750/1769 MiB/s, roughly +9% to +11%.
 That is a real-looking improvement but remains a one-fork focused result; quote
 it as the current quick run, not as a long confirmation.
+
+## E016 — JDK 28 hdis baseline and AVX2 rotate diagnosis
+
+Date: 2026-08-06
+Environment: **B** (Intel N97, AVX2), custom OpenJDK 28-internal with working
+mnemonic `PrintAssembly`; Rust 1.97.1 and `blake3` 1.8.5.
+
+Purpose: close E012–E014's machine-code evidence gap before changing another
+SIMD layout. Gradle 9.6.1 cannot run its Groovy build scripts on class-file
+version 72, so Gradle and compilation used the configured JDK 25 toolchain and
+the generated JMH classes were launched directly with
+`/opt/jdk-28-custom/bin/java`. JMH confirmed that its child forks also used
+JDK 28. The Rust cdylib was rebuilt in release mode and loaded in-process.
+
+Focused 8 MiB baseline, one fork, 2x1 s warmup and 3x1 s measurement:
+
+| implementation | one-shot | reused | streaming 4 KiB |
+|---|---:|---:|---:|
+| Commons scalar | 202 MiB/s | 215 MiB/s | 213 MiB/s |
+| Rust AVX2 | 1561 MiB/s | 1574 MiB/s | 1027 MiB/s |
+| E009 Java scalar | 362 MiB/s | 363 MiB/s | 365 MiB/s |
+| E011+E014 Java SIMD | 774 MiB/s | 793 MiB/s | 361 MiB/s |
+
+These are diagnostic one-fork figures, not replacements for the longer E014
+ledger. They establish that JDK 28 preserves the important shape: the
+four-lane SIMD path reaches about 50% of Rust on contiguous input, while 4 KiB
+updates remain on the scalar route. The JDK 28 allocation gate passes at
+5857 B/op, 0.000698 B per input byte, with zero collections.
+
+### hdis result
+
+The stable non-OSR C2 compilation of
+`Blake3ChunkVectorScratch.hashChunks` is 7648 bytes with a 368-byte stack
+frame. The static generated body contains 398 vector stack moves. Its compact
+round-loop body lowers all four rotate constants identically: 32 `vpsrld`, 32
+`vpslld`, and 32 `vpor`, with no `vpshufb`. AVX2 has no general packed rotate,
+so each Java Vector API `ROR` costs three instructions.
+
+The Rust `blake3_hash_many_avx2` disassembly uses `vpshufb` for the byte-aligned
+ROR16 and ROR8 operations, and shift/shift/OR only for ROR12 and ROR7. This is
+the first confirmed instruction-selection difference that directly applies to
+the compression rounds. Replacing the sixteen byte-aligned rotates in one
+BLAKE3 round should reduce the rotate sequence from 96 to roughly 64 vector
+instructions. It cannot explain the whole twofold gap, but it is the smallest
+high-information kernel experiment now available.
+
+### E016 execution plan
+
+1. Express ROR8 and ROR16 as `ByteVector.rearrange` operations in isolated
+   dependency-chain probes. Require one `vpshufb` in hdis, correct output, and
+   effectively zero allocation.
+2. If the probes pass, integrate ROR16 and ROR8 into only the four-lane E011
+   kernel, one constant at a time. After each change run official-vector
+   conformance, the allocation gate, hdis, and paired 8 MiB JMH.
+3. Implement a bounded four-chunk pending buffer for incremental updates. A
+   full 4 KiB update currently cannot enter SIMD because the implementation
+   must retain the possible rightmost chunk; the next byte makes the preceding
+   four chunks safe to hash as one batch.
+4. Independently replace the production scalar full-block byte-shift loader
+   with E014's little-endian VarHandle. Keep partial blocks on the existing
+   bounded byte loop.
+
+Raw JDK 28 results are `build/jmh-jdk28-baseline.json`,
+`build/jmh-jdk28-scratch.json`, and `build/jmh-jdk28-scratch-gc.json`.
+
+### E016 rotation result — ideal isolated lowering, rejected in the full kernel
+
+The ROR8 and ROR16 byte-shuffle probes passed their local gates. A one-step
+assertion checked both masks against `Integer.rotateRight`. Each 256-operation
+dependency chain allocated about 0.001 B/op with zero collections, and hdis
+showed one `vpshufb` per operation with no shift/shift/OR sequence.
+
+| 256 dependent operations | Vector API `ROR` | byte shuffle | speedup |
+|---|---:|---:|---:|
+| ROR16 | 194.972 ns | 89.950 ns | 2.17x |
+| ROR8 | 198.411 ns | 87.479 ns | 2.27x |
+
+Integration stopped at the first allocation rung. Replacing only the eight
+ROR16 sites in the compact E011 round body with the proven shuffle helper made
+the 8 MiB hash allocate **205,426,540 B/op**, about 24.49 bytes per input byte,
+and reduced one-shot throughput from 774 to 245 MiB/s. The full official-vector
+suite still passed, proving the path executed correctly, but its throughput is
+an allocation/GC result and is rejected. ROR8 was not integrated because it
+adds the same reinterpret/rearrange wrapper graph. The leaf kernel was restored
+to Vector API `ROR`; only the diagnostic probes remain.
+
+Rule learned: a Vector API expression can scalar-replace and lower perfectly in
+isolation yet cross the escape-analysis cliff when inserted eight times into a
+large method. `vpshufb` remains a useful future target only through a compiler
+intrinsic or a structurally smaller compression kernel; it is not a viable
+incremental edit to E011 on this C2 build. Raw probe and rejected-integration
+results are `build/jmh-jdk28-rotate-probes.json` and
+`build/jmh-jdk28-ror16.json`.
+
+### E016 streaming result — four-chunk pending batch accepted
+
+The scratch-vector update path now retains at most one 4096-byte batch. A
+following byte proves that the retained chunks cannot be the BLAKE3 root, so
+the complete batch can be sent to the existing four-lane leaf kernel. If the
+stream ends at the retained batch, finalization scalar-compresses its first
+zero to three chunks into a copied CV stack and preserves the last chunk for
+ROOT/XOF output. Finalization therefore remains repeatable and does not mutate
+the hasher.
+
+The forced, uncached official-vector run passed with
+`scratchChunkVector=true`, including ordinary, keyed and derive-key hashing,
+XOF, offsets, reset, repeated finalization, and incremental boundaries around
+1024 and 4096 bytes. The in-process Rust contender was present for the same
+run.
+
+Focused JDK 28 results after combining the pending buffer and the scalar loader,
+one fork, 3x1 s warmup and 3x1 s measurement:
+
+| 8 MiB shape | pre-buffer E011+E014 | final E016 | change |
+|---|---:|---:|---:|
+| one-shot | 774 MiB/s | 747 MiB/s | -3.5% |
+| reused | 793 MiB/s | 779 MiB/s | -1.8% |
+| streaming 4 KiB | 361 MiB/s | 747 MiB/s | **+107%** |
+
+Streaming is now the same performance class as contiguous input instead of
+falling through to scalar. Reused and streaming allocation is about 4.7 KiB
+per operation (0.000557 B per input byte) with zero collections; it is fixed
+hasher/finalization cost, not input-proportional allocation. One-shot is about
+12.8 KiB/op because that benchmark also constructs the hasher. Decision:
+retain the buffer as part of the opt-in scratch-vector path. The small
+contiguous-input movement should be rechecked in the longer promotion run, but
+does not outweigh the deliberately targeted 2.07x streaming gain.
+
+Raw results are `build/jmh-jdk28-stream-buffer.json` and
+`build/jmh-jdk28-final-simd.json`.
+
+### E016 scalar result — little-endian VarHandle loader accepted
+
+The production scalar full-block loader now uses a cached little-endian
+`byteArrayViewVarHandle`; the bounded partial-block loop is unchanged. This is
+the same endian-neutral load primitive that passed E014's isolated and SIMD
+gates, applied independently to the scalar compressor.
+
+| 8 MiB scalar shape | byte shifts | VarHandle | change |
+|---|---:|---:|---:|
+| one-shot | 362 MiB/s | 390 MiB/s | +7.7% |
+| reused | 363 MiB/s | 378 MiB/s | +4.1% |
+| streaming 4 KiB | 365 MiB/s | 365 MiB/s | neutral |
+
+The normal full suite and the forced scratch-vector suite both pass. Allocation
+remains fixed-size with zero collections. Decision: keep the loader in the
+production scalar path; it improves two shapes and does not regress the third.
+Raw result: `build/jmh-jdk28-scalar-varhandle.json`.
+
+### Next performance step after E016
+
+On this N97 the final Java SIMD path reaches 747/779/747 MiB/s versus Rust's
+1561/1574/1027 MiB/s. Streaming is now 73% of Rust, while contiguous hashing is
+still only 48–49%. The rotate experiment proved that instruction selection can
+be improved in isolation but also proved that inserting Vector wrapper graphs
+into the 7648-byte kernel is not viable on this C2 build. The next experiment
+should therefore measure, rather than infer, the remaining kernel cost:
+
+1. collect paired cycles, instructions, branches and cache-miss counters for
+   Java's leaf kernel and Rust's `blake3_hash_many_avx2` on the same pinned core;
+2. add allocation-free phase probes for transpose/load, seven-round compression,
+   and CV extraction, so the 398 static vector stack moves can be tied to time;
+3. only then prototype a smaller-live-set compression boundary, with hdis and
+   allocation as first gates. A design that merely hides shuffle rotations in a
+   helper is rejected unless hdis proves that the helper neither allocates nor
+   adds calls in the hot loop.
+
+Promotion of the scratch-vector path remains separate: repeat the longer paired
+suite on environment A and at least one additional AVX2 CPU, then choose
+dispatch by measured architecture rather than `SPECIES_PREFERRED` alone.

@@ -28,9 +28,25 @@ import org.openjdk.jmh.annotations.Warmup;
 public class VectorPrimitiveBenchmark {
 
     private static final VectorSpecies<Integer> S = IntVector.SPECIES_128;
+    private static final VectorSpecies<Byte> BS = ByteVector.SPECIES_128;
     private static final VectorShuffle<Integer> TWO_SOURCE =
             VectorShuffle.fromArray(S, new int[]{0, 4, 1, 5}, 0);
+    private static final VectorShuffle<Byte> ROR_8_BYTES = VectorShuffle.fromArray(BS,
+            new int[]{1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12}, 0);
+    private static final VectorShuffle<Byte> ROR_16_BYTES = VectorShuffle.fromArray(BS,
+            new int[]{2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13}, 0);
     private static final int REPETITIONS = 256;
+
+    static {
+        int[] probe = {0x12345678, 0x89abcdef, 0x0f1e2d3c, 0x4b5a6978};
+        ByteVector bytes = IntVector.fromArray(S, probe, 0).reinterpretAsBytes();
+        int ror8 = bytes.rearrange(ROR_8_BYTES).reinterpretAsInts().lane(0);
+        int ror16 = bytes.rearrange(ROR_16_BYTES).reinterpretAsInts().lane(0);
+        if (ror8 != Integer.rotateRight(probe[0], 8)
+                || ror16 != Integer.rotateRight(probe[0], 16)) {
+            throw new AssertionError("byte shuffle does not implement integer rotate-right");
+        }
+    }
 
     private final byte[] bytes = new byte[4096];
     private final MemorySegment memory = MemorySegment.ofArray(bytes);
@@ -50,6 +66,42 @@ public class VectorPrimitiveBenchmark {
             value = value.lanewise(VectorOperators.ROR, 7);
         }
         return value.lane(0);
+    }
+
+    @Benchmark
+    public int vectorRotate8DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = value.lanewise(VectorOperators.ROR, 8);
+        }
+        return value.lane(0);
+    }
+
+    @Benchmark
+    public int vectorRotate16DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = value.lanewise(VectorOperators.ROR, 16);
+        }
+        return value.lane(0);
+    }
+
+    @Benchmark
+    public int vectorRotate8ByteShuffleDependencyChain() {
+        ByteVector value = IntVector.fromArray(S, ints, 0).reinterpretAsBytes();
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = value.rearrange(ROR_8_BYTES);
+        }
+        return value.reinterpretAsInts().lane(0);
+    }
+
+    @Benchmark
+    public int vectorRotate16ByteShuffleDependencyChain() {
+        ByteVector value = IntVector.fromArray(S, ints, 0).reinterpretAsBytes();
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = value.rearrange(ROR_16_BYTES);
+        }
+        return value.reinterpretAsInts().lane(0);
     }
 
     @Benchmark
