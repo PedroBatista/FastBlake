@@ -1507,3 +1507,23 @@ should therefore measure, rather than infer, the remaining kernel cost:
 Promotion of the scratch-vector path remains separate: repeat the longer paired
 suite on environment A and at least one additional AVX2 CPU, then choose
 dispatch by measured architecture rather than `SPECIES_PREFERRED` alone.
+
+### E016 follow-up — Apple M5 confirmation
+
+The same forced conformance and 8 MiB gates passed on environment A with JDK
+25.0.4. A stable five-iteration one-shot rerun measured 1759 MiB/s; the paired
+three-shape run measured 1763 MiB/s reused and 1726 MiB/s streaming 4 KiB.
+Against the recorded pre-E016 E011+E014 control of 1750/1769/907 MiB/s, the
+contiguous changes are +0.5% and -0.3%, inside the 3% inconclusive band, while
+streaming improves by approximately 90%.
+
+The allocation gate also transfers: 12,455.674 B/op one-shot and approximately
+4,752 B/op reused/streaming, respectively 0.001485 and 0.000567 bytes per input
+byte, with zero collections. The production scalar VarHandle path measured
+923/919/921 MiB/s, directionally +3% to +5% over the earlier E009 M5 quick run.
+Full commands, timings and qualifications are preserved in
+`reference/performance/results/e016-m5.md`.
+
+Decision: E016 does not regress contiguous hashing on M5 and decisively fixes
+the 4 KiB streaming route. This closes the environment-A quick confirmation;
+the longer multi-fork promotion run and another AVX2 CPU remain open.

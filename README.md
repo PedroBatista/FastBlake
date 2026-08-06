@@ -310,6 +310,13 @@ streaming neutral at 365 MiB/s. Rust remains ahead at 1561/1574/1027 MiB/s; the
 next investigation is paired hardware counters and phase-level probes before
 changing the large, spill-heavy compression kernel again.
 
+The E016 follow-up on Apple M5 also passed. Current scratch-vector throughput is
+1759 MiB/s one-shot, 1763 MiB/s reused and 1726 MiB/s streaming 4 KiB. Relative
+to the pre-E016 1750/1769/907 control, contiguous input is unchanged within 1%
+and streaming improves by about 90%. Allocation remains fixed-size with zero
+collections. The production scalar path measured 923/919/921 MiB/s, a
+directional 3–5% improvement over the earlier M5 quick run.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
