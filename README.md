@@ -359,6 +359,15 @@ kernel. E019/E020 are retained as evidence for an upstream HotSpot improvement;
 FastBlake continues to require a stock-JDK, allocation-free win before
 promotion.
 
+E021 rules out missing x86 memory-operand folding as the explanation for the
+remaining N97 gap. In both stock and E019-patched C2 code, 8 of the compact
+round body's 16 static message loads fold into `vpaddd` and 8 remain separate
+`vmovdqu` instructions: 56/56 dynamically per block. Folding the remaining
+half could remove only 2.36% of the stock exact kernel's instructions and 2.7%
+of the measured 8 MiB Java/Rust instruction excess. The N97's 4.28× instruction
+ratio would still be about 4.19×. This x86 result says nothing about the Apple
+M5 gap, which still needs its own AArch64 counters and disassembly.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone

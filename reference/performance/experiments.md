@@ -1655,3 +1655,37 @@ and composition gates, E019/E020 have no shippable speedup. Keep ordinary
 `VectorOperators.ROR`, keep both SIMD kernels experimental, and treat the data
 as evidence for an upstream HotSpot improvement. Full results are in
 `reference/performance/results/e020-n97.md`.
+
+## E021 — x86 message-load folding audit
+
+Date: 2026-08-06
+
+E021 tested whether C2's failure to fold message loads into AVX2 `vpaddd` could
+jointly explain the N97 instruction gap and vector-register pressure. The
+premise needed two corrections: the compact loop has 16 static message loads
+executed over seven rounds, hence 112 dynamic loads per block; and the
+four-lane kernel uses XMM, not YMM. The 4,720-byte E018 compilation is the
+isolated seven-round benchmark, while production `hashChunks` is the roughly
+7.6–7.9 KiB method.
+
+The stable non-OSR bodies on both stock and E019-patched JDK 28 give the same
+answer: 8 memory-source `vpaddd` and 8 separate message-array `vmovdqu` loads
+per static round body. That is 56 folded and 56 separate loads per block, or
+896 of each per complete four-chunk batch. Folding every remaining load could
+remove at most 896 of the stock exact kernel's 37,900.6 instructions, only
+2.36%.
+
+Scaled to E017's 8 MiB counters, the remaining separate loads account for about
+1.834M instructions: 2.04% of Java's 89.83M and 2.67% of the 68.84M Java/Rust
+excess. Perfect folding would move the ratio only from 4.28× to approximately
+4.19×. Even the counterfactual where none of the 112 loads folded could explain
+only 5.33% of the excess.
+
+Decision: reject missing memory-operand folding as a primary cause of the N97
+gap and as the unified explanation for the source-level 18-versus-16 live-value
+count. One message operand per G is already consumed directly from memory; the
+other introduces only a transient register. Restructuring Java solely to fold
+that remaining half has a roughly 2.4% instruction ceiling and cannot close the
+gap. Keep the Apple M5 diagnosis separate: x86 memory operands are inapplicable
+there, and no N97 counter result should be projected onto AArch64. Full counts
+and qualifications are in `reference/performance/results/e021-n97.md`.
