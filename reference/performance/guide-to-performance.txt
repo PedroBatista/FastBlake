@@ -675,7 +675,7 @@ P1 largest expected throughput wins
 * Bounded 4 KiB streaming batch buffer with direct-input bypass. Still open:
   4 KiB updates never enter the chunk-vector branch. The pre-E014 M5 follow-up
   measured about 900 MiB/s on the scalar route; E014 measured 251-252 MiB/s on
-  the N97 scalar route. Current post-E014 M5 streaming throughput is unmeasured.
+  the N97 scalar route. A current post-E014 M5 quick run measured 907 MiB/s.
 * Scalar data-path work that compounds with the above and is not yet done: a
   cached little-endian VarHandle loader (measured 3.51x on the loader alone,
   about 6.7% end-to-end), a direct-input bypass avoiding the per-byte copy
@@ -693,6 +693,9 @@ P3 secondary kernels
 
 * One-node 128-bit row-vector kernel versus named-scalar compression.
 * Vectorized parent/root and long-XOF output only when measurements justify it.
+  E015's four-leaf parent reduction is allocation-free but rejected: it filled
+  only 2/4 then 1/4 lanes and measured 1713/1690 MiB/s against 1750/1769 scalar
+  parent reduction on M5. A retry must aggregate at least eight leaves first.
 
 P4 whole-machine throughput
 

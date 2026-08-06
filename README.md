@@ -245,9 +245,9 @@ E011 follows that gate with reusable primitive transposed-message scratch and a
 compact seven-round loop. It is the first correct allocation-free SIMD win:
 1584 MiB/s one-shot and 1569 MiB/s reused at 8 MiB, about 1.77x the production
 scalar path and 63% of Rust on the Apple M5. **Those M5 figures predate E014 and
-no longer describe the code in the tree** — E014 replaced the transpose that
-kernel used, and its M5 throughput has not been re-measured since. E012
-validated it on x86-64, where
+no longer describe the code in the tree**. A later focused current-code run
+measured 1750 MiB/s one-shot and 1769 MiB/s reused; this is a one-fork quick
+result rather than a long confirmation. E012 validated it on x86-64, where
 it is a *larger* relative win — 2.54x the scalar path — while still passing the
 allocation gate and the full official-vector suite. It remains opt-in behind
 `-Dfastblake.experimental.scratchChunkVector=true` while streaming batching is
@@ -271,7 +271,7 @@ endian-neutral, so no guard is needed — gained **+28% on the four-lane kernel
 and +30% on the preferred-width one**, from a one-line loader change. At 8 MiB
 the four-lane SIMD kernel now reaches 822 MiB/s one-shot: 3.25× the production
 scalar path, 3.90× Commons, and 49% of Rust on this machine. Both remain opt-in
-pending the streaming batch buffer and an environment A confirmation. The
+pending the streaming batch buffer and a long environment A confirmation. The
 intuitive alternative — doing the transpose with vector loads and in-register
 4×4 rearranges — was measured and **rejected at 2.3× slower** than the plain
 VarHandle read. A fully expanded seven-round variant is retained only as
@@ -283,11 +283,18 @@ A pre-E014 follow-up on the Apple M5 found no regression from E013 itself: the
 fixed and preferred-width kernels measured 1600/1598 and 1594/1592 MiB/s for
 one-shot/reuse respectively. Both were four-lane kernels on NEON and differed by
 less than 1%. Those runs used the old byte-shift loader and therefore do not
-measure the current E014 code. Kernel selection is not automatic yet: the N97
+measure the current E014 code; the later current-code run measured 1750/1769
+MiB/s one-shot/reused. Kernel selection is not automatic yet: the N97
 result proves that `SPECIES_PREFERRED` is a capability signal, not a guarantee
 that the widest kernel is fastest. Current width comparisons favor 128 bits on
-both M5 and N97; current post-E014 M5 throughput remains unmeasured, while other
-AVX2 cores and AVX-512 also require measurements.
+both M5 and N97; other AVX2 cores and AVX-512 still require measurements.
+
+E015 tested preferred-species parent compression and batched reduction of each
+aligned four-leaf SIMD result. It is correct and allocation-free, but underfills
+the four M5 lanes with only two parents and then one: 1713/1690 MiB/s versus the
+1750/1769 baseline. It remains opt-in behind
+`-Dfastblake.experimental.parentVector=true` as negative evidence. A future
+parent experiment must aggregate at least eight leaves before reducing them.
 
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector

@@ -39,6 +39,10 @@ public final class FastBlake {
     // property exists so the width change can be measured on its own.
     private static final boolean USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.wideChunkVector");
+    // E015 reduces each aligned leaf-SIMD batch to one subtree with a
+    // lane-parallel parent compressor before touching the scalar CV stack.
+    private static final boolean USE_EXPERIMENTAL_PARENT_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.parentVector");
     // E009 promoted the named-local compressor. Keep the former loop as a
     // diagnostic control so its baseline remains directly reproducible.
     private static final boolean USE_LEGACY_SCALAR =
@@ -183,11 +187,7 @@ public final class FastBlake {
                     && remaining > Blake3ChunkVectorWide.LANES * CHUNK_LEN) {
                 Blake3ChunkVectorWide.hashChunks(input, position, chunksCompressed,
                         key, modeFlags, vectorPacked, vectorCvs);
-                for (int lane = 0; lane < Blake3ChunkVectorWide.LANES; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
-                    chunksCompressed++;
-                    pushChunkCv(scratchCv, chunksCompressed);
-                }
+                pushVectorChunkCvs(Blake3ChunkVectorWide.LANES);
                 position += Blake3ChunkVectorWide.LANES * CHUNK_LEN;
                 remaining -= Blake3ChunkVectorWide.LANES * CHUNK_LEN;
                 continue;
@@ -197,11 +197,7 @@ public final class FastBlake {
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
                         key, modeFlags, vectorPacked, vectorCvs);
-                for (int lane = 0; lane < 4; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
-                    chunksCompressed++;
-                    pushChunkCv(scratchCv, chunksCompressed);
-                }
+                pushVectorChunkCvs(4);
                 position += 4 * CHUNK_LEN;
                 remaining -= 4 * CHUNK_LEN;
                 continue;
@@ -341,6 +337,47 @@ public final class FastBlake {
             parentCv(cvStack, leftOffset, scratchCv, key, modeFlags,
                     scratchCv, scratchWords, scratchState);
             count >>>= 1;
+        }
+        System.arraycopy(scratchCv, 0, cvStack, cvStackLength * 8, 8);
+        cvStackLength++;
+    }
+
+    /** Pushes one leaf-SIMD result, optionally reducing its aligned subtree first. */
+    private void pushVectorChunkCvs(int count) {
+        long firstChunk = chunksCompressed;
+        if (!USE_EXPERIMENTAL_PARENT_VECTOR
+                || count < 2
+                || (count & (count - 1)) != 0
+                || (firstChunk & (count - 1)) != 0
+                || count / 2 > Blake3ParentVector.LANES) {
+            for (int lane = 0; lane < count; lane++) {
+                System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                chunksCompressed++;
+                pushChunkCv(scratchCv, chunksCompressed);
+            }
+            return;
+        }
+
+        int active = count;
+        while (active > 1) {
+            int parents = active >>> 1;
+            Blake3ParentVector.compressPairs(vectorCvs, parents, key, modeFlags,
+                    vectorPacked);
+            active = parents;
+        }
+        chunksCompressed += count;
+        pushSubtreeCv(vectorCvs, chunksCompressed, count);
+    }
+
+    /** Merges and pushes one already-reduced power-of-two subtree. */
+    private void pushSubtreeCv(int[] newCv, long totalChunks, int subtreeChunks) {
+        System.arraycopy(newCv, 0, scratchCv, 0, 8);
+        long subtreeCount = totalChunks / subtreeChunks;
+        while ((subtreeCount & 1) == 0) {
+            int leftOffset = --cvStackLength * 8;
+            parentCv(cvStack, leftOffset, scratchCv, key, modeFlags,
+                    scratchCv, scratchWords, scratchState);
+            subtreeCount >>>= 1;
         }
         System.arraycopy(scratchCv, 0, cvStack, cvStackLength * 8, 8);
         cvStackLength++;

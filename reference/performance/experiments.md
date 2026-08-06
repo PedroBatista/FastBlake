@@ -988,7 +988,9 @@ Assessment: no M5 regression from E013. E011 and E013 both select four lanes
 here and differ by less than 1%, well inside the protocol's 3% inconclusive
 band. The small improvement over the historical run is ordinary
 run-to-run/JIT/thermal variation, not a claimed optimization. These figures do
-not describe the current E014 loader; its M5 throughput remains unmeasured.
+not describe the current E014 loader. E015 later supplied a current E011+E014
+quick run at 1750/1769 MiB/s one-shot/reused; a long M5 confirmation remains
+open.
 
 Dispatch audit: the code is width-capable but not yet CPU-policy-aware.
 `scratchChunkVector` always selects four lanes and `wideChunkVector` always
@@ -1113,10 +1115,11 @@ Next experiments, in order:
    end-to-end for E009. This changes the production default, so it needs its own
    entry and a longer confirmation.
 2. Streaming batch buffer, the last item gating E011's promotion.
-3. Re-measure E011+E014 and E013+E014 on environment A. The transpose was 30% of
-   the kernel on x86-64; its share on the M5 is unmeasured, and E013's width
-   verdict may differ where `SPECIES_PREFERRED` is 128-bit and the wide and
-   narrow kernels are the same thing.
+3. Re-measure E011+E014 and E013+E014 on environment A. E015 later supplied a
+   one-fork E011+E014 quick run at 1750/1769 MiB/s; a long confirmation and a
+   current E013 run remain open. E013's width verdict may differ where
+   `SPECIES_PREFERRED` is 128-bit and the wide and narrow kernels have the same
+   lane count.
 
 ### E014 effect on earlier recorded figures
 
@@ -1125,9 +1128,10 @@ E011's environment A results — 1584 MiB/s one-shot and 1569 MiB/s reused, "abo
 manual byte-shift transpose that E014 has now removed from
 `Blake3ChunkVectorScratch`. Those figures stand as written for the kernel as it
 existed then, per this ledger's no-rewrite rule, but **they no longer describe
-the code in the tree**. The current kernel's environment A throughput is
-unmeasured. The same applies to the README's 63%-of-Rust figure and to E012's
-environment A column wherever it quotes E011.
+the code in the tree**. E015 later measured the current E011+E014 kernel at
+1750/1769 MiB/s in a one-fork quick run; a long confirmation remains open. The
+same historical qualification applies to the README's 63%-of-Rust figure and to
+E012's environment A column wherever it quotes E011.
 
 On environment B the same change was worth +28%. If it transfers, E011+E014 on
 the M5 would be materially above 1584 MiB/s and above 63% of Rust, but that is a
@@ -1233,9 +1237,9 @@ Best SIMD is 3.25x the production scalar path, 3.90x Commons, and 49% of Rust.
    changes the production default and needs its own entry.
 2. **Streaming batch buffer.** 4 KiB updates stay on the scalar route at
    ~251 MiB/s. This is the last item gating E011's promotion out of opt-in.
-3. **Re-measure on environment A.** E011's recorded M5 figures predate E014 and
-   no longer describe the code. E013's width verdict is also untested where
-   `SPECIES_PREFERRED` is 128-bit.
+3. **Re-measure on environment A.** E015 later supplied an E011+E014 one-fork
+   quick run at 1750/1769 MiB/s. A long confirmation is still required, and the
+   current E013 path remains unmeasured where `SPECIES_PREFERRED` is 128-bit.
 4. **Re-measure on a wide x86-64 core.** Every environment B conclusion about
    core width rests on one narrow E-core with no AVX-512. A Golden Cove or Zen
    part would settle whether E009's 1.20x and E013's width loss are typical of
@@ -1250,3 +1254,86 @@ Best SIMD is 3.25x the production scalar path, 3.90x Commons, and 49% of Rust.
 
 Items 5 and 6 are cheap. Item 1 is the largest remaining measured win. Item 3 is
 required before any figure in this ledger's environment A column is quoted again.
+
+## E015 plan — SIMD parent compression and batched tree reduction
+
+Date: 2026-08-06
+
+Observed gap: after E014 on environment B, the best Java leaf-SIMD path reaches
+822 MiB/s against Rust's 1668 MiB/s. SIMD width alone is not the explanation:
+E013's eight-lane Java kernel remains slower than E011's four-lane kernel. The
+strongest structural difference is that the Rust implementation supplies
+architecture-specific `hash_many` and tree machinery, while FastBlake converts
+leaf results to lane-major arrays, copies and pushes every CV separately, and
+compresses every parent through the scalar path. C2 instruction scheduling,
+AVX2 rotate lowering, and spills remain plausible kernel-level contributors but
+are unconfirmed without assembly or counters; JNI overhead is amortized at 8 MiB
+and is not a credible primary explanation.
+
+Experiment: add an opt-in preferred-species parent compressor. When an existing
+leaf SIMD call returns an aligned power-of-two batch, transpose sibling CV pairs
+into one parent-message batch, compress the independent parents together, and
+repeat level by level until one subtree CV remains. Push that subtree once using
+the same lazy binary-tree invariant. Unaligned input and non-SIMD paths retain
+the existing scalar `pushChunkCv` behavior. This isolates parent batching from
+leaf-kernel changes and preserves the final/rightmost chunk for root/XOF output.
+
+Gates, in order: full official-vector correctness in hash, keyed, derive-key and
+XOF modes; zero input-proportional allocation; then 8 MiB one-shot and reused
+throughput against the identical leaf kernel without parent batching. Streaming
+4 KiB is expected to remain scalar until the separate streaming batch buffer is
+implemented. Retain the experiment only if the complete hash improves outside
+the 3% inconclusive band; an isolated parent microbenchmark is not sufficient.
+
+### E015 result — correct and allocation-free, but four-leaf reduction loses
+
+Environment: **A** (Apple M5, NEON 128-bit, preferred species = 4 int lanes)
+
+Implementation: `Blake3ParentVector` compresses one independent parent per lane.
+With `scratchChunkVector` and `parentVector` enabled together, each aligned
+four-leaf result is reduced in place: two level-1 parents, then one level-2
+parent, followed by one subtree-stack push. Existing `vectorPacked` and
+`vectorCvs` arrays are reused; unaligned batches retain scalar pushes. The
+production default and the leaf kernel are unchanged.
+
+Correctness: the complete rerun of the official-vector suite passed with both
+properties enabled, including hash, keyed hash, derive-key, XOF, offsets and all
+incremental boundary shapes. The 102,400-byte cases prove that the new branch
+executed rather than merely falling through to scalar processing.
+
+Allocation gate, 8 MiB one-shot, `-prof gc`: **5552.508 B/op**, 0.000662 B per
+input byte, zero collections. This is fixed hasher/finalization cost and matches
+the earlier M5 E011 setup volume; the parent kernel introduces no
+input-proportional allocation.
+
+Paired focused runs, one fork, 3 warmup and 3 measurement iterations:
+
+| 8 MiB shape | E011+E014 baseline | + E015 parent SIMD | change |
+|---|---:|---:|---:|
+| one-shot | 1750 MiB/s | 1713 MiB/s | -2.1% |
+| reused | 1769 MiB/s | 1690 MiB/s | -4.5% |
+| streaming 4 KiB | 907 MiB/s | 896 MiB/s | -1.2% (scalar route/noise) |
+
+The one-shot result is inside the 3% inconclusive band, while reused crosses the
+rejection threshold in the wrong direction. There is no evidence of an
+end-to-end improvement. Decision: do not promote; retain behind
+`-Dfastblake.experimental.parentVector=true` as a reproducible negative
+experiment, meaningful only together with an allocation-free leaf-SIMD property.
+
+Explanation: a four-leaf subtree contains two independent parents at its first
+level and one at its second. On a four-lane M5, E015 therefore executes complete
+vector rounds at only 2/4 and then 1/4 useful-lane occupancy. It replaces three
+strong named-scalar parent compressions with two underfilled vector
+compressions, plus transposition and lane extraction. It also vectorizes only
+the parents internal to each four-leaf batch; merges between batches remain on
+the scalar stack. This result does not show that parent SIMD is intrinsically
+bad. It shows that parent SIMD must aggregate a larger forest before reduction:
+at least eight leaves give 4/4 occupancy at the first level, while 16 leaves
+allow two full first-level calls followed by 4/4, 2/4 and 1/4. Such buffering is
+a distinct E016 design and should not be inferred as a win from E015.
+
+Incidental E014 M5 closure: the paired baseline above is the first measurement
+of the current VarHandle leaf kernel on environment A. Against the pre-E014
+follow-up (1600/1598 MiB/s), it reaches 1750/1769 MiB/s, roughly +9% to +11%.
+That is a real-looking improvement but remains a one-fork focused result; quote
+it as the current quick run, not as a long confirmation.
