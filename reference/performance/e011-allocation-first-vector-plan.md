@@ -1,7 +1,7 @@
 # E011 — allocation-first Vector API recovery plan
 
 Date: 2026-08-06
-Status: rungs 1–4 implemented and measured; no hashing dispatch changed
+Status: rungs 1–7 implemented and measured; algorithm-correct kernel is opt-in
 
 ## Objective
 
@@ -94,3 +94,56 @@ E004–E008's wrapper-allocation storm.
 Decision: proceed to rung 5, seven BLAKE3 rounds for one block, retaining the
 same named state and primitive message layout. Do not integrate with `FastBlake`
 until the block and sixteen-block chunk rungs also pass independently.
+
+## Rungs 5–7 and the allocation cliff
+
+| shape | time | normalized allocation | GC |
+|---|---:|---:|---:|
+| four fully expanded rounds | 65.230 ns | ~0.001 B/op | 0 |
+| six fully expanded rounds | 100.709 ns | 0.001 B/op | 0 |
+| seven fully expanded rounds | 13985.551 ns | 43776.098 B/op | 67 collections/5 iterations |
+| seven rounds through compact schedule loop | 114.963 ns | 0.001 B/op | 0 |
+| four complete 1 KiB chunk lanes | 2092.938 ns | 0.015 B/op | 0 |
+
+The allocation cliff is exact and non-gradual: six expanded rounds scalarize,
+while adding the seventh makes C2 allocate 43,776 bytes per invocation. A
+compact seven-round loop with dynamic schedule offsets is both allocation-free
+and fast. This disproves the idea that a loop or dynamic schedule is inherently
+fatal; on this JVM the smaller compiler graph is essential.
+
+The four-chunk diagnostic processes 4096 bytes in 2.093 microseconds, about
+1.87 GiB/s before real tree integration.
+
+## Algorithm-correct kernel
+
+`Blake3ChunkVectorScratch` applies the compact shape to real BLAKE3 flags,
+counters, chaining values, messages, and CV extraction. Enable with:
+
+```bash
+-Dfastblake.experimental.scratchChunkVector=true
+```
+
+Correctness: the forced full official-vector suite passed in hash, keyed-hash,
+derive-key, XOF, and incremental boundary modes.
+
+Allocation gate, 8 MiB one-shot: 5554.711 B/op, or 0.00066 B/input byte, with
+zero collections. This is fixed hasher/JMH setup and finalization noise rather
+than algorithm-proportional allocation. For comparison, E008 allocated 1.33 GB
+per operation.
+
+Standard 8 MiB quick comparison:
+
+| shape | Commons | Rust | E011 | E009 default |
+|---|---:|---:|---:|---:|
+| one-shot | 554 MiB/s | 2505 MiB/s | 1584 MiB/s | 894 MiB/s |
+| reused | 546 MiB/s | 2479 MiB/s | 1569 MiB/s | 883 MiB/s |
+| streaming 4 KiB | 540 MiB/s | 2301 MiB/s | 874 MiB/s | 874 MiB/s |
+
+E011 is 1.77x E009 for contiguous large inputs and reaches about 63% of Rust's
+single-threaded SIMD throughput. Streaming remains scalar because a 4096-byte
+update cannot process four chunks while also retaining the rightmost chunk for
+correct finalization.
+
+Decision: retain opt-in pending a streaming batch buffer, longer confirmation,
+and validation on at least one non-AArch64 JVM. The result is nevertheless the
+first correct, allocation-free, end-to-end Java SIMD win in this project.

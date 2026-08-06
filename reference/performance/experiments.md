@@ -529,3 +529,39 @@ Comment: E010's proposed primitive-message layout survives a complete round
 without wrapper allocation. This is the first positive end-to-end compiler
 shape evidence for the recovered SIMD effort; it is still a diagnostic result,
 not a BLAKE3 throughput claim.
+
+### E011 continuation — compiler cliff and complete kernel
+
+Rung 5 located a sharp escape-analysis cliff. Four and six fully expanded
+rounds allocate effectively zero and take 65.230 ns and 100.709 ns. Seven
+expanded rounds allocate 43,776.098 B/op and take 13,985.551 ns. Replacing the
+expanded rounds with a compact seven-iteration schedule loop restores effective
+zero allocation and takes 114.963 ns.
+
+Rung 6 combines scalar transpose, the compact round loop, and chaining across
+16 blocks: four complete chunk lanes take 2092.938 ns, approximately 1.87 GiB/s,
+with 0.015 B/op and no GC.
+
+Rung 7 adds algorithm-correct `Blake3ChunkVectorScratch`, available behind
+`-Dfastblake.experimental.scratchChunkVector=true`. The forced full conformance
+suite passed. An isolated 8 MiB one-shot GC-profile run measured 5554.711 B/op
+(0.00066 B/input byte), zero collections, and 1601 MiB/s; the fixed allocation
+is setup/finalization noise rather than compression-proportional garbage.
+
+Standard quick comparison:
+
+| 8 MiB shape | Commons | Rust | FastBlake E011 | E009 default |
+|---|---:|---:|---:|---:|
+| one-shot | 554 MiB/s | 2505 MiB/s | 1584 MiB/s | 894 MiB/s |
+| reused | 546 MiB/s | 2479 MiB/s | 1569 MiB/s | 883 MiB/s |
+| streaming 4 KiB | 540 MiB/s | 2301 MiB/s | 874 MiB/s | 874 MiB/s |
+
+Decision: keep opt-in while adding streaming batching, a longer confirmation,
+and non-AArch64 validation. E011 is a successful implementation result: 1.77x
+the production scalar path for large contiguous inputs and about 63% of Rust,
+without algorithm-proportional allocation.
+
+Rule learned: on this C2 build, minimizing the compiler graph is more important
+than making fixed rounds straight-line. Six expanded rounds scalarize; seven do
+not. A compact round loop preserves vector scalar replacement even with dynamic
+schedule offsets. Allocation must be checked after every method-size change.

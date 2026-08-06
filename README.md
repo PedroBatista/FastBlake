@@ -213,6 +213,16 @@ allocation-free SIMD; register-pressure and cache-layout conclusions from
 E002–E008 are therefore unproven. The kernels remain opt-in diagnostic
 artifacts, and future SIMD work starts with a mandatory per-fork allocation
 gate.
+
+E011 follows that gate with reusable primitive transposed-message scratch and a
+compact seven-round loop. It is the first correct allocation-free SIMD win:
+1584 MiB/s one-shot and 1569 MiB/s reused at 8 MiB, about 1.77x the production
+scalar path and 63% of Rust on the Apple M5. It remains opt-in behind
+`-Dfastblake.experimental.scratchChunkVector=true` while streaming batching and
+non-AArch64 validation are completed. A fully expanded seven-round variant is
+retained only as diagnostic evidence: it crosses a C2 cliff and allocates
+43,776 bytes per block invocation, while the compact loop allocates effectively
+zero.
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
