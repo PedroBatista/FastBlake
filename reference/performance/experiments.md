@@ -1527,3 +1527,35 @@ Full commands, timings and qualifications are preserved in
 Decision: E016 does not regress contiguous hashing on M5 and decisively fixes
 the 4 KiB streaming route. This closes the environment-A quick confirmation;
 the longer multi-fork promotion run and another AVX2 CPU remain open.
+
+## E017 — N97 phase decomposition and smaller-live-set control
+
+Date: 2026-08-06
+
+The three-fork CPU-3-pinned control measures the current Java SIMD path at
+801 MiB/s and Rust AVX2 at 1599 MiB/s: Java is 50.1% of Rust. After the machine
+owner enabled user-space counters, the operation-normalized paired run measured
+29.75M versus 14.66M cycles and 89.83M versus 20.99M instructions per 8 MiB
+hash. Java executes **4.28x** the instructions but sustains 3.02 IPC versus
+Rust's 1.43, reducing the final cycle gap to 2.03x. Cache references and misses
+are only 15% higher; Java branches are 61.45x higher but rarely mispredict.
+
+Exact allocation-free probes close to within 0.1% of the full four-chunk
+kernel: 16 blocks of VarHandle load/transpose account for 387.2 ns (9.2%), 16
+seven-round compressions account for 3825.6 ns (90.5%), and CV extraction costs
+17.1 ns (0.4%), versus 4225.7 ns measured end to end. Compression, not loading
+or extraction, is the remaining target.
+
+Phase counters agree: the exact batch retires 37,620 instructions, while the
+separately measured phase sum predicts 36,931 (within 1.8%). Sixteen
+compression phases contribute about 31,817 instructions. This is an
+instruction-volume problem, not evidence that the core is starved for work.
+
+A bounded state-scratch prototype reduced the nominal live vector set to one G
+but measured 387.6 ns per seven rounds versus 247.1 ns for the named-vector
+loop, **56.8% slower**, with both paths at 0.002 B/op. hdis shows a separate
+1344-byte `g` method, repeated range checks, and explicit four-load/four-store
+state traffic on each of 56 calls. Decision: reject for production and retain
+only as a benchmark control. Full commands, raw-result names, qualifications,
+and the counter-unblock procedure are in
+`reference/performance/results/e017-n97.md`.

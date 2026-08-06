@@ -317,6 +317,19 @@ and streaming improves by about 90%. Allocation remains fixed-size with zero
 collections. The production scalar path measured 923/919/921 MiB/s, a
 directional 3–5% improvement over the earlier M5 quick run.
 
+E017 decomposed the current SIMD kernel on the N97. A three-fork core-pinned
+run measures Java at 801 MiB/s and Rust at 1599 MiB/s. Exact phase probes put
+90.5% of Java kernel time in the seven compression rounds, 9.2% in
+load/transpose, and 0.4% in CV extraction; their sum matches the complete
+kernel within 0.1%. A smaller-live-set state-scratch boundary was allocation-free
+but 56.8% slower and is retained only as a negative benchmark control. Linux
+hardware counters then established the main mechanism: Java executes 4.28× as
+many instructions and 61× as many branches as Rust, while sustaining 3.02 IPC
+versus Rust's 1.43 and recording only 15% more cache misses. The remaining 2.03×
+cycle gap is therefore instruction volume, not poor issue utilization or a
+cache bottleneck. Details and reproducible commands are in the E017 result
+document.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone
