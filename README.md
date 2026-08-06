@@ -137,7 +137,24 @@ better; x-factor against the `commons` baseline.
 | 8 MiB | 544 | 2420 (4.45×) | 538 | 2402 (4.46×) | 534 | 2240 (4.19×) |
 
 Raw JSON: `build/jmh-contenders.json`. Re-measure on your own machine before
-drawing conclusions.
+drawing conclusions — and that is not a formality. E012 re-ran the ledger on an
+Intel N97 (AVX2, Linux, Temurin 25+36) and two of the headline ratios above do
+not transfer:
+
+| ratio at 8 MiB | Apple M5 (NEON) | Intel N97 (AVX2) |
+|---|---:|---:|
+| FastBlake scalar vs Commons | 1.61x | 1.20x |
+| FastBlake E011 SIMD vs its own scalar | 1.77x | 2.54x |
+| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% |
+| Rust vs Commons | 4.5x | 7.9x |
+
+Correctness, the allocation gate, and C2's escape-analysis behaviour *did*
+transfer, to three significant figures. What did not transfer is anything whose
+mechanism depends on core width: the scalar kernel's instruction-level
+parallelism has less to exploit on a narrow E-core, and the SIMD kernel's
+hard-coded 128-bit species uses only half of an AVX2 machine while the Rust
+crate dispatches to 8-lane AVX2. See `reference/performance/experiments.md`
+§ E012.
 
 What this says about where the work is:
 
@@ -173,6 +190,11 @@ benchmark harness, not something to imitate in production code.
 The crate pins `panic = "abort"` and leaves the `rayon` feature off, so it races
 one core against one Java thread. `fb_abi_version` is checked at link time, so a
 stale library is rejected rather than silently mismeasured.
+
+**Requires cargo 1.85 or newer.** `blake3` 1.8.5 pulls in `cpufeatures` 0.3.0,
+which needs edition 2024. On an older cargo the crate fails to build and the
+contender is skipped with the cargo error as its reason — the build stays green,
+but the ceiling column silently disappears. `rustup update stable` fixes it.
 
 Gradle's `cargoBuild` task is best-effort: missing cargo, a failed compile, or a
 platform that produces no shared library each record a reason in
@@ -217,9 +239,11 @@ gate.
 E011 follows that gate with reusable primitive transposed-message scratch and a
 compact seven-round loop. It is the first correct allocation-free SIMD win:
 1584 MiB/s one-shot and 1569 MiB/s reused at 8 MiB, about 1.77x the production
-scalar path and 63% of Rust on the Apple M5. It remains opt-in behind
-`-Dfastblake.experimental.scratchChunkVector=true` while streaming batching and
-non-AArch64 validation are completed. A fully expanded seven-round variant is
+scalar path and 63% of Rust on the Apple M5. E012 validated it on x86-64, where
+it is a *larger* relative win — 2.54x the scalar path — while still passing the
+allocation gate and the full official-vector suite. It remains opt-in behind
+`-Dfastblake.experimental.scratchChunkVector=true` while streaming batching is
+completed. A fully expanded seven-round variant is
 retained only as diagnostic evidence: it crosses a C2 cliff and allocates
 43,776 bytes per block invocation, while the compact loop allocates effectively
 zero.

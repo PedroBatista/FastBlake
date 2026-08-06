@@ -26,11 +26,36 @@ may combine details from several attempts.
 
 ## Environment
 
+Entries E000–E011 were measured on environment **A**. E012 introduces
+environment **B**; every entry must now name the environment it was measured on,
+because E012 shows that several conclusions are environment-specific.
+
+Environment A (AArch64):
+
 - Machine: Apple M5, 10 cores
 - OS: macOS 26.6 (25G72)
 - JVM: Temurin OpenJDK 25.0.4+7-LTS
 - Benchmark: JMH 1.37, one thread
 - Native reference: Rust `blake3` 1.8.5, SIMD, Rayon disabled
+- SIMD width: NEON, 128 bit. `IntVector.SPECIES_PREFERRED` is 128-bit/4-lane,
+  so the kernels' hard-coded `SPECIES_128` is the full machine width.
+
+Environment B (x86-64):
+
+- Machine: Intel N97, 4 cores, 4 threads, Alder Lake-N (Gracemont E-cores
+  only), 3.6 GHz max, 6 MiB L3
+- OS: Linux 7.0.0-28-generic
+- JVM: Temurin OpenJDK 25+36-LTS
+- Benchmark: JMH 1.37, one thread
+- Native reference: Rust `blake3` 1.8.5 built with Rust 1.97.1, SIMD, Rayon
+  disabled
+- SIMD width: AVX2, 256 bit (`UseAVX=2`, `MaxVectorSize=32`, no AVX-512).
+  `IntVector.SPECIES_PREFERRED` is 256-bit/8-lane, so the kernels' hard-coded
+  `SPECIES_128` uses **half** the available width.
+
+Environment B is a low-power part and is much slower in absolute terms than
+environment A. Absolute MiB/s must never be compared across environments; only
+ratios within one environment are meaningful.
 
 ## E000 — external baselines before FastBlake
 
@@ -565,3 +590,190 @@ Rule learned: on this C2 build, minimizing the compiler graph is more important
 than making fixed rounds straight-line. Six expanded rounds scalarize; seven do
 not. A compact round loop preserves vector scalar replacement even with dynamic
 schedule offsets. Allocation must be checked after every method-size change.
+
+## E012 — cross-architecture validation of E001–E011 on x86-64
+
+Date: 2026-08-06
+Environment: **B** (Intel N97, AVX2, Linux, Temurin 25+36). All prior entries
+were environment A (Apple M5, NEON, macOS, Temurin 25.0.4+7).
+
+Type: validation of existing experiments on a second architecture. No production
+code changed. Full record with all raw numbers, commands, limitations, and
+reasoning: `e012-x86-64-cross-architecture-validation.md`.
+
+Purpose: E011 was retained opt-in explicitly pending "validation on at least one
+non-AArch64 JVM". This entry supplies it, and also re-runs the E010 allocation
+diagnosis to determine whether its findings are properties of C2 or of AArch64.
+
+### Toolchain note
+
+The Rust contender initially reported unavailable: the machine's cargo 1.84.0
+predates the `edition2024` feature required by `cpufeatures 0.3.0`, a transitive
+dependency of `blake3` 1.8.5. `cargoBuild` recorded the reason and the build
+stayed green with two contenders, which is the documented "absence is never
+failure" behaviour working as designed on a second platform. Updating to Rust
+1.97.1 restored the contender. Recorded because the minimum Rust version is a
+real, undocumented build requirement.
+
+### Result 1 — correctness is portable
+
+`./gradlew test` passes on x86-64 in every configuration: 542 tests with all
+three contenders present, and 362 java-cpu tests under each of the seven
+experimental properties (`vector`, `blockVector`, `chunkVector4`,
+`lowLiveVector`, `roundCacheVector`, `heapChunkVector`, `scratchChunkVector`),
+each in its own JVM via `JAVA_TOOL_OPTIONS`.
+
+The vector branches genuinely executed rather than being skipped: dispatch
+requires `remaining > 4 * CHUNK_LEN` (4096 bytes) and the official vectors run to
+102,400 bytes. `Blake3ChunkVectorScratch` is endian-neutral — it assembles words
+with explicit byte shifts rather than reinterpretation — so unlike
+`heapChunkVector` it needs no little-endian guard, and that portability is now
+demonstrated rather than assumed.
+
+### Result 2 — E010's allocation diagnosis is a C2 property, not an AArch64 one
+
+Same protocol as E010: 8 MiB one-shot, one isolated fork per kernel, `-prof gc`.
+
+| kernel | env B B/op | env B B/input byte | env A B/input byte |
+|---|---:|---:|---:|
+| E008 `heapChunkVector` | 1,333,932,852 | **159.02** | 158.76 |
+| E004 `chunkVector4` | 1,333,934,658 | **159.02** | 158.90 |
+| E006 `roundCacheVector` | 1,786,700,064 | **213.00** | 212.99 |
+| E005 `lowLiveVector` | 2,138,849,552 | **254.97** | 254.61 |
+
+The figures agree with environment A to three significant figures on a different
+architecture, OS, and JVM build. C2's failure to eliminate `IntVector` wrappers
+in these kernels is therefore a property of the compiler and the code shape, not
+of AArch64 or of Apple's memory model. E010's central finding is confirmed and
+its correction of E002–E008 stands on both architectures.
+
+Their environment-B throughput is correspondingly ruined: 8.3, 7.8, 6.8 and
+5.7 MiB/s, i.e. worse than environment A in the same rank order.
+
+### Result 3 — the seven-round escape-analysis cliff reproduces exactly
+
+Full `VectorAllocationBenchmark` ladder, one fork per method, `-prof gc`:
+
+| rung | env B time | env B allocation | env B GC | env A time |
+|---|---:|---:|---:|---:|
+| primitive four-chunk transpose | 88.709 ns | 0.001 B/op | 0 | 26.449 ns |
+| scheduled vector load chain | 343.835 ns | 0.002 B/op | 0 | 392.838 ns |
+| one BLAKE3 G | 1531.962 ns | 0.011 B/op | 0 | 1981.969 ns |
+| one round, 16 named vectors | 7358.509 ns | 0.051 B/op | 0 | 4743.136 ns |
+| four expanded rounds | 116.767 ns | 0.001 B/op | 0 | 65.230 ns |
+| six expanded rounds | 166.896 ns | 0.001 B/op | 0 | 100.709 ns |
+| **seven expanded rounds** | 31529.766 ns | **43,776.221 B/op** | 16 | 13,985.551 ns |
+| seven rounds, compact loop | 216.236 ns | 0.001 B/op | 0 | 114.963 ns |
+| four complete chunk lanes | 4660.932 ns | 0.032 B/op | 0 | 2092.938 ns |
+
+The cliff is not merely present on x86-64; the allocated volume is **43,776
+bytes per invocation on both architectures**, matching environment A's
+43,776.098 to within profiler noise. An identical byte count across two
+architectures means the same escape-analysis decision fails on the same objects.
+Six expanded rounds scalarize and seven do not, on both.
+
+E011's rule learned — minimize the compiler graph, prefer a compact round loop
+to straight-line expansion, recheck allocation after every method-size change —
+is confirmed as portable guidance rather than an M5 artifact.
+
+### Result 4 — E011's allocation gate passes on x86-64
+
+`scratchChunkVector`, 8 MiB one-shot, isolated fork, `-prof gc`:
+**5990.676 B/op**, i.e. 0.00071 bytes per input byte, with **zero collections**.
+Environment A measured 5554.711 B/op. Both are fixed hasher setup and
+finalization cost, not compression-proportional garbage. E011 is an
+allocation-free kernel on both architectures.
+
+### Result 5 — throughput, and where the two architectures disagree
+
+8 MiB, 2 forks × 5 warmup × 5 measurement iterations of one second,
+single-threaded. Quick-run figures (`-f1 -wi 3 -i 3`) agreed within 1–2%.
+
+| 8 MiB shape | Commons | Rust | E011 `scratchChunkVector` | E009 default |
+|---|---:|---:|---:|---:|
+| one-shot | 211 | 1668 | 642 | 253 |
+| reused | 210 | 1713 | 637 | 255 |
+| streaming 4 KiB | 210 | 1100 | 253 (scalar route) | 259 |
+
+Ratios, environment B against environment A:
+
+| ratio | env B | env A |
+|---|---:|---:|
+| E009 scalar vs Commons | **1.20x** | 1.61x |
+| E011 vs E009 scalar (one-shot) | **2.54x** | 1.77x |
+| E011 vs Commons | **3.04x** | 2.86x |
+| E011 as a fraction of Rust | **38%** | 63% |
+| Rust vs Commons | **7.9x** | 4.5x |
+| Rust streaming-4 KiB penalty | **-36%** | -6% |
+
+Three findings, in descending order of importance.
+
+**E011 is a larger relative win on x86-64 than on AArch64, and it validates.**
+2.54x the production scalar path versus 1.77x on the M5. The kernel is correct,
+allocation-free, and faster on both architectures. The acceptance criterion
+"beats the current E009 production baseline" is met in environment B by a wider
+margin than in environment A.
+
+**E009's scalar advantage is largely an M5 result.** Named locals and expanded
+rounds beat Commons by 1.61x on the M5 but only 1.20x here. E009's stated
+mechanism was exposing independent G operations to a wide out-of-order core;
+Gracemont is a narrow E-core with far less to exploit. Evidence 5 in the E010
+document computed 2.5–2.6 arithmetic ops/cycle on an M5 P-core against a much
+wider integer issue width, and concluded the limiter was dependency structure.
+On this core the issue width itself is closer to binding. E009 remains the right
+default — it is still the fastest scalar option here — but its 1.61x figure
+should be quoted as environment A only.
+
+**E011 falls further behind Rust on x86-64 because it is using half the machine.**
+`Blake3ChunkVectorScratch` hard-codes `IntVector.SPECIES_128` — four lanes, four
+chunks. On the M5 that is the full NEON width, and E011 reaches 63% of Rust. On
+this machine `IntVector.SPECIES_PREFERRED` is `S_256_BIT`, eight lanes: the JVM
+reports `UseAVX=2` and `MaxVectorSize=32`. The staged `libfastblake_rust.so`
+contains `blake3_hash_many_sse41`, `_avx2` and `_avx512` (4-, 8- and 16-way);
+`lscpu` shows AVX2 without AVX-512, so the crate's runtime detection selects the
+8-way AVX2 kernel. E011 therefore competes at 4 lanes against Rust's 8 and lands
+at 38%. The gap is a width deficit, not a new compiler pathology — the
+allocation gate passes and the win over scalar grew.
+
+Rust's own numbers corroborate the width explanation independently. Its
+streaming-4 KiB penalty is -36% here versus -6% on the M5: a 4096-byte update
+supplies four chunks, which fills a 128-bit NEON batch exactly but leaves an
+8-lane AVX2 batch half empty. The same arithmetic that explains Rust's streaming
+loss explains E011's ceiling.
+
+Decision: E011 has now satisfied its non-AArch64 validation condition —
+correctness, the allocation gate, and a throughput win over E009 all hold in
+environment B. It remains opt-in pending only the streaming batch buffer.
+No dispatch changed in this entry.
+
+Rule learned: hard-coding `SPECIES_128` cost roughly half the available SIMD
+throughput on the first non-AArch64 machine tried, and nothing in the test suite
+or the allocation gate detects it, because a narrow kernel is still correct and
+still allocation-free. Vector width is a portability property and must be
+measured per architecture like allocation is. Every future performance claim
+must name its environment; E012 shows that two of this project's headline ratios
+(E009's 1.61x and E011's 63%-of-Rust) do not transfer.
+
+Not established by this entry, so these gaps are not mistaken for coverage: only
+one x86-64 machine was tested and it is an E-core-only part with no P-core and
+no AVX-512, so finding 5b is "E009's advantage depends on core width, shown on
+one narrow core", not a general x86-64 result; E002 and E003 were
+conformance-tested only, with no allocation or throughput measured, exactly as
+E010 left them; no mnemonic assembly was inspected because this Temurin build
+also lacks `hsdis`, so whether `VectorOperators.ROR` lowers well on AVX2 — which
+has no general 32-bit vector rotate below AVX-512's `VPRORD` — is untested and
+is a plausible secondary contributor; `heapChunkVector`'s big-endian guard
+remains unexercised; the machine was not thermally quiesced, though quick and
+long runs agreed within 1–2%; and only 8 MiB was measured, with no size sweep.
+
+Next experiment: a `SPECIES_PREFERRED`-width variant of
+`Blake3ChunkVectorScratch` processing eight chunks per batch where the species
+is 256-bit, keeping the compact round loop that E012 confirms is the
+allocation-safe shape on both architectures. Gate it on allocation first, per
+E010, since the cliff's exact reproduction here means method-size effects will
+move with the lane count. The four-lane path must remain for 128-bit machines.
+Two cheap items should precede it: add `rust-version = "1.85"` to
+`native/rust-blake3/Cargo.toml` and to the README, since cargo 1.84 silently
+loses the ceiling contender on this machine; and re-run
+`VectorPrimitiveBenchmark` to settle the AVX2 `ROR` question before committing to
+a wider kernel's rotate strategy.
