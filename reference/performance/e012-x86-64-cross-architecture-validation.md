@@ -208,8 +208,9 @@ explanations were left explicitly unverified rather than disproved. This entry
 closes that gap. Both allocate heavily — 60.03 and 99.61 bytes per input byte —
 so both fail the allocation gate, and their E002/E003 rejection rationales
 (array escape and scalar packing; lane shuffles and indexed gathers overwhelming
-the saved arithmetic) join E004–E008's as unproven. Every Vector API kernel in
-this project except E011 is an allocating kernel.
+the saved arithmetic) join E004–E008's as unproven. Among the kernels evaluated
+through E012, every Vector API kernel except E011 is an allocating kernel. E013
+subsequently added a second allocation-free kernel.
 
 E002 is the interesting one, because it is the only width-generic kernel in the
 tree — see Result 6.

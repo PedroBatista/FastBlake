@@ -645,9 +645,10 @@ Same protocol as E010: 8 MiB one-shot, one isolated fork per kernel, `-prof gc`.
 
 E002 and E003 were outside E010's allocation driver and their rejection
 rationales were left explicitly unverified. This entry closes that gap: both
-allocate heavily and both fail the gate, so **every Vector API kernel in this
-project except E011 is an allocating kernel**, and none of the E002–E008 causal
-explanations survive. Derived throughput here: 128.3 and 56.8 MiB/s.
+allocate heavily and both fail the gate, so **among the kernels tested through
+E012, every Vector API kernel except E011 is an allocating kernel**, and none of
+the E002–E008 causal explanations survive. E013 later added a second
+allocation-free kernel. Derived throughput here: 128.3 and 56.8 MiB/s.
 
 The figures agree with environment A to three significant figures on a different
 architecture, OS, and JVM build. C2's failure to eliminate `IntVector` wrappers
@@ -847,9 +848,10 @@ Throughput, 8 MiB, 2 forks × 5 warmup × 5 measurement iterations:
 
 Decision: reject for promotion; retain behind
 `-Dfastblake.experimental.wideChunkVector=true`. It is correct, allocation-free
-and structurally right, and it is the kernel a machine with wider *execution*
-should use — but it does not win here and must not become the default on this
-evidence. E011 remains the SIMD candidate; E009 remains the production default.
+and a useful width-generic candidate for machines with wider *execution*, but it
+does not win here and must not become the default on this evidence. A wider
+machine should use it only after measurement on that CPU demonstrates a win.
+E011 remains the SIMD candidate; E009 remains the production default.
 
 ### Why: the bottleneck is the scalar transpose, not the vector width
 
@@ -890,15 +892,21 @@ Decomposition, all measured at `-f1 -wi 5 -i 5`:
 | transpose share of loop | 28.4% | 33.7% | |
 | compression, per byte | 0.8093 ns | 0.7687 ns | **−5.0% better** |
 
-This locates the problem precisely. The compression *did* get faster per byte at
-8 lanes — but only 5%, not the 50% the primitive probe predicts, and the scalar
-transpose got 21% worse per byte, which more than cancels it.
+This decomposition identifies the scalar transpose as the largest measured
+contributor. Compression *appears* 5% faster per byte at 8 lanes, not the 50%
+the primitive probe predicts, while the separately measured scalar transpose is
+21% worse per byte, enough to account for the observed whole-loop regression.
+The subtraction is diagnostic rather than an exact attribution: the isolated
+transpose and complete loop need not have identical inlining, scheduling, cache
+state, or register pressure.
 
-The transpose is the explanation for the regression. It is plain scalar
-byte-shift code that gains nothing from wider vectors, it is already ~30% of the
-kernel, and widening makes it worse: it strides across eight 1 KiB chunks
-instead of four, so each block touches 8 KiB of input rather than 4 KiB, over
-eight prefetch streams rather than four, against a 32 KiB L1d.
+The transpose is therefore the leading explanation for the regression, not a
+proven complete explanation. It is plain scalar byte-shift code that gains
+nothing directly from wider vectors, it is measured at roughly 30% of the
+kernel, and widening makes the isolated operation worse: it strides across eight
+1 KiB chunks instead of four, creating eight input streams rather than four.
+Confirming the mechanism requires generated assembly or hardware counters; the
+32 KiB L1d observation alone does not prove cache misses.
 
 Why compression gained only 5% rather than 50% is not established. The residual
 hypothesis is that 16 state plus 2 message vectors is 18 live values against
@@ -907,13 +915,13 @@ width, while each spill moves twice the bytes. That is consistent with the
 measurements but unconfirmed: mnemonic assembly is unavailable on this JVM
 (no `hsdis`), so spill traffic was not observed directly.
 
-Rule learned: `SPECIES_PREFERRED` is the right *default* for a chunk-parallel
-kernel and the hard-coded 128 was still a portability defect worth fixing — but
-width is not a throughput guarantee, and it must be measured per machine like
-allocation is. More importantly, this experiment mislocated the bottleneck
-before measuring it: **about 30% of this kernel is scalar byte-shift transpose,
-and no amount of vector width touches it.** That is now the largest identified
-target in the SIMD path.
+Rule learned: `SPECIES_PREFERRED` is the right capability source for constructing
+a width-generic experimental kernel, not an automatically optimal performance
+default. Explicit 128-, 256- and eventually 512-bit specializations must be
+measured per machine like allocation is. More importantly, the decomposition
+shows that **roughly 30% of this measured kernel shape is scalar byte-shift
+transpose, and merely increasing `IntVector` width does not accelerate it.** It
+is now the largest measured target in the SIMD path.
 
 Next experiment: vectorize the transpose. E007 measured
 `ByteVector.fromArray(...).reinterpretAsInts()` at roughly 25x an endian
@@ -922,3 +930,73 @@ that loader belongs, loading contiguous 16-byte rows per chunk and transposing
 in registers rather than assembling words a byte at a time. Gate on allocation
 per rung, and measure it at both widths — a cheaper transpose changes the
 width trade-off, and may make E013 win where it currently loses.
+
+### Evaluation of the E013 follow-up ideas
+
+The ideas are ordered by evidential value, not implementation convenience.
+
+1. **Vectorize the input load/transpose: proceed.** This directly attacks the
+   largest measured non-vector component. Implement it as new opt-in kernels at
+   explicit 128- and 256-bit widths, preserving E011 and E013 as controls. Start
+   with contiguous little-endian `ByteVector.fromArray(...).reinterpretAsInts()`
+   loads and register rearrangement. Do not replace the endian-neutral path or
+   claim a win until correctness, allocation, and 8 MiB throughput gates pass on
+   both M5 and N97. Benchmark the load/transpose rung alone and the complete
+   kernel: improving the isolated rung without improving the hash is insufficient.
+
+2. **Retest register pressure after the transpose changes: defer.** The existing
+   scratch-CV probe changed the wide loop by only 1.4%, inside the 3% inconclusive
+   band. Removing values touched once per block is a weak test of the 18
+   frequently live state/message vectors. Assembly, spill counters, or a kernel
+   shape that materially shortens those live ranges would justify reopening it;
+   repeating the same probe would not.
+
+3. **Add automatic CPU dispatch: defer.** `SPECIES_PREFERRED` describes a width
+   the runtime supports, not the fastest kernel. The only measured profiles are
+   M5 → 128-bit and N97 → 128-bit. Keep manual properties while collecting
+   results from AVX2 P-cores and AVX-512. A future selector should choose among
+   separately benchmarked specializations, allow an explicit override, and run
+   outside the compression loop. If both current properties are enabled, the
+   present dispatch order gives `wideChunkVector` precedence; this is an
+   experimental detail, not CPU selection.
+
+4. **Use the primitive width probe as a diagnostic only.** Its 1.50x useful-work
+   estimate establishes that 256-bit operations have real execution value on the
+   N97. It does not predict whole-kernel speedup because it excludes transposition,
+   loads, stores, live-range pressure, tree reduction, and frontend effects.
+
+5. **Streaming batching remains independent and high-value.** Both SIMD kernels
+   take the scalar route for 4 KiB updates, so neither the width experiment nor a
+   faster transpose improves that workload until complete chunks are buffered
+   into SIMD-sized batches. Keep this as a separate experiment so buffering cost
+   is not confused with compression improvements.
+
+### E013 follow-up — Apple M5 regression and dispatch audit
+
+Date: 2026-08-06
+Environment: **A** (Apple M5, NEON 128-bit, preferred species = 4 int lanes)
+
+The current `main` revision after the N97 work was recompiled and the full
+official-vector suite passed with `wideChunkVector` enabled. Focused 8 MiB
+runs, one fork with 3 warmup and 3 measurement iterations:
+
+| shape | E011 fixed 128-bit | E013 preferred-width | original E011 quick run |
+|---|---:|---:|---:|
+| one-shot | 1600 MiB/s | 1594 MiB/s | 1584 MiB/s |
+| reused | 1598 MiB/s | 1592 MiB/s | 1569 MiB/s |
+| streaming 4 KiB | 902 MiB/s | 900 MiB/s | 874 MiB/s |
+
+Assessment: no M5 regression. E011 and E013 both select four lanes here and
+differ by less than 1%, well inside the protocol's 3% inconclusive band. The
+small improvement over the historical run is ordinary run-to-run/JIT/thermal
+variation, not a claimed optimization.
+
+Dispatch audit: the code is width-capable but not yet CPU-policy-aware.
+`scratchChunkVector` always selects four lanes and `wideChunkVector` always
+selects `SPECIES_PREFERRED`; both require manual properties and the production
+default remains scalar. Selecting the widest species automatically would be
+wrong on current evidence: four lanes win on both measured machines, while
+preferred/eight lanes lose by 3–4% on the N97. The correct future policy needs
+separate specialized kernels plus a measured profile/override, not an
+assumption that lane count predicts throughput. Known profiles today are M5 →
+128-bit and N97 → 128-bit; AVX2 P-cores and AVX-512 remain unknown.

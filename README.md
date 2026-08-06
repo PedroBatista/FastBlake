@@ -254,14 +254,25 @@ machine is wide; enable it with
 `-Dfastblake.experimental.wideChunkVector=true`. It is correct, passes the
 allocation gate at 0.00071 B/input byte, and does not hit the seven-round cliff
 at eight lanes — and it is **3–4% slower** than the four-lane kernel on AVX2, so
-it is not promoted. Doubling the width helped compression by only 5% per byte,
-while the *scalar* byte-shift transpose — about 30% of the kernel, and untouched
-by any amount of vector width — got 21% worse per byte from striding across
-eight chunks instead of four. The transpose, not the lane count, is now the
-largest identified target in the SIMD path. A fully expanded seven-round variant is
+it is not promoted. An isolated-component decomposition estimates that doubling
+the width helped compression by only 5% per byte, while the *scalar* byte-shift
+transpose — about 30% of the measured kernel shape, and untouched by merely
+widening the vectors — got 21% worse per byte from striding across eight chunks
+instead of four. This makes the transpose the leading measured contributor, not
+a proven complete causal explanation; confirming cache and spill behavior needs
+assembly or hardware counters. A fully expanded seven-round variant is
 retained only as diagnostic evidence: it crosses a C2 cliff and allocates
 43,776 bytes per block invocation, while the compact loop allocates effectively
 zero.
+
+A follow-up on the Apple M5 found no regression after E013: the fixed and
+preferred-width kernels measured 1600/1598 and 1594/1592 MiB/s for
+one-shot/reuse respectively. Both are four-lane kernels on NEON and the
+difference is below 1%. Kernel selection is not automatic yet: the N97 result
+proves that `SPECIES_PREFERRED` is a capability signal, not a guarantee that the
+widest kernel is fastest. Current measured profiles favor the 128-bit kernel on
+both M5 and N97; other AVX2 cores and AVX-512 still require measurements.
+
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
 loads plus reinterpretation on this runtime. E008 applied that load change alone

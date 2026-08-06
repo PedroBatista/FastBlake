@@ -78,7 +78,9 @@ public class WideVectorAllocationBenchmark {
      * the execution units are 128 bits wide and each 256-bit operation is being
      * split, so doubling the lane count buys no throughput. If the two cost
      * about the same, the wider chain is doing twice the useful work per
-     * operation and a wide kernel should win.
+     * operation. That establishes useful primitive width, but does not predict a
+     * complete-kernel win because loads, transpose, stores, and register pressure
+     * are intentionally absent from this probe.
      */
     @Benchmark
     public int mixChain128() {
