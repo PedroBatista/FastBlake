@@ -316,3 +316,49 @@ mechanism in the best prior cross-chunk layout (E004), using 128-bit
 `ByteVector.fromArray` loads and native little-endian reinterpretation. Keep it
 opt-in and architecture-guarded. This is now a measured, specific hypothesis;
 do not redesign caching and loading simultaneously.
+
+## E008 — E004 with direct heap byte-vector loads
+
+Date: 2026-08-06
+
+Change: preserve E004's four-chunk layout, block-wide 16-message cache, 4x4
+transposes, named state vectors, and fully expanded rounds. Change only each
+source load from `IntVector.fromMemorySegment(..., LITTLE_ENDIAN)` to
+`ByteVector.fromArray(...).reinterpretAsInts()`. Enable with
+`-Dfastblake.experimental.heapChunkVector=true`. Dispatch is guarded by native
+little-endian byte order because reinterpretation uses native lane order.
+
+Correctness: the full official-vector `./gradlew test` suite passed with the
+property enabled, including hash, keyed-hash, derive-key, XOF, and incremental
+boundary cases.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E008 | E001 scalar |
+|---|---:|---:|---:|---:|
+| one-shot | 560 MiB/s | 2504 MiB/s | 51 MiB/s reported; ~74 MiB/s after C2 transition | 679 MiB/s |
+| reused | 547 MiB/s | 2479 MiB/s | 73 MiB/s | 673 MiB/s |
+| streaming 4 KiB | 539 MiB/s | 2315 MiB/s | 696 MiB/s (scalar route) | 661 MiB/s |
+
+Decision: reject for default dispatch and retain as an opt-in negative
+experiment. The one-shot aggregate is distorted by compilation during the
+measurement: its iterations were 250.1, 109.4, and 107.3 ms. The stable last
+two iterations and the stable reused result both put the compiled kernel near
+73--74 MiB/s, still roughly 9x slower than E001.
+
+Comment: the isolated heap-load primitive remained fast in the same run
+(65.854 ns per 256 loads versus 1655.460 ns for endian MemorySegment loads),
+confirming a roughly 25.1x load-level improvement. That improvement does not
+materially improve the complete kernel over E004's compiled result. Input
+loading was a real pathology, but it was not the dominant remaining bottleneck:
+the large vector live set, two-source transposes, vector rotate dependency
+chains, method size, and C2 compilation behaviour still dominate. Streaming
+4 KiB does not enter the four-chunk branch and provides a contemporaneous
+scalar control.
+
+Rule learned: keep direct heap ByteVector loads for any future cross-chunk
+prototype, but retire E004's monolithic four-chunk Java shape as an optimization
+direction. Do not promote it or spend another experiment reshuffling its cache.
+A credible next step needs a structurally different lowering strategy (for
+example generated/native SIMD, or a much smaller JVM kernel proven by compiler
+output), while the scalar implementation remains the production default.

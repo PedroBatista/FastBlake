@@ -1,6 +1,7 @@
 package com.pedrobatista.fastblake;
 
 import java.lang.foreign.MemorySegment;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
@@ -28,6 +29,9 @@ public final class FastBlake {
             Boolean.getBoolean("fastblake.experimental.lowLiveVector");
     private static final boolean USE_EXPERIMENTAL_ROUND_CACHE_VECTOR =
             Boolean.getBoolean("fastblake.experimental.roundCacheVector");
+    private static final boolean USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.heapChunkVector")
+                    && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
 
     private static final int OUT_LEN = 32;
     private static final int KEY_LEN = 32;
@@ -73,11 +77,13 @@ public final class FastBlake {
             || USE_EXPERIMENTAL_CHUNK_VECTOR4
             || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
             || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
+            || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
             ? new int[Blake3Vector.packedWordsLength()] : null;
     private final int[] vectorCvs = USE_EXPERIMENTAL_VECTOR
             || USE_EXPERIMENTAL_CHUNK_VECTOR4
             || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
             || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
+            || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
             ? new int[Blake3Vector.outputLength()] : null;
 
     private int chunkLength;
@@ -154,6 +160,20 @@ public final class FastBlake {
                 chunksCompressed++;
                 pushChunkCv(scratchCv, chunksCompressed);
                 chunkLength = 0;
+            }
+
+            if (USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR && chunkLength == 0
+                    && remaining > 4 * CHUNK_LEN) {
+                Blake3ChunkVectorHeap.hashChunks(input, position, chunksCompressed,
+                        key, modeFlags, vectorPacked, vectorCvs);
+                for (int lane = 0; lane < 4; lane++) {
+                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    chunksCompressed++;
+                    pushChunkCv(scratchCv, chunksCompressed);
+                }
+                position += 4 * CHUNK_LEN;
+                remaining -= 4 * CHUNK_LEN;
+                continue;
             }
 
             if (USE_EXPERIMENTAL_ROUND_CACHE_VECTOR && chunkLength == 0

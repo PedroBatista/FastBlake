@@ -215,8 +215,12 @@ scope did not translate into useful register-lifetime control. Further SIMD
 work now requires generated-code evidence rather than another cache reshuffle.
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
-loads plus reinterpretation on this runtime. The next experiment therefore
-changes the load mechanism alone; details are in the experiment ledger.
+loads plus reinterpretation on this runtime. E008 applied that load change alone
+to the best four-chunk layout. Correctness passed and the isolated loads stayed
+about 25× faster, but the complete 8 MiB kernel reached only about 73--74 MiB/s
+after compilation, versus roughly 670 MiB/s for scalar. It remains available
+behind `-Dfastblake.experimental.heapChunkVector=true` on little-endian systems;
+the production dispatch remains scalar. Details are in the experiment ledger.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands
