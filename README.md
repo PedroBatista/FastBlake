@@ -190,9 +190,12 @@ is deliberately retained until finalization so the correct `ROOT` node remains
 available for XOF output.
 
 A focused 8 MiB run (1 fork, 3 warmup and 3 measurement iterations) measured
-679 MiB/s one-shot, 673 MiB/s with instance reuse, and 661 MiB/s with 4 KiB
-streaming updates: 1.23–1.24× Commons Codec on this machine. This is the scalar
-baseline, not the end state. The next CPU milestone is a Vector API
+894 MiB/s one-shot, 883 MiB/s with instance reuse, and 874 MiB/s with 4 KiB
+streaming updates: 1.61–1.62× Commons Codec on this machine. The production
+compressor uses 16 named integer locals and seven fully expanded rounds; the
+former array-and-loop compressor remains selectable with
+`-Dfastblake.experimental.legacyScalar=true` for diagnostic comparisons. The
+next CPU milestone is a Vector API
 `hash_many` kernel over independent 1 KiB chunks, followed by batched parent
 compression and wider streaming buffering. The first array-based Vector API
 experiment is retained behind `-Dfastblake.experimental.vector=true` but is

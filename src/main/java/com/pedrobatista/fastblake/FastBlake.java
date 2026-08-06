@@ -32,6 +32,10 @@ public final class FastBlake {
     private static final boolean USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.heapChunkVector")
                     && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
+    // E009 promoted the named-local compressor. Keep the former loop as a
+    // diagnostic control so its baseline remains directly reproducible.
+    private static final boolean USE_LEGACY_SCALAR =
+            Boolean.getBoolean("fastblake.experimental.legacyScalar");
 
     private static final int OUT_LEN = 32;
     private static final int KEY_LEN = 32;
@@ -389,6 +393,10 @@ public final class FastBlake {
                                  int flags, int[] state) {
         if (USE_EXPERIMENTAL_BLOCK_VECTOR) {
             Blake3BlockVector.compress(cv, block, counter, blockLength, flags, state);
+            return;
+        }
+        if (!USE_LEGACY_SCALAR) {
+            Blake3ScalarUnrolled.compress(cv, block, counter, blockLength, flags, state);
             return;
         }
         System.arraycopy(cv, 0, state, 0, 8);

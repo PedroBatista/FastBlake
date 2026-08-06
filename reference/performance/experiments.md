@@ -362,3 +362,46 @@ direction. Do not promote it or spend another experiment reshuffling its cache.
 A credible next step needs a structurally different lowering strategy (for
 example generated/native SIMD, or a much smaller JVM kernel proven by compiler
 output), while the scalar implementation remains the production default.
+
+## E009 — named-local, fully unrolled scalar compression
+
+Date: 2026-08-06
+
+Change: replace the compression loop's reusable `int[16]` state mutations,
+schedule-table traversal, and indexed `g` helper with 16 named integer locals
+and seven explicitly expanded rounds. Message indexes and state positions are
+compile-time constants. Byte loading, chunk handling, tree reduction, and API
+semantics are unchanged.
+
+Correctness: a forced full rebuild and official-vector suite passed in every
+mode and incremental boundary case with the new compressor selected.
+
+Quick run: 1 fork, 3 warmup and 3 measurement iterations of one second.
+
+| 8 MiB shape | Commons Codec | Rust | FastBlake E009 | E001 scalar | E009 vs E001 |
+|---|---:|---:|---:|---:|---:|
+| one-shot | 555 MiB/s | 2507 MiB/s | 894 MiB/s | 679 MiB/s | 1.32x |
+| reused | 547 MiB/s | 2481 MiB/s | 883 MiB/s | 673 MiB/s | 1.31x |
+| streaming 4 KiB | 540 MiB/s | 2313 MiB/s | 874 MiB/s | 661 MiB/s | 1.32x |
+
+Decision: promote E009 to the production default. Retain the former loop behind
+`-Dfastblake.experimental.legacyScalar=true` as an executable comparison and
+rollback control.
+
+Default-dispatch confirmation after promotion, using the same quick-run counts
+and FastBlake only: 885 MiB/s one-shot, 884 MiB/s reused, and 881 MiB/s
+streaming 4 KiB. The small movement from the full comparison is normal
+run-to-run noise and confirms that the property-free path selects E009.
+
+Comment: the improvement is large, stable across iterations, and consistent
+across all three call shapes. Named locals allow C2 to keep the compression
+state in registers and expose independent G operations to the out-of-order
+core. Removing state-array indexing and runtime schedule traversal matters much
+more on this target than the attempted Vector API layouts. E009 is 1.61--1.62x
+Commons, though Rust SIMD remains about 2.8x faster than FastBlake.
+
+Rule learned: establish the best scalar machine-code shape before adding SIMD.
+Future vector work should borrow E009's constant schedules and compact state
+lifetime, and must beat 894/883/874 MiB/s rather than the obsolete E001
+baseline. The next scalar experiment should isolate full-block word loading;
+the guide's cached little-endian VarHandle is a plausible single-variable test.
