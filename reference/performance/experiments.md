@@ -499,3 +499,33 @@ structural variant to sample first is transposing message words once per block
 into a scratch `int[64]` and keeping only the 16 state vectors as vector values;
 E004-E008 all kept messages as live vector values and none tried reading them
 back from an array.
+
+## E011 — allocation-first vector recovery, rungs 1–4
+
+Date: 2026-08-06
+
+Change: add an isolated `VectorAllocationBenchmark` ladder and the detailed
+plan in `e011-allocation-first-vector-plan.md`. Messages use reusable primitive
+`int[64]` word-major scratch; vector state uses 16 named locals. No production
+dispatch changed.
+
+Command: one fork per benchmark, 3 warmup and 3 measurement iterations, GC
+profiler enabled:
+`./gradlew jmh -P'jmh.args=VectorAllocationBenchmark -f1 -wi 3 -i 3 -prof gc'`.
+
+| diagnostic rung | time | allocation | collections |
+|---|---:|---:|---:|
+| primitive four-chunk transpose | 26.449 ns | ~0.0001 B/op | 0 |
+| scheduled vector load chain, 256 reps | 392.838 ns | 0.003 B/op | 0 |
+| one G, 256 reps | 1981.969 ns | 0.014 B/op | 0 |
+| one round with 16 named vectors, 256 reps | 4743.136 ns | 0.033 B/op | 0 |
+
+Decision: all four rungs pass the allocation gate. The sub-byte normalized
+figures are fixed profiler noise and do not scale with thousands of vector
+operations. Proceed to a seven-round block rung, then a sixteen-block chunk
+rung, before touching hash dispatch.
+
+Comment: E010's proposed primitive-message layout survives a complete round
+without wrapper allocation. This is the first positive end-to-end compiler
+shape evidence for the recovered SIMD effort; it is still a diagnostic result,
+not a BLAKE3 throughput claim.
