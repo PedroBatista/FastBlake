@@ -39,6 +39,15 @@ public final class FastBlake {
     // E024: two interleaved four-chunk batches, for latency-bound cores.
     private static final boolean USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.dualChunkVector");
+
+    // E025 P1: chunks retained across update() calls so that fragmented input
+    // can still form a complete SIMD batch. E016 introduced this for the
+    // four-chunk kernel; the batch size is now whatever the selected kernel
+    // consumes, so the eight-chunk kernel gets the same treatment. Zero means
+    // no vector kernel is active and update() uses the ordinary scalar path.
+    private static final int VECTOR_STREAM_CHUNKS =
+            USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR ? 8
+                    : (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR ? 4 : 0);
     // E013 is E011's kernel at the machine's preferred vector width. On a
     // 128-bit target the two are the same shape and the same lane count; the
     // property exists so the width change can be measured on its own.
@@ -159,7 +168,7 @@ public final class FastBlake {
     private byte[] vectorPending() {
         byte[] pending = vectorPending;
         if (pending == null) {
-            pending = vectorPending = new byte[4 * CHUNK_LEN];
+            pending = vectorPending = new byte[VECTOR_STREAM_CHUNKS * CHUNK_LEN];
         }
         return pending;
     }
@@ -283,8 +292,8 @@ public final class FastBlake {
         Objects.requireNonNull(input, "input");
         Objects.checkFromIndexSize(offset, length, input.length);
 
-        if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
-            return updateScratchVector(input, offset, length);
+        if (VECTOR_STREAM_CHUNKS > 0) {
+            return updateVectorStream(input, offset, length);
         }
 
         int remaining = length;
@@ -415,22 +424,27 @@ public final class FastBlake {
     }
 
     /** Incremental path that retains one four-chunk batch for the SIMD kernel. */
-    private FastBlake updateScratchVector(byte[] input, int offset, int length) {
+    /**
+     * Streaming update for whichever chunk-parallel kernel is active.
+     *
+     * <p>At most one complete batch is retained. A following byte proves every
+     * chunk in that batch is non-final, at which point it can be committed
+     * without disturbing BLAKE3's rightmost-chunk/ROOT semantics. When the
+     * buffer is empty and more than a full batch remains, the kernel reads the
+     * caller's array directly and the copy is skipped entirely.
+     */
+    private FastBlake updateVectorStream(byte[] input, int offset, int length) {
         int position = offset;
         int remaining = length;
-        int batchBytes = 4 * CHUNK_LEN;
+        int batchBytes = VECTOR_STREAM_CHUNKS * CHUNK_LEN;
         while (remaining > 0) {
             if (vectorPendingLength == batchBytes) {
-                Blake3ChunkVectorScratch.hashChunks(vectorPending(), 0, chunksCompressed,
-                        key, modeFlags, vectorPacked(), vectorCvs());
-                pushVectorChunkCvs(4);
+                hashStreamBatch(vectorPending(), 0);
                 vectorPendingLength = 0;
             }
 
             if (vectorPendingLength == 0 && remaining > batchBytes) {
-                Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked(), vectorCvs());
-                pushVectorChunkCvs(4);
+                hashStreamBatch(input, position);
                 position += batchBytes;
                 remaining -= batchBytes;
                 continue;
@@ -443,6 +457,18 @@ public final class FastBlake {
             remaining -= take;
         }
         return this;
+    }
+
+    /** Runs one complete batch through the selected kernel and pushes its CVs. */
+    private void hashStreamBatch(byte[] source, int sourceOffset) {
+        if (USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR) {
+            Blake3ChunkVectorDual.hashChunks(source, sourceOffset, chunksCompressed,
+                    key, modeFlags, vectorPacked(), vectorCvs());
+        } else {
+            Blake3ChunkVectorScratch.hashChunks(source, sourceOffset, chunksCompressed,
+                    key, modeFlags, vectorPacked(), vectorCvs());
+        }
+        pushVectorChunkCvs(VECTOR_STREAM_CHUNKS);
     }
 
     /**
@@ -464,11 +490,20 @@ public final class FastBlake {
         int[] finalStack = cvStack;
         int finalStackLength = cvStackLength;
 
-        if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
+        // Only when a partial batch is actually retained. vectorPendingLength
+        // is zero only for empty input, because a complete batch is committed
+        // solely on proof that more input follows.
+        if (VECTOR_STREAM_CHUNKS > 0 && vectorPendingLength > 0
+                && vectorPendingLength <= CHUNK_LEN) {
+            // The whole retained batch is one partial chunk, so it *is* the
+            // final chunk: no CVs to push, nothing to copy. This is the common
+            // case for small inputs and must not pay for the drain machinery.
+            finalChunk = vectorPending();
+            finalChunkLength = vectorPendingLength;
+        } else if (VECTOR_STREAM_CHUNKS > 0 && vectorPendingLength > 0) {
             finalStack = Arrays.copyOf(cvStack(), cvStack().length);
             byte[] pendingChunk = new byte[CHUNK_LEN];
-            int chunksBeforeLast = vectorPendingLength == 0
-                    ? 0 : (vectorPendingLength - 1) / CHUNK_LEN;
+            int chunksBeforeLast = (vectorPendingLength - 1) / CHUNK_LEN;
             for (int pending = 0; pending < chunksBeforeLast; pending++) {
                 System.arraycopy(vectorPending(), pending * CHUNK_LEN,
                         pendingChunk, 0, CHUNK_LEN);
@@ -512,13 +547,15 @@ public final class FastBlake {
 
     /** Restores the initial state while retaining mode and key. */
     public FastBlake reset() {
+        int chunkLengthBeforeReset = chunkLength;
+        int pendingLengthBeforeReset = vectorPendingLength;
         chunkLength = 0;
         vectorPendingLength = 0;
         chunksCompressed = 0;
         cvStackLength = 0;
-        Arrays.fill(chunk, (byte) 0);
+        Arrays.fill(chunk, 0, chunkLengthBeforeReset, (byte) 0);
         if (vectorPending != null) {
-            Arrays.fill(vectorPending, (byte) 0);
+            Arrays.fill(vectorPending, 0, pendingLengthBeforeReset, (byte) 0);
         }
         return this;
     }

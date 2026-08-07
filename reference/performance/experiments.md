@@ -2259,3 +2259,63 @@ single-chunk case only. Bundling them would have hidden that P0a alone gets to
 Next: P1 (streaming batching for the E024 kernel) is now the largest remaining
 gap at 39% of Rust, followed by P2's size ladder, which the 16 KiB row above
 shows untouched at 2.30x Commons against 3.84x at 8 MiB.
+
+### E025 P1 result — streaming batching for the eight-chunk kernel: 2.26x
+
+Date: 2026-08-07
+Environment: **A** (Apple M5). JMH on the project toolchain; allocation on the
+custom JDK 28 driver.
+
+Change: E016 gave the four-chunk kernel a retained pending batch so fragmented
+`update()` calls could still form a complete SIMD batch. That was hard-coded to
+four chunks. It is now generalised: one constant, `VECTOR_STREAM_CHUNKS`,
+describes the batch of whichever kernel is selected, the retained buffer sizes
+itself from it, and `updateVectorStream` dispatches to the kernel. The
+eight-chunk kernel gets 8192-byte batching with no duplicated finalization
+logic.
+
+**Two regressions found and fixed while gating this**, both pre-existing and
+both amplified by the larger batch:
+
+* `reset()` zeroed the entire retained buffer. Bytes past `vectorPendingLength`
+  are never read, so this was pure memset — 4 KiB per reset before, 8 KiB after
+  the batch doubled. It now zeroes only the valid prefix.
+* `doFinalize` copied the CV stack and allocated a 1 KiB chunk buffer on every
+  finalize whenever streaming was enabled, even when the retained batch was a
+  single partial chunk with no CVs to push. A batch of at most one chunk *is*
+  the final chunk and needs neither. This had been costing the four-chunk
+  kernel **3,072 B/op on every small streamed hash since E016** and nobody had
+  measured it, because the allocation gate only ran at 8 MiB.
+
+Update-path allocation at 64 bytes, after the fixes:
+
+| kernel | before P1 | after P1 |
+|---|---:|---:|
+| scalar | 288 B/op | 288 B/op |
+| four-chunk | 3,072 B/op | **288 B/op** |
+| eight-chunk | 3,072 B/op | **288 B/op** |
+
+**Conformance**: 542 tests, default dispatch and with each of
+`scratchChunkVector` and `dualChunkVector` forced. All pass. The suite's
+fragmented-update cases (chunk sizes 1/7/63/64/65/1023/1024/1025 across all 35
+vectors) are exactly the path this change rewrites.
+
+**Throughput**, JMH `streaming4k`, 2 forks x 5 warmup x 5 measurement:
+
+| size | commons | rust | before P1 | after P1 |
+|---|---:|---:|---:|---:|
+| 64 B | 473 | 849 | 495 | 476 (1.01x) |
+| 16 KiB | 556 | 2354 | 909 | **1240 (2.23x)** |
+| 8 MiB | 546 | 2336 | 911 | **2054 (3.76x)** |
+
+**2.26x at 8 MiB. Streaming goes from 39% of Rust to 88%** — now marginally
+*better* relative to Rust than the one-shot shape is (85.4%), because Rust's
+own streaming path also gives up throughput at the 4 KiB boundary.
+
+Decision: keep. P1 closes what was the largest remaining gap in the ladder.
+
+Comment: the two shapes have essentially converged on this machine — 2140
+one-shot against 2054 streaming, where before P1 it was 2140 against 911. The
+remaining structural gap is P2's size ladder: 16 KiB reaches only 1240,
+because the eight-chunk kernel needs 8192 bytes to engage and there is still no
+rung between it and scalar.
