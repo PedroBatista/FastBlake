@@ -36,6 +36,9 @@ public final class FastBlake {
                     && ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
     private static final boolean USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.scratchChunkVector");
+    // E024: two interleaved four-chunk batches, for latency-bound cores.
+    private static final boolean USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR =
+            Boolean.getBoolean("fastblake.experimental.dualChunkVector");
     // E013 is E011's kernel at the machine's preferred vector width. On a
     // 128-bit target the two are the same shape and the same lane count; the
     // property exists so the width change can be measured on its own.
@@ -57,6 +60,7 @@ public final class FastBlake {
             || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
             || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
             || USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
+            || USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR
             || USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR;
 
     private static final int OUT_LEN = 32;
@@ -111,11 +115,13 @@ public final class FastBlake {
     // and Blake3ChunkVectorWide both scale with the preferred species, so this
     // already covers the four-lane kernels on a wider machine.
     private final int[] vectorPacked = ANY_VECTOR_KERNEL
-            ? new int[Math.max(Blake3Vector.packedWordsLength(),
-                    Blake3ChunkVectorWide.packedWordsLength())] : null;
+            ? new int[Math.max(Blake3ChunkVectorDual.packedWordsLength(),
+                    Math.max(Blake3Vector.packedWordsLength(),
+                    Blake3ChunkVectorWide.packedWordsLength()))] : null;
     private final int[] vectorCvs = ANY_VECTOR_KERNEL
-            ? new int[Math.max(Blake3Vector.outputLength(),
-                    Blake3ChunkVectorWide.outputLength())] : null;
+            ? new int[Math.max(Blake3ChunkVectorDual.outputLength(),
+                    Math.max(Blake3Vector.outputLength(),
+                    Blake3ChunkVectorWide.outputLength()))] : null;
 
     private int chunkLength;
     private int vectorPendingLength;
@@ -205,6 +211,16 @@ public final class FastBlake {
                 pushVectorChunkCvs(Blake3ChunkVectorWide.LANES);
                 position += Blake3ChunkVectorWide.LANES * CHUNK_LEN;
                 remaining -= Blake3ChunkVectorWide.LANES * CHUNK_LEN;
+                continue;
+            }
+
+            if (USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR && chunkLength == 0
+                    && remaining > 8 * CHUNK_LEN) {
+                Blake3ChunkVectorDual.hashChunks(input, position, chunksCompressed,
+                        key, modeFlags, vectorPacked, vectorCvs);
+                pushVectorChunkCvs(8);
+                position += 8 * CHUNK_LEN;
+                remaining -= 8 * CHUNK_LEN;
                 continue;
             }
 

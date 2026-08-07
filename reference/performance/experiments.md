@@ -1689,3 +1689,302 @@ that remaining half has a roughly 2.4% instruction ceiling and cannot close the
 gap. Keep the Apple M5 diagnosis separate: x86 memory operands are inapplicable
 there, and no N97 counter result should be projected onto AArch64. Full counts
 and qualifications are in `reference/performance/results/e021-n97.md`.
+
+## E022 — first AArch64 generated-code audit, and a rejected bounds-check fix
+
+Date: 2026-08-07
+Environment: **A** (Apple M5, macOS 26.6), custom OpenJDK 28-internal with a
+working `hsdis-aarch64.dylib`. This is the project's first mnemonic AArch64
+disassembly; every earlier M5 entry had to reason without one.
+
+E021 closed by requiring an independent M5 audit before any N97 cause was
+assigned to the Apple gap. This is that audit.
+
+### The generated code
+
+Stable non-OSR `Blake3ChunkVectorScratch::hashChunks`, seven-round loop body:
+**245 instructions**.
+
+| class | count | theoretical minimum |
+|---|---:|---:|
+| vector shift/rotate (`ushr`+`sli`) | 64 | 64 |
+| vector add | 48 | 48 |
+| vector eor | 32 | 32 |
+| vector message load | 16 | 16 |
+| scalar index/address | 49 | 0 |
+| branch/compare | 36 | 0 |
+| **vector spill traffic** | **0** | 0 |
+
+Two results, and they point in opposite directions.
+
+**The vector arithmetic is already optimal.** 48/32/64/16 matches the exact
+minimum for one four-lane BLAKE3 round. C2 lowers `VectorOperators.ROR` to
+`ushr`+`sli`, which is the best AArch64 offers without a dedicated vector
+rotate. There is nothing left to win inside the mixing math on this
+architecture.
+
+**There is no spilling.** Not one vector store or reload to `[sp]` in the round
+body. The 18-live-values-against-16-registers pressure that shapes every N97
+result does not exist on AArch64's 32 vector registers. E021's warning was
+correct and is now confirmed from generated code rather than inferred: N97
+conclusions must not be transferred to environment A.
+
+That leaves 85 instructions, 35% of the round body, in scalar index arithmetic
+and bounds checking. The pattern repeats at all 16 message loads:
+
+```asm
+lsl   w4, w3, #2              ; schedule[i] * 4
+cmp   w4, w10                 ; bounds check vs messages.length
+b.hs  #0x11b9a76d0            ; -> uncommon trap
+add   x4, x6, w4, sxtw #2     ; address
+ldur  q18, [x4, #0xc]         ; the load
+```
+
+Four overhead instructions per useful load. The index comes from
+`SCHEDULE[round][i]`, so it is data-dependent and C2 cannot prove its range.
+
+### The rejected fix
+
+Hypothesis: flatten `SCHEDULE` to a pre-multiplied `int[112]` and mask each use
+site with `& 60`. The index is then provably `[0, 60]`, so with `messages` at
+least 64 long the only remaining check is `messages.length >= 64`, which is
+loop-invariant and should hoist out of the round loop. Projected 13-20% fewer
+instructions in the round body.
+
+Correctness: full forced conformance passed, 542 tests, with
+`JAVA_TOOL_OPTIONS=-Dfastblake.experimental.scratchChunkVector=true`.
+
+Allocation gate: 36,744 bytes total for 25,165,824 bytes hashed, 0.00 B per
+input byte. Passed.
+
+Generated code, same JDK, before and after:
+
+| round body | E011 baseline | E022 flat+mask |
+|---|---:|---:|
+| total instructions | 245 | **245** |
+| vector | 160 | 160 |
+| scalar | 85 | 85 |
+| `cmp` | 18 | **17** |
+
+Paired interleaved throughput, 8 MiB one-shot, three rounds each:
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---:|---:|---:|---:|
+| E011 baseline | 1890.2 | 1889.8 | 1886.3 | 1888.8 |
+| E022 flat+mask | 1874.3 | 1886.4 | 1878.1 | 1879.6 |
+
+**The mask removed exactly one bounds check** — the 2D `SCHEDULE[round]`
+dereference that flattening eliminated. The 16 per-load checks survived
+untouched, and the 0.5% throughput difference is inside the protocol's 3%
+inconclusive band.
+
+Decision: reject and revert. Production is unchanged.
+
+Comment: the masking trick works on ordinary array loads but does not reach the
+range check that `IntVector.fromArray` generates inside its own intrinsic. C2's
+range analysis proves the *index* is `[0, 60]` and still emits the check, so the
+bound is not being derived from the masked index at all. This is a Vector API
+lowering property, not something reachable by reshaping Java source — which
+puts it in the same category as E016's `vpshufb` result.
+
+Rule learned: the 85 scalar instructions are real and measured, but they are not
+removable from Java. Before the next attempt at them, establish whether the M5
+round loop is even issue-bound — if the vector dependency chain is the critical
+path, scalar index work issuing in parallel on separate units may be costing
+nothing, and the whole 35% is a phantom target. That measurement (a probe with
+the message loads replaced by constant vectors, preserving the vector chain)
+should precede any further work here, and it is cheap.
+
+Artifacts, this machine:
+
+```text
+build/e022-m5-baseline-nonosr.txt        # isolated stable non-OSR body
+build/e022-m5-baseline-hashchunks.log    # full capture, E011 baseline
+build/e022-m5-flatmask-hashchunks.log    # full capture, rejected candidate
+```
+
+## E023 — issue-bound probe: the M5 round body's scalar overhead is free
+
+Date: 2026-08-07
+Environment: **A** (Apple M5), custom OpenJDK 28-internal.
+
+E022 measured 85 of 245 instructions in the AArch64 round body as scalar index
+arithmetic and bounds checking, and closed by requiring this probe before any
+further attempt to remove them.
+
+Method: two variants generated mechanically from the production kernel source.
+
+* **A** — `Blake3ChunkVectorScratch` verbatim, renamed.
+* **B** — identical vector arithmetic, but the 16 per-round message operands are
+  loop-invariant vectors hoisted out of the block loop. Every message load,
+  index computation and bounds check disappears; the vector dependency chain,
+  the live-vector count and the round structure are unchanged.
+
+B computes a wrong digest by construction. It is a diagnostic control, never a
+candidate. The transpose still runs in both, so the input is still read.
+
+Per four-chunk batch, interleaved, best of 12 repetitions each, isolated JVMs:
+
+| round | A (real kernel) | B (no message loads) |
+|---|---:|---:|
+| 1 | 1778.829 ns | 1759.481 ns |
+| 2 | 1766.052 ns | 1758.931 ns |
+| 3 | 1767.395 ns | 1756.429 ns |
+| **mean** | **1770.759 ns** | **1758.280 ns** |
+
+Both allocate 0 bytes in the measured repetition.
+
+**Removing 35% of the round body's instructions buys 0.7%.**
+
+Conclusion: the M5 four-chunk round loop is latency-bound on the vector
+dependency chain, not issue-bound. The scalar index and bounds-check work
+issues in parallel on scalar units and costs essentially nothing.
+
+A cycle estimate agrees. The critical path is about 18 dependent vector
+operations per G, two G groups per round, seven rounds, sixteen blocks — roughly
+8,000 cycles per batch at Apple P-core NEON latencies, or about 1,830 ns at
+4.4 GHz against 1,771 ns measured. The body retires roughly 27,400 instructions
+in that window, well under the core's issue capacity.
+
+Decision: retire instruction-count reduction as an optimization direction for
+the M5 four-chunk kernel. That closes message-load folding, bounds-check
+elimination, index flattening, schedule restructuring, and partial unrolling as
+avenues on this architecture — E018, E021 and E022 were all, in retrospect,
+attacking a target that does not exist here.
+
+Comment: this also explains E022's null result completely. Even if the mask had
+eliminated all sixteen bounds checks, the measured ceiling for doing so was
+0.7%. The experiment was unwinnable before it was written, and the probe costs
+minutes where the prototype cost hours.
+
+Rule learned: before optimizing an instruction count, prove the loop is
+issue-bound. The probe is cheap and mechanical — hoist the operand loads out,
+keep the arithmetic, compare. Add it to the measurement protocol alongside the
+allocation gate.
+
+Consequence for direction: a latency-bound loop goes faster only by putting more
+independent work in flight, not by shrinking the work it already has. The M5
+kernel exposes 4-way ILP (four independent G functions per half-round). The
+natural next candidate is two interleaved four-chunk batches, raising it to
+8-way. AArch64's 32 vector registers are the reason this is worth trying here
+and not on the N97: 32 state vectors plus message operands is tight but close to
+fitting, and E022 measured zero spill traffic at the current 16, so there is
+headroom to spend. Note that `SPECIES_PREFERRED` is 128-bit on this machine, so
+E013's wide kernel is not the same experiment — interleaving batches, not
+widening lanes, is what adds parallelism on NEON.
+
+Artifacts: probe sources are generated from the kernel by the script in this
+entry's session; variants A and B differ only in the 16 `fromArray` sites.
+
+## E024 — two interleaved four-chunk batches: +36%, the first ILP win
+
+Date: 2026-08-07
+Environment: **A** (Apple M5), custom OpenJDK 28-internal for the paired driver
+runs; the standard quick comparison uses the project toolchain as usual.
+
+E023 proved the four-chunk round loop is latency-bound, so the only remaining
+lever is more independent work in flight. This runs two independent four-chunk
+groups (8 chunks, 8192 bytes) through one interleaved round body, raising ILP
+from four independent G chains per half-round to eight. Lanes stay at
+`SPECIES_128`: on NEON, parallelism comes from more batches, not wider vectors,
+so this is not E013's width experiment repeated.
+
+`Blake3ChunkVectorDual`, enabled with
+`-Dfastblake.experimental.dualChunkVector=true`. The round body is generated
+mechanically from `Blake3ChunkVectorScratch` by duplicating and interleaving its
+eight G-pair groups, so the two kernels cannot drift apart in arithmetic.
+
+### Gates, in protocol order
+
+**Equivalence** (standalone, before integration): the dual kernel's 64 output
+words equal two sequential four-chunk batches, over counters {0, 4, 1024,
+999996} x flags {0, 16, 64}. PASS.
+
+**Allocation gate**, isolated JVM per variant, 8 MiB end to end:
+
+| kernel | allocated | per input byte |
+|---|---:|---:|
+| E011 `scratchChunkVector` | 37,896 B | 0.00 |
+| E024 `dualChunkVector` | **17,208 B** | **0.00** |
+
+Doubling the round body did **not** cross the escape-analysis cliff. Given E011
+rung 5 (six expanded rounds fine, seven at 43,776 B/op) this was the main risk
+and it did not materialise: the compact seven-iteration loop is preserved, and
+only the body inside it grew.
+
+**Conformance**: full official-vector suite, 542 tests, with
+`JAVA_TOOL_OPTIONS=-Dfastblake.experimental.dualChunkVector=true`. PASS. Default
+dispatch re-verified unchanged at 542.
+
+**Throughput, kernel only**, per 8192 bytes, interleaved, best of 12:
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---:|---:|---:|---:|
+| single four-chunk | 3549.927 | 3534.465 | 3549.927 | 3544.773 ns |
+| **dual** | 2589.438 | 2585.368 | 2627.604 | **2600.803 ns** |
+
+**1.363x.**
+
+**Throughput, end to end**, 8 MiB one-shot, interleaved, JDK 28:
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---:|---:|---:|---:|
+| E011 | 1895.9 | 1899.1 | 1866.3 | 1887.1 MiB/s |
+| **E024** | 2475.2 | 2470.5 | 2456.2 | **2467.3 MiB/s** |
+
+**1.307x.**
+
+**Standard quick comparison**, 1 fork, 3 warmup, 3 measurement:
+
+| 8 MiB shape | Commons | Rust | E024 | E011 | E024 vs E011 |
+|---|---:|---:|---:|---:|---:|
+| one-shot | 553 | 2510 | **2149** | 1584 | 1.36x |
+| reused | 549 | 2491 | **2149** | 1569 | 1.37x |
+| streaming 4 KiB | 544 | 2344 | 905 | 874 | unchanged |
+
+FastBlake is now at **85.6% of Rust** on large contiguous input, up from 63%.
+
+### Generated code: why it wins while doing more work
+
+Stable non-OSR round body, AArch64:
+
+| | E011 single | E024 dual | vs 2x single (490) |
+|---|---:|---:|---:|
+| instructions | 245 | 533 | **+8.8%** |
+| vector-referencing | 160 | 348 | |
+| scalar/branch | 85 | 185 | |
+| **vector spill traffic** | **0** | **30** | |
+
+The dual kernel executes 8.8% *more* instructions per unit of work than two
+single batches, and it spills — 32 state vectors plus message operands exceeds
+AArch64's 32 vector registers, exactly as E023 predicted. It is 36% faster
+anyway.
+
+That is the clearest possible confirmation of E023: in a latency-bound loop,
+instruction count and even spill traffic are close to free, while independent
+work in flight is everything. The same 30 spills in an issue-bound loop would
+have been a regression.
+
+Decision: keep opt-in behind `-Dfastblake.experimental.dualChunkVector=true`
+pending streaming support and non-AArch64 validation, matching how E011 was
+handled. Production default is unchanged.
+
+Open items before promotion:
+
+1. Streaming is untouched at 905 MiB/s — the dual kernel only takes the direct
+   path, with no equivalent of E016's pending-batch retention. An 8192-byte
+   pending batch is the obvious follow-up and is worth more than further
+   compression work.
+2. Validate on environment B. The N97 is issue-bound and register-starved at 16
+   architectural vector registers, so the mechanism that makes E024 win here may
+   invert there. Do not promote on environment A evidence alone.
+3. A four-way interleave (16 chunks) is the natural next rung, but spill traffic
+   will grow faster than ILP at some point. E023's probe should be re-run against
+   E024 first to establish whether it is still latency-bound.
+
+Rule learned: when a loop is latency-bound, evaluate candidates by independent
+work in flight, not by instruction count or register pressure. E013, E016, E018,
+E021 and E022 all optimised the wrong quantity; E023 identified it and E024 is
+the first experiment since E014 to move the number.
+
+Artifacts: `build/e024-m5-dual-hashchunks.log`.

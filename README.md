@@ -2,13 +2,16 @@
 
 A pure-JVM BLAKE3 implementation, optimised for throughput.
 
-Status: **CPU implementation and comparison harness complete; SIMD kernel
+Status: **CPU implementation and comparison harness complete; SIMD kernels
 validated on two architectures and awaiting streaming support before
 promotion.** FastBlake implements the full BLAKE3 API in dependency-free Java.
 The allocation-free scalar kernel is the production default and the correctness
-baseline. An opt-in chunk-parallel Vector API kernel reaches 3.25× it on large
-contiguous inputs, and stays opt-in only because 4 KiB streaming updates still
-fall back to scalar. GPU offload remains planned work.
+baseline. Two opt-in chunk-parallel Vector API kernels sit above it: a
+four-chunk kernel, and an eight-chunk interleaved one that reaches **2148 MiB/s
+one-shot at 8 MiB on the Apple M5 — 85.8% of the reference Rust crate** and
+3.9× Commons Codec. Both stay opt-in because 4 KiB streaming updates still
+fall back to scalar, and because the eight-chunk kernel has not yet been
+validated on x86-64. GPU offload remains planned work.
 
 ```
 ./gradlew contenders   # what can run here, and why anything can't
@@ -22,7 +25,7 @@ fall back to scalar. GPU offload remains planned work.
 |---|---|---|
 | `commons` | Apache Commons Codec `Blake3`, scalar Java | The floor. Always available. |
 | `rust` | Reference [`blake3`][crate] crate via FFM, SIMD, single-threaded | The ceiling. Optional. |
-| `java-cpu` | FastBlake CPU — allocation-free scalar Java | Implemented and always available. |
+| `java-cpu` | FastBlake CPU — allocation-free scalar Java, plus opt-in chunk-parallel Vector API kernels | Implemented and always available. |
 | `java-gpu` | FastBlake GPU — device offload | **Planned.** |
 
 Everything is measured through one interface, `Blake3Engine`, so all four face
@@ -127,19 +130,60 @@ machine.
 ### Results
 
 Apple M5 (10 core), Temurin JDK 25.0.4, Commons Codec 1.22.0, `blake3` crate
-1.8.5. 2 forks × 5×1s measurement iterations, single-threaded. MiB/s, higher is
-better; x-factor against the `commons` baseline.
+1.8.5. 2 forks × 5 warmup × 5×1s measurement iterations, single-threaded, all
+three contenders measured in one session. MiB/s, higher is better; x-factor
+against the `commons` baseline. `java-cpu` is FastBlake with the E024
+eight-chunk kernel enabled (`-Dfastblake.experimental.dualChunkVector=true`).
 
-| size | `oneShot` commons | `oneShot` rust | `reusedInstance` commons | `reusedInstance` rust | `streaming4k` commons | `streaming4k` rust |
-|---:|---:|---:|---:|---:|---:|---:|
-| 64 B | 525 | 820 (1.56×) | 459 | 844 (1.84×) | 450 | 838 (1.86×) |
-| 1 KiB | 562 | 1274 (2.27×) | 558 | 1257 (2.25×) | 522 | 1262 (2.42×) |
-| 16 KiB | 545 | 2384 (4.37×) | 552 | 2374 (4.30×) | 549 | 2256 (4.11×) |
-| 256 KiB | 552 | 2386 (4.32×) | 542 | 2388 (4.41×) | 539 | 2254 (4.18×) |
-| 4 MiB | 543 | 2388 (4.40×) | 541 | 2387 (4.41×) | 538 | 2251 (4.19×) |
-| 8 MiB | 544 | 2420 (4.45×) | 538 | 2402 (4.46×) | 534 | 2240 (4.19×) |
+**`oneShot`** — fresh hasher per buffer:
 
-Raw JSON: `build/jmh-contenders.json`. Re-measure on your own machine before
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 525 | 834 (1.59×) | **199 (0.38×)** |
+| 1 KiB | 559 | 1309 (2.34×) | 850 (1.52×) |
+| 16 KiB | 544 | 2480 (4.55×) | 1269 (2.33×) |
+| 256 KiB | 554 | 2503 (4.51×) | 2058 (3.71×) |
+| 4 MiB | 548 | 2507 (4.57×) | 2142 (3.91×) |
+| 8 MiB | 548 | 2503 (4.57×) | 2148 (3.92×) |
+
+**`reusedInstance`** — `reset()` reuse:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 422 | 873 (2.07×) | 458 (1.09×) |
+| 1 KiB | 524 | 1315 (2.51×) | 921 (1.76×) |
+| 16 KiB | 498 | 2473 (4.97×) | 1286 (2.59×) |
+| 256 KiB | 512 | 2506 (4.90×) | 2081 (4.07×) |
+| 4 MiB | 520 | 2506 (4.82×) | 2147 (4.13×) |
+| 8 MiB | 494 | 2498 (5.05×) | 2149 (4.35×) |
+
+**`streaming4k`** — 4 KiB incremental updates:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 423 | 854 (2.02×) | 467 (1.10×) |
+| 1 KiB | 529 | 1308 (2.47×) | 926 (1.75×) |
+| 16 KiB | 501 | 2367 (4.72×) | 916 (1.83×) |
+| 256 KiB | 505 | 2362 (4.68×) | 917 (1.82×) |
+| 4 MiB | 532 | 2351 (4.42×) | 916 (1.72×) |
+| 8 MiB | 507 | 2349 (4.64×) | 916 (1.81×) |
+
+Three things this exposes that the 8 MiB headline hides:
+
+- **`java-cpu` is 2.6× *slower* than Commons on a 64-byte one-shot** (199 vs
+  525). The same input under `reusedInstance` reaches 458, so this is per-hasher
+  construction cost, not compression. It is the worst number in the project and
+  the one a general-purpose library would be judged on first.
+- **The eight-chunk kernel needs 8 KiB before it engages at all**, so 16 KiB
+  reaches only 1269 MiB/s — 59% of its 8 MiB rate — and does not saturate until
+  256 KiB. Rust saturates by 16 KiB. Widening the useful range downward is a
+  dispatch problem (fall back to the four-chunk kernel, then scalar), not a
+  kernel problem.
+- **Streaming is flat at ~916 MiB/s from 16 KiB up**, against 2148 one-shot.
+  The SIMD kernels are simply not reachable from the 4 KiB update path, so
+  streaming is 39% of Rust where one-shot is 86%.
+
+Raw JSON: `build/jmh-e024-long.json`. Re-measure on your own machine before
 drawing conclusions — and that is not a formality. E012 re-ran the ledger on an
 Intel N97 (AVX2, Linux, Temurin 25+36) and two of the headline ratios above do
 not transfer:
@@ -151,6 +195,12 @@ not transfer:
 | FastBlake E011 SIMD as a fraction of Rust | 63% | 38% |
 | Rust vs Commons | 4.5x | 7.9x |
 
+These are the E011-era figures that prompted the cross-architecture work; they
+are kept because the *divergence* is the point. The M5 SIMD row has since been
+superseded twice, by E014's loader and E024's interleaved kernel, and now stands
+at 85.8% of Rust — see the E024 paragraph below. The N97 column has its own
+later history under E016 and E019.
+
 Correctness, the allocation gate, and C2's escape-analysis behaviour *did*
 transfer, to three significant figures. What did not transfer is anything whose
 mechanism depends on core width: the scalar kernel's instruction-level
@@ -161,22 +211,23 @@ crate dispatches to 8-lane AVX2. See `reference/performance/experiments.md`
 
 What this says about where the work is:
 
-- **Commons Codec is flat at ~540 MiB/s from 1 KiB to 8 MiB. Rust triples from
-  820 to about 2400.** Rust's curve is SIMD engaging as the input grows enough to fill
-  a lane batch — it saturates by 16 KiB, exactly where 16 chunks first become
-  available. Commons never engages anything, because there is nothing to engage.
-  That flat line is the headroom, and closing it is the entire point of
-  `java-cpu`.
-- **The gap is 4.4× at size, but only 1.6× at 64 B.** Small inputs are dominated
-  by per-call setup, not compression, and there SIMD has nothing to work with.
-  A Vector API implementation should expect to reach parity quickly on large
-  buffers and struggle to justify itself on tiny ones.
-- **`reset()` reuse buys nothing** — it is *slower* than a fresh hasher at 64 B
-  for both contenders. Per-call cost is setup, not allocation, so a
-  zero-allocation API is not where the small-input win lives.
-- **Streaming in 4 KiB pieces costs Rust ~6% at size and Commons nothing.**
-  Rust gives up a little chunk-batching width at the piece boundary; the scalar
-  implementation has no width to give up.
+- **Commons Codec is flat at ~500–550 MiB/s across three orders of magnitude.**
+  It never engages data parallelism, because it has none to engage. That flat
+  line was the original headroom estimate, and `java-cpu` has now taken most of
+  it: 3.9× Commons at 8 MiB.
+- **Rust's curve is SIMD engaging as the input grows**, saturating by 16 KiB
+  where its 8-lane AVX2/NEON batch first fills. `java-cpu` traces the same
+  shape one step to the right, saturating at 256 KiB, because its batch is
+  8 KiB of input rather than Rust's smaller working set. The remaining 14% at
+  8 MiB is the narrower part of the gap; the wide part is everything below
+  256 KiB.
+- **`reset()` reuse buys nothing at size, but it is decisive at 64 B** — 458
+  against 199 for `java-cpu`. For Commons and Rust the two shapes are close,
+  so this is FastBlake-specific hasher construction cost and a fixable one.
+- **Streaming in 4 KiB pieces costs Rust ~6% and Commons nothing, but costs
+  `java-cpu` 57%.** Rust gives up a little batching width at the piece
+  boundary; Commons has none to give up; FastBlake loses its SIMD path
+  entirely and falls back to scalar.
 
 ## How the Rust contender is wired
 
@@ -221,8 +272,10 @@ compressor uses 16 named integer locals and seven fully expanded rounds; the
 former array-and-loop compressor remains selectable with
 `-Dfastblake.experimental.legacyScalar=true` for diagnostic comparisons. The
 Vector API `hash_many` kernel over independent 1 KiB chunks has since landed as
-E011, described below; the remaining CPU milestones are reducing the measured
-SIMD kernel cost and confirming automatic dispatch across architectures. E016
+E011, described below; the remaining CPU milestones are streaming support for
+the E024 eight-chunk kernel, x86-64 validation of it, and confirming automatic
+dispatch across architectures. Reducing the SIMD kernel's instruction count is
+no longer among them — E023 measured that target at 0.7% on AArch64. E016
 completed the streaming batch buffer and promoted the scalar little-endian
 VarHandle loader; direct-input bypass and message-local experiments remain
 possible follow-ups. The first array-based Vector API
@@ -367,6 +420,55 @@ half could remove only 2.36% of the stock exact kernel's instructions and 2.7%
 of the measured 8 MiB Java/Rust instruction excess. The N97's 4.28× instruction
 ratio would still be about 4.19×. This x86 result says nothing about the Apple
 M5 gap, which still needs its own AArch64 counters and disassembly.
+
+E022 supplied that M5 audit, using a locally built OpenJDK 28 with a working
+`hsdis-aarch64` — the project's first mnemonic AArch64 disassembly. The
+four-chunk round body is 245 instructions, of which the vector arithmetic is
+already at the exact theoretical minimum (48 add, 32 eor, 64 rotate as
+`ushr`+`sli`, 16 loads), with **zero** vector spill traffic. AArch64's 32 vector
+registers mean the register pressure that shapes every N97 result simply does
+not exist here. The remaining 85 instructions are scalar index arithmetic and
+per-load bounds checks. A flat pre-multiplied schedule with a masked index,
+intended to let C2 hoist those checks, removed exactly one of them and moved
+throughput 0.5% — inside the inconclusive band. Rejected and reverted: masking
+does not reach the range check that `IntVector.fromArray` emits inside its own
+intrinsic.
+
+E023 then asked whether those 85 instructions were worth attacking at all, with
+a probe that keeps the vector arithmetic identical but replaces every message
+operand with a loop-invariant vector, deleting all loads, index arithmetic and
+bounds checks. **Removing 35% of the round body's instructions bought 0.7%.**
+The M5 kernel is latency-bound on the vector dependency chain, not issue-bound.
+That retires instruction-count reduction as a direction on this architecture and
+explains E022's null result completely — the experiment had a 0.7% ceiling
+before it was written. The protocol now requires proving a loop is issue-bound
+*before* optimising its instruction count, alongside the allocation gate.
+
+E024 acts on the corrected model. A latency-bound loop goes faster only with
+more independent work in flight, so `Blake3ChunkVectorDual` runs two independent
+four-chunk groups — eight chunks, 8192 bytes — through one interleaved round
+body, doubling instruction-level parallelism from four independent G chains per
+half-round to eight. Lanes stay at 128-bit: on NEON parallelism comes from more
+batches, not wider vectors, so this is not E013's width experiment repeated. It
+passes equivalence against two sequential four-chunk batches, the full 542-test
+official-vector suite, and the allocation gate at 0.00 B per input byte —
+doubling the round body did not cross the escape-analysis cliff. At 8 MiB it
+measures **2149 MiB/s one-shot and reused, 1.36× the four-chunk kernel and 85.6%
+of Rust**, up from 63%; the 2-fork long run in the Results table above confirms
+this at 2148 one-shot and 2149 reused, or 85.8% of Rust. Enable with
+`-Dfastblake.experimental.dualChunkVector=true`.
+
+The generated code is the interesting part: the dual kernel executes **8.8% more
+instructions** than two sequential four-chunk batches and **does spill** (30
+vector spill instructions, since 32 state vectors plus message operands exceed
+AArch64's 32 registers) — and is 36% faster anyway. In a latency-bound loop,
+instruction count and spill traffic are nearly free while independent work in
+flight is everything. The same 30 spills in an issue-bound loop would have been
+a regression, which is precisely why this kernel must be validated on the
+issue-bound, register-starved N97 before any promotion. Streaming is also still
+untouched at 905 MiB/s, since the dual kernel has no equivalent of E016's
+pending-batch retention; with one-shot at 85% of Rust and streaming at 39%, that
+gap is now worth more than any further compression work.
 
 The primitive probe found that C2 does intrinsify the Vector API, but endian
 MemorySegment vector loads are about 25× slower than direct heap ByteVector
