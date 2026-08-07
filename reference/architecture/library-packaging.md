@@ -37,7 +37,7 @@ Before publishing an artifact:
 1. Run `./gradlew releaseCheck`.
 2. Run forced scalar/four/eight conformance where the Vector API is available.
 3. Inspect `build/libs/FastBlake-*.jar` through `verifyLibraryJar`.
-4. Run the consumer smoke test against the generated jar rather than project
+4. Run `consumerSmokeTest` against the generated jar rather than project
    classes.
 5. Record 8 MiB throughput, allocation rate, and retained footprint for the
    reference machines in `reference/performance/results/`.

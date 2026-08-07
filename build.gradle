@@ -59,6 +59,13 @@ sourceSets {
         compileClasspath += sourceSets.main.output
         runtimeClasspath += sourceSets.main.output
     }
+    consumerTest {
+        java.srcDirs = ['src/consumerTest/java']
+        // Compile exactly as a downstream user does: against the generated
+        // artifact, never against sourceSets.main.output.
+        compileClasspath = files(tasks.named('jar').flatMap { it.archiveFile })
+        runtimeClasspath = output + compileClasspath
+    }
     harness {
         java.srcDirs = ['src/harness/java']
         resources.srcDirs = ['src/harness/resources']
@@ -484,5 +491,18 @@ tasks.named('check') {
 tasks.register('releaseCheck') {
     group = 'verification'
     description = 'Runs correctness and verifies the consumer-facing library artifact.'
-    dependsOn tasks.named('test'), tasks.named('verifyLibraryJar'), tasks.named('generatePomFileForMavenJavaPublication')
+    dependsOn tasks.named('test'), tasks.named('verifyLibraryJar'),
+            tasks.named('generatePomFileForMavenJavaPublication'),
+            tasks.named('consumerSmokeTest')
+}
+
+// A consumer-style smoke test deliberately runs without --add-modules. This
+// proves the published jar can still use its scalar fallback on a JVM where
+// the incubating Vector API is not resolved.
+tasks.register('consumerSmokeTest', JavaExec) {
+    group = 'verification'
+    description = 'Compiles and runs a downstream-style program against the jar.'
+    dependsOn tasks.named('compileConsumerTestJava')
+    mainClass = 'com.pedrobatista.fastblake.consumer.LibraryConsumerSmokeTest'
+    classpath = sourceSets.consumerTest.runtimeClasspath
 }
