@@ -219,27 +219,139 @@ tasks.register('contenders', JavaExec) {
     configureNativeAccess(it)
 }
 
-// E025 P3. Runs every selectable kernel on this machine and reports whether the
-// one KernelSelector picked actually won. The dispatch table encodes measured
-// results, and this is what keeps it honest as CPUs and JDKs change — a table
-// nobody re-checks is an assumption, not a measurement.
+// E025 P3. Benchmarks every selectable kernel on this machine and reports
+// whether the one KernelSelector picked actually won.
 //
-// ./gradlew dispatchAudit
+// The dispatch table in KernelSelector encodes measured results, and a table
+// nobody re-checks is an assumption rather than a measurement. This is the
+// check. It matters because the ground moves: E024 measured a ~15% swing on
+// identical code between two JDK builds, and a JDK on this machine changed
+// underneath the build mid-session.
+//
+//   ./gradlew dispatchAudit
+//   ./gradlew dispatchAudit -PauditSize=1048576 -PauditShape=streaming4k
 tasks.register('dispatchAudit') {
     group = 'verification'
     description = 'Benchmarks every selectable kernel and checks the selector chose the best.'
     dependsOn tasks.named('jmhClasses')
+
+    def injected = objects.newInstance(InjectedExec)
+    def jmhClasspath = sourceSets.jmh.runtimeClasspath
+    def nativeDir = nativeStageDir.get().asFile.absolutePath
+    def javaLauncher = javaToolchains.launcherFor(java.toolchain)
+    def size = (project.findProperty('auditSize') ?: '8388608').toString()
+    def shape = (project.findProperty('auditShape') ?: 'oneShot').toString()
+    def outputFile = layout.buildDirectory.file('dispatch-audit.txt')
+    outputs.file(outputFile)
+
     doLast {
-        logger.lifecycle('dispatchAudit runs one JMH fork per kernel; use:')
-        logger.lifecycle('')
-        ['scalar', 'four', 'eight'].each { kernel ->
-            logger.lifecycle("  ./gradlew jmh -P'jmh.args=oneShot -p impl=java-cpu " +
-                    "-p size=8388608 -f2 -wi 5 -i 5' " +
-                    "-Dfastblake.kernel=${kernel}")
+        def kernels = ['scalar', 'four', 'eight']
+        def scores = [:]
+        def selected = null
+
+        kernels.each { kernel ->
+            logger.lifecycle("dispatchAudit: measuring ${kernel} at ${shape}/${size} ...")
+            def out = new ByteArrayOutputStream()
+            def result = injected.execOps.javaexec {
+                executable = javaLauncher.get().executablePath.asFile.absolutePath
+                classpath = jmhClasspath
+                mainClass = 'com.pedrobatista.fastblake.bench.BenchmarkRunner'
+                systemProperty 'fastblake.native.dir', nativeDir
+                // The kernel override must reach the JMH *fork*, not just this
+                // host process. JMH child JVMs do not inherit arbitrary -D
+                // flags, so an audit that set only a systemProperty measured
+                // the same kernel three times and always reported "OK".
+                // JAVA_TOOL_OPTIONS is inherited through the environment and is
+                // how every other run in this project propagates the flag.
+                environment 'JAVA_TOOL_OPTIONS', "-Dfastblake.kernel=${kernel}"
+                jvmArgs '--enable-native-access=ALL-UNNAMED',
+                        '--add-modules=jdk.incubator.vector'
+                args shape, '-p', 'impl=java-cpu', '-p', "size=${size}",
+                        '-f', '2', '-wi', '5', '-i', '5'
+                standardOutput = out
+                errorOutput = out
+                ignoreExitValue = true
+            }
+            def text = out.toString()
+            if (result.exitValue != 0) {
+                logger.lifecycle("  ${kernel}: FAILED (exit ${result.exitValue})")
+                logger.info(text)
+                return
+            }
+            // The runner prints "<size label>  <MiB/s>" in its summary table.
+            def score = null
+            text.eachLine { line ->
+                def m = line =~ /^\s{2,}\S+\s+(?:B|KiB|MiB)\s+([0-9]+)\s*$/
+                if (m.find()) {
+                    score = m.group(1) as int
+                }
+            }
+            if (score == null) {
+                logger.lifecycle("  ${kernel}: no score parsed")
+                logger.info(text)
+            } else {
+                scores[kernel] = score
+                logger.lifecycle("  ${kernel}: ${score} MiB/s")
+            }
+            // Every run prints the selection line; capture it once.
+            text.eachLine { line ->
+                if (selected == null && line.contains('-> ') && line.contains('java-cpu')) {
+                    selected = line.trim()
+                }
+            }
         }
+
+        if (scores.isEmpty()) {
+            throw new GradleException('dispatchAudit produced no scores; see --info for output.')
+        }
+
+        def best = scores.max { it.value }
+        // Map the automatic choice onto a kernel key. Run once more with no
+        // override so the selector reports what it would pick unaided.
+        def autoOut = new ByteArrayOutputStream()
+        injected.execOps.javaexec {
+            executable = javaLauncher.get().executablePath.asFile.absolutePath
+            classpath = jmhClasspath
+            mainClass = 'com.pedrobatista.fastblake.harness.Contenders'
+            systemProperty 'fastblake.native.dir', nativeDir
+            jvmArgs '--enable-native-access=ALL-UNNAMED',
+                    '--add-modules=jdk.incubator.vector'
+            standardOutput = autoOut
+            errorOutput = autoOut
+            ignoreExitValue = true
+        }
+        def autoLine = autoOut.toString().readLines().find { it.contains('java-cpu') } ?: ''
+        def autoKernel = autoLine.contains('EIGHT_CHUNK') ? 'eight'
+                : autoLine.contains('FOUR_CHUNK') ? 'four'
+                : autoLine.contains('SCALAR') ? 'scalar' : null
+
+        def report = new StringBuilder()
+        report.append("FastBlake dispatch audit\n")
+        report.append("shape=${shape} size=${size} bytes, 2 forks x 5 warmup x 5 measurement\n\n")
+        report.append(autoLine.trim()).append('\n\n')
+        scores.each { k, v ->
+            def marks = []
+            if (k == best.key) marks << 'fastest'
+            if (k == autoKernel) marks << 'selected'
+            report.append(String.format("  %-7s %6d MiB/s%s%n", k, v,
+                    marks ? '   <- ' + marks.join(', ') : ''))
+        }
+        report.append('\n')
+        if (autoKernel == null) {
+            report.append('VERDICT: could not determine the automatic selection.\n')
+        } else if (autoKernel == best.key) {
+            report.append("VERDICT: OK. The selector picked '${autoKernel}', which is the fastest here.\n")
+        } else {
+            def margin = 100.0 * (best.value - (scores[autoKernel] ?: 0)) / best.value
+            report.append(String.format(
+                    "VERDICT: MISMATCH. The selector picked '%s' but '%s' is %.1f%% faster here.%n",
+                    autoKernel, best.key, margin))
+            report.append('Record this machine and these numbers in '
+                    + 'reference/performance/experiments.md, then update KernelSelector.\n')
+        }
+        def text = report.toString()
+        outputFile.get().asFile.text = text
         logger.lifecycle('')
-        logger.lifecycle('then compare against the automatic choice reported by ./gradlew contenders.')
-        logger.lifecycle('A kernel that wins here but is not selected is a KernelSelector bug;')
-        logger.lifecycle('record the machine and the numbers in reference/performance/experiments.md.')
+        logger.lifecycle(text)
     }
 }
