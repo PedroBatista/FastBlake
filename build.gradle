@@ -4,16 +4,26 @@ import javax.inject.Inject
 
 plugins {
     id 'java'
+    id 'maven-publish'
 }
 
 group 'com.pedrobatista'
 version '0.1.0'
+
+description = 'Dependency-free pure-JVM BLAKE3 implementation'
+
+// The main jar is the library boundary. Harnesses, benchmarks and native
+// contenders are deliberately separate source sets and are never runtime
+// dependencies of this artifact.
+def libraryJar = tasks.named('jar')
 
 repositories {
     mavenCentral()
 }
 
 java {
+    withSourcesJar()
+    withJavadocJar()
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
@@ -393,4 +403,69 @@ tasks.register('footprint', JavaExec) {
     systemProperty 'jol.magicFieldOffset', 'true'
     jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
             '--add-opens=java.base/java.util=ALL-UNNAMED'
+}
+
+// Packaging checks are intentionally independent of Gradle's source-set
+// wiring. They inspect the actual artifact a consumer would receive, so a new
+// harness class or dependency cannot accidentally leak into the library.
+tasks.register('verifyLibraryJar') {
+    group = 'verification'
+    description = 'Verifies that the published jar contains only library code.'
+    dependsOn libraryJar
+    doLast {
+        def jarFile = libraryJar.get().archiveFile.get().asFile
+        def forbiddenPrefixes = [
+                'com/pedrobatista/fastblake/harness/',
+                'com/pedrobatista/fastblake/bench/'
+        ]
+        def forbiddenSuffixes = ['test_vectors.json']
+        def leaked = []
+        new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
+            zip.entries().each { entry ->
+                def name = entry.name
+                if (forbiddenPrefixes.any { name.startsWith(it) }
+                        || forbiddenSuffixes.any { name.endsWith(it) }) {
+                    leaked << name
+                }
+            }
+        }
+        if (!leaked.isEmpty()) {
+            throw new GradleException("Library jar contains non-library entries: ${leaked}")
+        }
+        logger.lifecycle("verifyLibraryJar: ${jarFile.name} contains no harness, benchmark, or test-vector entries.")
+    }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            pom {
+                name = 'FastBlake'
+                description = project.description
+                url = 'https://github.com/pedrobatista/FastBlake'
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                scm {
+                    connection = 'scm:git:https://github.com/pedrobatista/FastBlake.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/pedrobatista/FastBlake.git'
+                    url = 'https://github.com/pedrobatista/FastBlake'
+                }
+            }
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyLibraryJar')
+}
+
+tasks.register('releaseCheck') {
+    group = 'verification'
+    description = 'Runs correctness and verifies the consumer-facing library artifact.'
+    dependsOn tasks.named('test'), tasks.named('verifyLibraryJar'), tasks.named('generatePomFileForMavenJavaPublication')
 }
