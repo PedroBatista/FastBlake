@@ -40,14 +40,38 @@ public final class FastBlake {
     private static final boolean USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR =
             Boolean.getBoolean("fastblake.experimental.dualChunkVector");
 
-    // E025 P1: chunks retained across update() calls so that fragmented input
-    // can still form a complete SIMD batch. E016 introduced this for the
-    // four-chunk kernel; the batch size is now whatever the selected kernel
-    // consumes, so the eight-chunk kernel gets the same treatment. Zero means
-    // no vector kernel is active and update() uses the ordinary scalar path.
-    private static final int VECTOR_STREAM_CHUNKS =
-            USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR ? 8
-                    : (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR ? 4 : 0);
+
+    /**
+     * E025 P3: how many chunks the streaming batch holds, and therefore which
+     * chunk-parallel kernel runs.
+     *
+     * <p>An explicitly set {@code fastblake.experimental.*} property always
+     * wins, so every experiment in the ledger stays reproducible exactly as
+     * recorded. Only when none is set does {@link KernelSelector} choose from
+     * the machine's capabilities.
+     */
+    private static int resolveStreamChunks() {
+        if (USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR) {
+            return 8;
+        }
+        if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
+            return 4;
+        }
+        // The remaining experimental kernels are driven from the general update
+        // loop, not the streaming path. Leave that loop in charge of them.
+        if (USE_EXPERIMENTAL_VECTOR || USE_EXPERIMENTAL_BLOCK_VECTOR
+                || USE_EXPERIMENTAL_CHUNK_VECTOR4 || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
+                || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR || USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR
+                || USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR || USE_LEGACY_SCALAR) {
+            return 0;
+        }
+        return KernelSelector.selected().chunksPerBatch;
+    }
+
+    /** The kernel this JVM selected, and why. For diagnostics and the harness. */
+    public static String selectedKernel() {
+        return KernelSelector.describe();
+    }
     // E013 is E011's kernel at the machine's preferred vector width. On a
     // 128-bit target the two are the same shape and the same lane count; the
     // property exists so the width change can be measured on its own.
@@ -62,8 +86,21 @@ public final class FastBlake {
     private static final boolean USE_LEGACY_SCALAR =
             Boolean.getBoolean("fastblake.experimental.legacyScalar");
 
+    // E025 P1: chunks retained across update() calls so that fragmented input
+    // can still form a complete SIMD batch. E016 introduced this for the
+    // four-chunk kernel; the batch size is now whatever the selected kernel
+    // consumes, so the eight-chunk kernel gets the same treatment. Zero means
+    // no vector kernel is active and update() uses the ordinary scalar path.
+    //
+    // MUST be declared after every fastblake.experimental.* flag it reads:
+    // static initialisers run in textual order, and an earlier position would
+    // silently observe them as false. That would make a forced experimental
+    // kernel measure a different kernel than the one requested.
+    private static final int VECTOR_STREAM_CHUNKS = resolveStreamChunks();
+
     /** True when any experimental kernel needing the vector scratch is on. */
-    private static final boolean ANY_VECTOR_KERNEL = USE_EXPERIMENTAL_VECTOR
+    private static final boolean ANY_VECTOR_KERNEL = VECTOR_STREAM_CHUNKS > 0
+            || USE_EXPERIMENTAL_VECTOR
             || USE_EXPERIMENTAL_CHUNK_VECTOR4
             || USE_EXPERIMENTAL_LOW_LIVE_VECTOR
             || USE_EXPERIMENTAL_ROUND_CACHE_VECTOR
@@ -477,7 +514,7 @@ public final class FastBlake {
 
     /** Runs one complete batch through the selected kernel and pushes its CVs. */
     private void hashStreamBatch(byte[] source, int sourceOffset) {
-        if (USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR) {
+        if (VECTOR_STREAM_CHUNKS == 8) {
             Blake3ChunkVectorDual.hashChunks(source, sourceOffset, chunksCompressed,
                     key, modeFlags, vectorPacked(), vectorCvs());
         } else {

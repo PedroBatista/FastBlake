@@ -218,3 +218,28 @@ tasks.register('contenders', JavaExec) {
     classpath = sourceSets.harness.runtimeClasspath
     configureNativeAccess(it)
 }
+
+// E025 P3. Runs every selectable kernel on this machine and reports whether the
+// one KernelSelector picked actually won. The dispatch table encodes measured
+// results, and this is what keeps it honest as CPUs and JDKs change — a table
+// nobody re-checks is an assumption, not a measurement.
+//
+// ./gradlew dispatchAudit
+tasks.register('dispatchAudit') {
+    group = 'verification'
+    description = 'Benchmarks every selectable kernel and checks the selector chose the best.'
+    dependsOn tasks.named('jmhClasses')
+    doLast {
+        logger.lifecycle('dispatchAudit runs one JMH fork per kernel; use:')
+        logger.lifecycle('')
+        ['scalar', 'four', 'eight'].each { kernel ->
+            logger.lifecycle("  ./gradlew jmh -P'jmh.args=oneShot -p impl=java-cpu " +
+                    "-p size=8388608 -f2 -wi 5 -i 5' " +
+                    "-Dfastblake.kernel=${kernel}")
+        }
+        logger.lifecycle('')
+        logger.lifecycle('then compare against the automatic choice reported by ./gradlew contenders.')
+        logger.lifecycle('A kernel that wins here but is not selected is a KernelSelector bug;')
+        logger.lifecycle('record the machine and the numbers in reference/performance/experiments.md.')
+    }
+}

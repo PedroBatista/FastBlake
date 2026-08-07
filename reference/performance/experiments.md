@@ -2319,3 +2319,58 @@ one-shot against 2054 streaming, where before P1 it was 2140 against 911. The
 remaining structural gap is P2's size ladder: 16 KiB reaches only 1240,
 because the eight-chunk kernel needs 8192 bytes to engage and there is still no
 rung between it and scalar.
+
+### E025 P2 result — ladder rung: +21% mid-size on two shapes, none on the third
+
+Date: 2026-08-07
+Environment: **A** (Apple M5).
+
+Change: a second rung in the update ladder. When a full eight-chunk batch does
+not remain but more than four chunks do, use the four-chunk kernel instead of
+falling through to the scalar tail. Guarded so it only applies when the selected
+batch is wider than four chunks.
+
+Motivation, from tracing 16 KiB through the post-P1 code: the eight-chunk kernel
+consumed 8 chunks, the remaining 8192 bytes were retained, and finalization then
+compressed **7 of those 8 chunks one at a time in scalar**. Nearly half the
+input ran at scalar speed.
+
+**Conformance**: 542 tests, default and with each of `scratchChunkVector` and
+`dualChunkVector` forced. All pass.
+
+**Throughput**, JMH, 2 forks x 5 warmup x 5 measurement:
+
+| size | shape | post-P1 | post-P2 |
+|---|---|---:|---:|
+| 16 KiB | oneShot | 1240 | **1494 (+20.5%)** |
+| 16 KiB | reusedInstance | 1247 | **1520 (+21.9%)** |
+| 16 KiB | streaming4k | 1238 | 1242 (unchanged) |
+| 8 MiB | oneShot | 2119 | 2126 |
+| 8 MiB | reusedInstance | 2135 | 2131 |
+| 8 MiB | streaming4k | 2076 | 2076 |
+
+Full mid-size curve after P2:
+
+| size | oneShot | reusedInstance | streaming4k |
+|---|---:|---:|---:|
+| 4 KiB | 855 | 881 | 878 |
+| 8 KiB | 1153 | 1173 | 881 |
+| 16 KiB | 1494 | 1520 | 1242 |
+| 256 KiB | 2050 | 2082 | 1991 |
+| 8 MiB | 2126 | 2131 | 2076 |
+
+Decision: keep. +21% mid-size on two of three shapes with no change at 8 MiB.
+
+**P2 is incomplete, and the measurement says exactly why.** The new rung fires
+only on the direct path, which requires `vectorPendingLength == 0 && remaining >
+4 * CHUNK_LEN`. Under 4 KiB streaming updates `remaining` is never more than
+4096, so the rung never fires: input accumulates in the retained buffer and
+finalization still drains up to 7 chunks scalar. That is precisely why
+`streaming4k` at 8 KiB and 16 KiB did not move while the other two shapes gained
+21%.
+
+**P2b**: apply the same ladder inside the finalization drain. When the retained
+batch holds four or more whole non-final chunks, compress them four at a time
+with the four-chunk kernel instead of one at a time with the scalar path. This
+is a separate change to a separate code path and should be measured separately;
+`streaming4k` at 8-16 KiB is its target and its control.
