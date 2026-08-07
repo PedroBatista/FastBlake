@@ -557,7 +557,29 @@ public final class FastBlake {
             finalStack = Arrays.copyOf(cvStack(), cvStack().length);
             byte[] pendingChunk = new byte[CHUNK_LEN];
             int chunksBeforeLast = (vectorPendingLength - 1) / CHUNK_LEN;
-            for (int pending = 0; pending < chunksBeforeLast; pending++) {
+            int pending = 0;
+
+            // E025 P2b: the ladder, applied to the drain as well as the update
+            // loop. Every non-final chunk retained here is provably not the
+            // root, so complete groups of four can go through the four-chunk
+            // kernel instead of one at a time through the scalar compressor.
+            // Under 4 KiB streaming updates the P2 rung never fires -- each
+            // update is exactly one batch-fill, so input accumulates here
+            // instead -- which is why streaming stayed flat while one-shot
+            // gained 21%. This is the path that shape actually takes.
+            while (chunksBeforeLast - pending >= 4) {
+                Blake3ChunkVectorScratch.hashChunks(vectorPending(), pending * CHUNK_LEN,
+                        finalChunkCounter, key, modeFlags, vectorPacked(), vectorCvs());
+                for (int lane = 0; lane < 4; lane++) {
+                    System.arraycopy(vectorCvs(), lane * 8, rightCv, 0, 8);
+                    finalChunkCounter++;
+                    finalStackLength = pushChunkCv(finalStack, finalStackLength, rightCv,
+                            finalChunkCounter, key, modeFlags, words, state);
+                }
+                pending += 4;
+            }
+
+            for (; pending < chunksBeforeLast; pending++) {
                 System.arraycopy(vectorPending(), pending * CHUNK_LEN,
                         pendingChunk, 0, CHUNK_LEN);
                 chunkChainingValue(pendingChunk, CHUNK_LEN, finalChunkCounter,
