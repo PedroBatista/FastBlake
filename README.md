@@ -302,6 +302,66 @@ setting the flag via `JAVA_TOOL_OPTIONS` instead (see E012), which was never
 affected and remains the more foolproof way to flip these flags for
 `./gradlew jmh`.
 
+#### E024 on this machine: a regression, not a repeat of the M5 win
+
+E024 interleaves two independent four-chunk batches (8 chunks, 8192 bytes) in
+one round body, still at 128-bit lanes — more independent work per round
+rather than wider vectors. On Apple M5 it beat E011 by 1.36-1.37x (see the
+main Results table above and `reference/performance/experiments.md` § E024).
+This machine is the first non-AArch64 measurement of it.
+
+Correctness passes (`JAVA_TOOL_OPTIONS=-Dfastblake.experimental.dualChunkVector=true
+./gradlew test --rerun`, full official-vector suite) and the allocation gate
+holds: ~5,980 B fixed per 8 MiB call, i.e. ~0.0007 B per input byte, matching
+E011's near-zero figure.
+
+The first full-sweep throughput run (2 forks × 5+5×1s, same protocol as
+everything else on this page) was contaminated by a handful of extreme
+single-iteration outliers — an 11x spike at 8 MiB `oneShot` (118.6M ns against
+a ~10.3M ns cluster) and a 14x spike at 256 KiB `reusedInstance` (4.57M ns
+against a ~400K ns cluster), both visible in the raw JSON's `rawData` and
+absent from every neighboring iteration and size. On a shared desktop with no
+core pinning that reads as OS/background-process jitter, not kernel behavior,
+but it skewed the tool's plain-average summary table badly enough to report
+an implausible dip at those two cells. Re-running just those cells at 3 forks
+× 10 iterations resolved it:
+
+| shape / size | first sweep (contaminated) | re-check (3f×10i) |
+|---|---:|---:|
+| `oneShot` 256 KiB | 785 | **775** |
+| `oneShot` 8 MiB | 379 | **778** |
+| `reusedInstance` 256 KiB | 317 | **784** |
+| `reusedInstance` 8 MiB | 771 | 777 (unaffected, kept as a check) |
+
+Clean numbers against the E011 single four-chunk kernel and the scalar/Commons
+baselines already measured on this machine, at 8 MiB:
+
+| | commons | scalar (`java-cpu`) | E011 (4-chunk SIMD) | E024 (8-chunk SIMD) |
+|---|---:|---:|---:|---:|
+| `oneShot` | 166 | 318 | 888 | **778 (0.88x of E011)** |
+| `reusedInstance` | 166 | 310 | 897 | **777 (0.87x of E011)** |
+| `streaming4k` | 155 | 310 | 870 | ~300 (unchanged — see below) |
+
+**E024 is about 12-14% slower than E011 here**, not 1.36x faster as on the
+M5 — though it still beats scalar by ~2.4-2.5x and Commons by ~4.7x. This is
+exactly the inversion the experiment doc's open item #2 flagged as a risk
+before promotion: AVX2 gives the JIT only 16 architectural vector registers
+against AArch64's 32, and doubling the interleaved round body from 4 to 8
+independent chunks raises live vector state accordingly. What is a free
+latency-hiding win on a register-rich core can cost more in spills/pressure
+than it buys in independent work on a narrower one. This machine and the N97
+share that 16-register constraint, so this result is a concrete data point
+for — not a substitute for — running E024 on the N97 itself.
+
+`streaming4k` stays at scalar-level throughput (~300 MiB/s) regardless of the
+kernel, because E024 has no streaming-batch integration yet (open item #1 in
+the experiment doc) — it only takes the direct one-shot/reused path, same
+limitation E011 had before E016.
+
+Raw JSON: `build/jmh-dual-ryzen.json` (full sweep, includes the outlier
+iterations for anyone who wants to see them), plus the two targeted re-checks
+noted above.
+
 ## How the Rust contender is wired
 
 `cargo build --release` produces a `cdylib` from `native/rust-blake3`, which the
