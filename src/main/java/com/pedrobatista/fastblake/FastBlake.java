@@ -450,6 +450,22 @@ public final class FastBlake {
                 continue;
             }
 
+            // E025 P2, the ladder's second rung. Below one full batch there is
+            // still enough for the narrower kernel, and without this rung that
+            // tail was compressed one chunk at a time in finalization. At
+            // 16 KiB that was 7 of 16 chunks running scalar. Only meaningful
+            // when the selected batch is wider than four chunks; the four-chunk
+            // kernel is already the rung above.
+            if (VECTOR_STREAM_CHUNKS > 4 && vectorPendingLength == 0
+                    && remaining > 4 * CHUNK_LEN) {
+                Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
+                        key, modeFlags, vectorPacked(), vectorCvs());
+                pushVectorChunkCvs(4);
+                position += 4 * CHUNK_LEN;
+                remaining -= 4 * CHUNK_LEN;
+                continue;
+            }
+
             int take = Math.min(remaining, batchBytes - vectorPendingLength);
             System.arraycopy(input, position, vectorPending(), vectorPendingLength, take);
             vectorPendingLength += take;
