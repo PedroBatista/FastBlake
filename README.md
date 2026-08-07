@@ -193,6 +193,35 @@ Three things this exposes that the 8 MiB headline hides:
   caller's array. It is now 536, or 1.02× Commons, having gone from 3,400 to
   256 bytes allocated per 64-byte hash.
 
+### Memory
+
+Throughput is one axis; how much memory a hasher holds is another, and they can
+move in opposite directions. `./gradlew footprint` reports deep retained size
+per hasher via JOL, at three lifecycle points:
+
+| contender | fresh | after 64 B | after 8 MiB |
+|---|---:|---:|---:|
+| `commons` | 464 B | 464 B | 1,136 B |
+| `rust` | 88 B † | 88 B † | 88 B † |
+| `java-cpu` | 1,384 B | 1,384 B | 12,136 B |
+
+† `rust` is a Java wrapper over an off-heap `blake3::Hasher`; JOL cannot see the
+native allocation, so that row is a floor rather than a total.
+
+A hasher that has streamed 8 MiB retains 12 KiB, most of it the 8 KiB batch
+buffer that makes streaming fast — that is the price of the 2.26× streaming win,
+paid only by hashers that actually stream. A hasher doing small work retains
+1.4 KiB and does not grow: the batch buffer is allocated only once input exceeds
+one chunk. Static one-shot entry points retain nothing between calls, so this
+axis only matters for callers that hold hasher instances.
+
+This was not free by default. E025 made the SIMD kernel automatic and routed
+every `update()` through the streaming path, so a 64-byte hash briefly retained
+9.4 KiB — the per-operation allocation gate stayed at zero throughout and could
+never have caught it, because the buffer is allocated once and then held.
+Allocation rate and retained footprint are separate measurements and both are
+now gated.
+
 ### Independent re-measurement: AMD Ryzen 3 3200G
 
 AMD Ryzen 3 3200G (Zen, 4C/4T), Windows 10, Temurin JDK 25.0.4, Commons Codec

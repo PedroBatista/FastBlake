@@ -2580,3 +2580,56 @@ Rule learned: allocation rate and retained footprint are different measurements
 and can move in opposite directions. E025 P0a reduced allocation per call while
 *increasing* what a hasher retains, and nothing in the protocol would have
 caught that. `./gradlew footprint` is now the second memory gate.
+
+### E027 P0d result — deferred batch buffer: 6.9x less retained, throughput unchanged
+
+Date: 2026-08-07
+Environment: **A** (Apple M5).
+
+Change: a two-stage retained buffer. While at most one chunk has been seen, the
+existing 1 KiB `chunk` array holds the retained streaming bytes; the 8 KiB batch
+array is allocated only once input pushes past `CHUNK_LEN`, i.e. only once a
+batch can actually be formed.
+
+`chunk` is free to serve this because when a chunk-parallel kernel is active,
+`update()` always routes through `updateVectorStream`, so `chunkLength` stays
+zero and the two uses cannot overlap. That invariant is what the change rests
+on. `reset()` now clears whichever of the two buffers held the valid prefix.
+
+**Conformance**: 542 tests across six configurations — automatic dispatch, both
+experimental kernel properties, both forced kernels, and the wide kernel.
+Widened beyond the usual set because this changes the buffer finalization reads
+from, and the drain path differs per kernel. All pass.
+
+**Footprint gate**, `./gradlew footprint`:
+
+| contender | fresh | after 64 B | after 8 MiB |
+|---|---:|---:|---:|
+| `commons` | 464 B | 464 B | 1,136 B |
+| `java-cpu` before | 1,384 B | **9,592 B** | 12,136 B |
+| `java-cpu` after | 1,384 B | **1,384 B** | 12,136 B |
+
+A small-input hasher retains **6.9x less**, and no longer grows at all from
+hashing 64 bytes. Against Commons it is 3.0x rather than 20.7x. The 8 MiB column
+is deliberately unchanged: a hasher that has streamed 8 MiB legitimately needs
+the batch, and paying for it there is what bought P1's 2.26x.
+
+**Throughput gate**, JMH, 2 forks x 5 warmup x 5 measurement:
+
+| shape | 64 B | 16 KiB | 8 MiB |
+|---|---:|---:|---:|
+| `oneShot` | 555 (was 536) | 1506 (1510) | 2137 (2135) |
+| `reusedInstance` | 482 (483) | 1526 (1531) | 2145 (2159) |
+| `streaming4k` | 474 (475) | 1497 (1509) | 2085 (2094) |
+
+Every delta is under 1%, inside the 3% inconclusive band. The footprint
+reduction is free.
+
+Decision: keep. Strict improvement on one axis, no measurable cost on the other.
+
+Comment: this closes the interaction E027 exposed. P0a made the buffers lazy so
+small work would not pay for large-input machinery; P1 and P3 then routed the
+smallest possible update through the largest buffer and silently undid it. The
+per-operation allocation gate could never have caught it — allocation stayed at
+zero throughout, because the buffer is allocated once per hasher and then
+retained. Two gates were needed, and now exist.

@@ -201,13 +201,42 @@ public final class FastBlake {
         return cvs;
     }
 
-    /** The retained streaming batch, allocated on the first streaming update. */
-    private byte[] vectorPending() {
+    /**
+     * The buffer holding retained streaming bytes, sized to what is needed.
+     *
+     * <p>E027 P0d: while at most one chunk has been seen, the existing 1 KiB
+     * {@code chunk} array is the buffer. The full batch array is allocated only
+     * once input pushes past a chunk, i.e. only once a batch can actually be
+     * formed. Before this, a hasher that had done nothing but hash 64 bytes
+     * retained 9.4 KiB, because every update routed through the streaming path
+     * and touched the 8 KiB batch on first use — E025 P0a's laziness bought
+     * nothing for the common small case.
+     *
+     * <p>{@code chunk} is free to serve this purpose: when a chunk-parallel
+     * kernel is active, {@code update} always goes through
+     * {@link #updateVectorStream}, so {@code chunkLength} stays zero and the two
+     * uses never overlap.
+     *
+     * @param requiredCapacity bytes that must fit after this call
+     */
+    private byte[] pendingBuffer(int requiredCapacity) {
         byte[] pending = vectorPending;
-        if (pending == null) {
-            pending = vectorPending = new byte[VECTOR_STREAM_CHUNKS * CHUNK_LEN];
+        if (pending != null) {
+            return pending;
+        }
+        if (requiredCapacity <= CHUNK_LEN) {
+            return chunk;
+        }
+        pending = vectorPending = new byte[VECTOR_STREAM_CHUNKS * CHUNK_LEN];
+        if (vectorPendingLength > 0) {
+            System.arraycopy(chunk, 0, pending, 0, vectorPendingLength);
         }
         return pending;
+    }
+
+    /** The buffer currently holding retained bytes, without allocating. */
+    private byte[] retainedBuffer() {
+        return vectorPending != null ? vectorPending : chunk;
     }
 
     private int chunkLength;
@@ -476,7 +505,7 @@ public final class FastBlake {
         int batchBytes = VECTOR_STREAM_CHUNKS * CHUNK_LEN;
         while (remaining > 0) {
             if (vectorPendingLength == batchBytes) {
-                hashStreamBatch(vectorPending(), 0);
+                hashStreamBatch(retainedBuffer(), 0);
                 vectorPendingLength = 0;
             }
 
@@ -504,7 +533,8 @@ public final class FastBlake {
             }
 
             int take = Math.min(remaining, batchBytes - vectorPendingLength);
-            System.arraycopy(input, position, vectorPending(), vectorPendingLength, take);
+            System.arraycopy(input, position,
+                    pendingBuffer(vectorPendingLength + take), vectorPendingLength, take);
             vectorPendingLength += take;
             position += take;
             remaining -= take;
@@ -551,7 +581,7 @@ public final class FastBlake {
             // The whole retained batch is one partial chunk, so it *is* the
             // final chunk: no CVs to push, nothing to copy. This is the common
             // case for small inputs and must not pay for the drain machinery.
-            finalChunk = vectorPending();
+            finalChunk = retainedBuffer();
             finalChunkLength = vectorPendingLength;
         } else if (VECTOR_STREAM_CHUNKS > 0 && vectorPendingLength > 0) {
             finalStack = Arrays.copyOf(cvStack(), cvStack().length);
@@ -568,7 +598,7 @@ public final class FastBlake {
             // instead -- which is why streaming stayed flat while one-shot
             // gained 21%. This is the path that shape actually takes.
             while (chunksBeforeLast - pending >= 4) {
-                Blake3ChunkVectorScratch.hashChunks(vectorPending(), pending * CHUNK_LEN,
+                Blake3ChunkVectorScratch.hashChunks(retainedBuffer(), pending * CHUNK_LEN,
                         finalChunkCounter, key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
                     System.arraycopy(vectorCvs(), lane * 8, rightCv, 0, 8);
@@ -580,7 +610,7 @@ public final class FastBlake {
             }
 
             for (; pending < chunksBeforeLast; pending++) {
-                System.arraycopy(vectorPending(), pending * CHUNK_LEN,
+                System.arraycopy(retainedBuffer(), pending * CHUNK_LEN,
                         pendingChunk, 0, CHUNK_LEN);
                 chunkChainingValue(pendingChunk, CHUNK_LEN, finalChunkCounter,
                         key, modeFlags, rightCv, words, state);
@@ -591,7 +621,7 @@ public final class FastBlake {
             int lastOffset = chunksBeforeLast * CHUNK_LEN;
             finalChunkLength = vectorPendingLength - lastOffset;
             if (finalChunkLength > 0) {
-                System.arraycopy(vectorPending(), lastOffset, pendingChunk, 0, finalChunkLength);
+                System.arraycopy(retainedBuffer(), lastOffset, pendingChunk, 0, finalChunkLength);
             }
             finalChunk = pendingChunk;
         }
@@ -628,7 +658,11 @@ public final class FastBlake {
         vectorPendingLength = 0;
         chunksCompressed = 0;
         cvStackLength = 0;
-        Arrays.fill(chunk, 0, chunkLengthBeforeReset, (byte) 0);
+        // Retained bytes may live in `chunk` (small inputs) or in the batch
+        // array (once promoted); clear whichever prefix was valid.
+        int chunkValid = Math.max(chunkLengthBeforeReset,
+                vectorPending == null ? pendingLengthBeforeReset : 0);
+        Arrays.fill(chunk, 0, Math.min(chunkValid, chunk.length), (byte) 0);
         if (vectorPending != null) {
             Arrays.fill(vectorPending, 0, pendingLengthBeforeReset, (byte) 0);
         }
