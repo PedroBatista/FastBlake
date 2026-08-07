@@ -232,24 +232,71 @@ What this says about where the work is:
 ### Independent re-measurement: AMD Ryzen 3 3200G
 
 AMD Ryzen 3 3200G (Zen, 4C/4T), Windows 10, Temurin JDK 25.0.4, Commons Codec
-1.22.0. No cargo toolchain on this machine, so `./gradlew contenders` reports
-2 of 4 (`commons`, `java-cpu`; `rust` and `java-gpu` skip with their reasons,
-as designed). Same harness, same protocol: 2 forks × 5×1s warmup + 5×1s
-measurement, single-threaded. `./gradlew test` passes the full official-vector
-suite for both contenders first.
+1.22.0. Same harness, same protocol: 2 forks × 5×1s warmup + 5×1s measurement,
+single-threaded.
 
-Commons vs the FastBlake production scalar kernel:
+This machine had no Rust toolchain at first, so the earliest runs here covered
+only `commons`/`java-cpu` (2 of 4, with `rust` and `java-gpu` reporting why
+they were skipped, exactly as designed) — those numbers are still below,
+unchanged. Rust was then installed via `rustup` (stable,
+`x86_64-pc-windows-msvc`; this machine already had the VS 2022 Build Tools
+Rust needs, so no other install was required) specifically so this machine's
+figures would carry a Rust ceiling like the M5/N97 rows do. `./gradlew
+contenders` now reports 3 of 4, and the full official-vector suite passes all
+542 tests across all three contenders (`./gradlew test --rerun`).
 
-| size | `oneShot` commons | `oneShot` java-cpu | `reusedInstance` commons | `reusedInstance` java-cpu | `streaming4k` commons | `streaming4k` java-cpu |
-|---:|---:|---:|---:|---:|---:|---:|
-| 64 B | 161 | 91 (0.57×) | 141 | 157 (1.11×) | 138 | 156 (1.13×) |
-| 1 KiB | 189 | 283 (1.49×) | 187 | 268 (1.43×) | 175 | 298 (1.70×) |
-| 16 KiB | 155 | 304 (1.96×) | 157 | 304 (1.93×) | 155 | 305 (1.97×) |
-| 256 KiB | 167 | 309 (1.86×) | 156 | 308 (1.97×) | 156 | 310 (1.99×) |
-| 4 MiB | 153 | 310 (2.02×) | 157 | 313 (1.99×) | 165 | 310 (1.87×) |
-| 8 MiB | 166 | 318 (1.92×) | 166 | 310 (1.89×) | 155 | 310 (2.00×) |
+Commons / Rust / the FastBlake production scalar kernel, all three now
+measured together in one session:
 
-Raw JSON: `build/jmh-contenders-ryzen.json`.
+**`oneShot`**:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 165 | 449 (2.73×) | 146 (0.89×) |
+| 1 KiB | 182 | 810 (4.46×) | 321 (1.77×) |
+| 16 KiB | 159 | 2155 (13.55×) | 320 (2.01×) |
+| 256 KiB | 145 | 2183 (15.05×) | 328 (2.26×) |
+| 4 MiB | 135 | 2075 (15.32×) | 328 (2.42×) |
+| 8 MiB | 167 | 2033 (12.15×) | 327 (1.96×) |
+
+**`reusedInstance`**:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 152 | 414 (2.73×) | 170 (1.12×) |
+| 1 KiB | 194 | 827 (4.27×) | 316 (1.63×) |
+| 16 KiB | 163 | 2120 (12.97×) | 327 (2.00×) |
+| 256 KiB | 166 | 2203 (13.26×) | 333 (2.01×) |
+| 4 MiB | 167 | 2048 (12.26×) | 331 (1.98×) |
+| 8 MiB | 163 | 2026 (12.45×) | 331 (2.03×) |
+
+**`streaming4k`**:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 150 | 413 (2.75×) | 168 (1.12×) |
+| 1 KiB | 201 | 807 (4.01×) | 316 (1.57×) |
+| 16 KiB | 167 | 1371 (8.21×) | 330 (1.98×) |
+| 256 KiB | 168 | 1386 (8.25×) | 328 (1.95×) |
+| 4 MiB | 168 | 1312 (7.79×) | 324 (1.92×) |
+| 8 MiB | 165 | 1322 (7.99×) | 330 (1.99×) |
+
+Raw JSON: `build/jmh-contenders-ryzen-full.json` (supersedes the earlier
+2-contender `build/jmh-contenders-ryzen.json`, kept for history). x-factors
+are against `commons`; `java-cpu` here is the production scalar kernel, not
+either opt-in SIMD kernel below.
+
+**Rust vs Commons is far wider on this machine than on either the M5 or the
+N97** — 12.15x at 8 MiB `oneShot`, peaking at 15.32x at 4 MiB, against 4.5x
+(M5) and 7.9x (N97). Both `rust` and `commons` are single-threaded scalar
+executables/JVM code doing the identical work as elsewhere, so this isn't a
+new mechanism, just a data point that the *size* of the Rust ceiling varies
+enormously by machine — a Zen core apparently gives the 8-lane AVX2 SIMD path
+much more room over undualized Commons than either the wide M5 or the narrow
+N97 do. `java-cpu` scalar vs Commons also improved a little on this fresh
+combined run versus the earlier isolated run (1.96x vs the previously
+reported 1.92x at 8 MiB `oneShot`) — within normal run-to-run noise for this
+harness, not a regression signal.
 
 Re-running with the opt-in E011/E014 SIMD kernel
 (`-Dfastblake.experimental.scratchChunkVector=true`) against that same scalar
@@ -264,22 +311,26 @@ column:
 | 4 MiB | 310 | 889 (2.87×) | 313 | 911 (2.91×) | 310 | 845 (2.73×) |
 | 8 MiB | 318 | 888 (2.79×) | 310 | 897 (2.89×) | 310 | 870 (2.81×) |
 
-Raw JSON: `build/jmh-vector-ryzen.json`. Adding this machine to the ledger:
+Raw JSON: `build/jmh-vector-ryzen.json`. Adding this machine to the ledger,
+now with a real Rust ceiling instead of "n/a":
 
 | ratio at 8 MiB | Apple M5 (NEON) | Intel N97 (AVX2) | AMD Ryzen 3 3200G (AVX2) |
 |---|---:|---:|---:|
-| FastBlake scalar vs Commons | 1.61x | 1.20x | 1.92x |
+| FastBlake scalar vs Commons | 1.61x | 1.20x | 1.96x |
 | FastBlake E011 SIMD vs its own scalar | 1.77x | 2.54x | 2.79x |
-| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% | n/a — no cargo here |
-| Rust vs Commons | 4.5x | 7.9x | n/a — no cargo here |
+| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% | **44%** |
+| Rust vs Commons | 4.5x | 7.9x | **12.15x** |
 
-Both headline ratios move further in the same direction the N97 already
-established: a core wider/more OoO than the N97's Gracemont E-cores gives the
-scalar kernel more instruction-level parallelism to exploit (1.92x here vs
-1.20x there), and the hard-coded 128-bit SIMD kernel does correspondingly
-better relative to its own scalar baseline (2.79x here vs 2.54x there) even
-though its lane width is unchanged. Without a Rust build on this machine there
-is no ceiling column to place either number against.
+E011's fraction-of-Rust on this machine (44%) lands close to the N97's 38% and
+well below the M5's 63% — consistent with the standing explanation that E011's
+hard-coded 128-bit species leaves half an AVX2 machine's lane width unused
+while Rust dispatches to the full 8-lane path, on both x86-64 boxes measured
+so far. That the *absolute* Rust ceiling is nearly 3x higher here than on the
+N97 (2033 vs an implied lower N97 figure) while E011's fraction-of-Rust is
+similar says the two machines' `java-cpu` SIMD kernels are closer to each
+other in absolute terms than their Rust ceilings are — i.e. most of this
+machine's outsized Rust/Commons gap is a Commons-side and Rust-side story, not
+something `java-cpu` is failing to capture proportionally more of here.
 
 The SIMD kernel is a **loss** at 64 B and roughly break-even at 1 KiB on this
 machine — 0.42-0.52x and 0.79-1.01x respectively — before crossing over
@@ -336,11 +387,11 @@ an implausible dip at those two cells. Re-running just those cells at 3 forks
 Clean numbers against the E011 single four-chunk kernel and the scalar/Commons
 baselines already measured on this machine, at 8 MiB:
 
-| | commons | scalar (`java-cpu`) | E011 (4-chunk SIMD) | E024 (8-chunk SIMD) |
-|---|---:|---:|---:|---:|
-| `oneShot` | 166 | 318 | 888 | **778 (0.88x of E011)** |
-| `reusedInstance` | 166 | 310 | 897 | **777 (0.87x of E011)** |
-| `streaming4k` | 155 | 310 | 870 | ~300 (unchanged — see below) |
+| | commons | rust | scalar (`java-cpu`) | E011 (4-chunk SIMD) | E024 (8-chunk SIMD) |
+|---|---:|---:|---:|---:|---:|
+| `oneShot` | 166 | 2033 | 318 | 888 (44% of rust) | **778 (38% of rust, 0.88x of E011)** |
+| `reusedInstance` | 166 | 2026 | 310 | 897 (44% of rust) | **777 (38% of rust, 0.87x of E011)** |
+| `streaming4k` | 155 | 1322 | 310 | 870 (66% of rust) | ~300 (unchanged — see below) |
 
 **E024 is about 12-14% slower than E011 here**, not 1.36x faster as on the
 M5 — though it still beats scalar by ~2.4-2.5x and Commons by ~4.7x. This is
@@ -351,7 +402,11 @@ independent chunks raises live vector state accordingly. What is a free
 latency-hiding win on a register-rich core can cost more in spills/pressure
 than it buys in independent work on a narrower one. This machine and the N97
 share that 16-register constraint, so this result is a concrete data point
-for — not a substitute for — running E024 on the N97 itself.
+for — not a substitute for — running E024 on the N97 itself. Against Rust the
+picture is unambiguous either way: on this machine's outsized ~12x Rust
+ceiling, neither opt-in kernel gets past the mid-40s percent on the direct
+path, so E024's loss to E011 here is a real regression, not a rounding
+difference near parity.
 
 `streaming4k` stays at scalar-level throughput (~300 MiB/s) regardless of the
 kernel, because E024 has no streaming-batch integration yet (open item #1 in
