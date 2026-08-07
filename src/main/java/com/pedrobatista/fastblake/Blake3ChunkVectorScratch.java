@@ -31,6 +31,9 @@ final class Blake3ChunkVectorScratch {
 
     private Blake3ChunkVectorScratch() {}
 
+    static int packedWordsLength() { return 64; }
+    static int outputLength() { return 32; }
+
     static void hashChunks(byte[] input, int offset, long firstCounter,
                            int[] key, int flags, int[] messages, int[] output) {
         long counter0 = firstCounter + 0;

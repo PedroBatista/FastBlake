@@ -13,18 +13,18 @@ production classes only; `verifyLibraryJar` checks the generated artifact and
 rejects harness, benchmark, and test-vector entries. `releaseCheck` runs the
 test suite, creates the Maven POM, and performs that jar check.
 
-The current kernel classes are still compiled from `src/main` because
-`FastBlake` retains historical forced-dispatch paths for reproducible
-experiments. They are package-private and are not public API, but this is an
-intermediate state. They must not be referenced by new library API code.
+The measured four- and eight-chunk kernels remain in `src/main`. Historical
+block, preferred-width, heap, low-live, round-cache, wide, parent, and original
+vector kernels are compiled from `src/experiment` and are not included in the
+library jar. They are package-private and are available to JMH through its
+experiment classpath.
 
 ## Extraction target
 
-When the next kernel refactoring starts, add `src/experiment` and
-`src/experimentTest` source sets. Move rejected and diagnostic kernels there,
-along with the `fastblake.experimental.*` switches. Production dispatch should
-retain only the measured scalar, four-chunk, and eight-chunk choices and the
-single diagnostic override `fastblake.kernel=auto|scalar|four|eight`.
+New rejected and diagnostic kernels go into `src/experiment`. Their switches
+must remain in experiment-only runners. Production dispatch retains only the
+measured scalar, four-chunk, and eight-chunk choices and the single diagnostic
+override `fastblake.kernel=auto|scalar|four|eight`.
 
 Experiments should call a package-private kernel contract or a dedicated
 experiment runner. The public `FastBlake` API must not grow experiment classes,

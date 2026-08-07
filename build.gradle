@@ -44,6 +44,8 @@ ext {
 // Source layout
 //
 //   src/main     the implementations under development (Java CPU, later GPU)
+//   src/experiment historical/candidate kernels; compiled for the laboratory,
+//                 never included in the library jar
 //   src/harness  contender adapters + official test vectors, shared by both
 //                consumers below so tests and benchmarks measure the same code
 //   src/test     conformance, run over every available contender
@@ -52,6 +54,11 @@ ext {
 // Only `main` ships. Commons Codec, JMH and the harness never reach the jar.
 // ---------------------------------------------------------------------------
 sourceSets {
+    experiment {
+        java.srcDirs = ['src/experiment/java']
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
     harness {
         java.srcDirs = ['src/harness/java']
         resources.srcDirs = ['src/harness/resources']
@@ -64,9 +71,13 @@ sourceSets {
     }
     jmh {
         java.srcDirs = ['src/jmh/java']
-        compileClasspath += sourceSets.main.output + sourceSets.harness.output
-        runtimeClasspath += sourceSets.main.output + sourceSets.harness.output
+        compileClasspath += sourceSets.main.output + sourceSets.experiment.output + sourceSets.harness.output
+        runtimeClasspath += sourceSets.main.output + sourceSets.experiment.output + sourceSets.harness.output
     }
+}
+
+configurations {
+    experimentImplementation.extendsFrom implementation
 }
 
 configurations {
@@ -418,12 +429,18 @@ tasks.register('verifyLibraryJar') {
                 'com/pedrobatista/fastblake/harness/',
                 'com/pedrobatista/fastblake/bench/'
         ]
+        def archivedKernels = [
+                'Blake3BlockVector', 'Blake3ChunkVector4', 'Blake3ChunkVectorHeap',
+                'Blake3ChunkVectorLowLive', 'Blake3ChunkVectorRoundCache',
+                'Blake3ChunkVectorWide', 'Blake3ParentVector', 'Blake3Vector'
+        ].collect { "com/pedrobatista/fastblake/${it}.class" }
         def forbiddenSuffixes = ['test_vectors.json']
         def leaked = []
         new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
             zip.entries().each { entry ->
                 def name = entry.name
                 if (forbiddenPrefixes.any { name.startsWith(it) }
+                        || archivedKernels.contains(name)
                         || forbiddenSuffixes.any { name.endsWith(it) }) {
                     leaked << name
                 }

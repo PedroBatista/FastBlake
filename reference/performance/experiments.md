@@ -4,6 +4,12 @@ This is the permanent experiment ledger. Add an entry for every performance
 change, including failed ideas. Never replace an old result: later experiments
 may combine details from several attempts.
 
+Historical commands in this file describe the JVM/source layout at the time of
+each experiment. Candidate kernels now live under `src/experiment` and are
+compiled with `./gradlew experimentClasses`; the shipped `FastBlake` class no
+longer interprets `fastblake.experimental.*` properties. New production dispatch
+measurements use `-Dfastblake.kernel=auto|scalar|four|eight`.
+
 ## Measurement protocol
 
 - Correctness gate: `./gradlew test`
@@ -2633,3 +2639,17 @@ smallest possible update through the largest buffer and silently undid it. The
 per-operation allocation gate could never have caught it — allocation stayed at
 zero throughout, because the buffer is allocated once per hasher and then
 retained. Two gates were needed, and now exist.
+
+### E022 result — library/experiment extraction: no M5 regression
+
+Date: 2026-08-07. Environment: **A** (Apple M5).
+
+Historical kernels were moved from `src/main` to `src/experiment`, and the
+production class no longer interprets the old `fastblake.experimental.*`
+switches. The measured production selector still chose `EIGHT_CHUNK`.
+
+The exact two-fork, five-warmup, five-measurement 8 MiB comparison is recorded
+in [`results/e022-library-extraction-m5.md`](results/e022-library-extraction-m5.md).
+FastBlake measured 2,146 / 2,134 / 2,089 MiB/s for one-shot / reused /
+streaming, versus the recorded 2,116 / 2,114 / 2,063 MiB/s. Deltas were +1.4%,
++0.9%, and +1.3%, all inside the 3% margin. Decision: keep the extraction.

@@ -16,6 +16,13 @@ started without `jdk.incubator.vector` falls back to the scalar kernel
 automatically and still produces identical digests. GPU offload remains planned
 work.
 
+The generated library jar contains the public API and measured production
+kernels. Historical and candidate kernels live under `src/experiment` and can
+be compiled with `./gradlew experimentClasses`; JMH receives them on its
+benchmark classpath. The old `fastblake.experimental.*` properties are archived
+experiment records and are no longer interpreted by `FastBlake`. Use
+`-Dfastblake.kernel=auto|scalar|four|eight` for current dispatch experiments.
+
 ```
 ./gradlew contenders   # what can run here, and why anything can't
 ./gradlew test         # conformance: every contender vs. the official vectors

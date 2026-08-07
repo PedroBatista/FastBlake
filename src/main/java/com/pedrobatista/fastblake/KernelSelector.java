@@ -28,10 +28,10 @@ import java.util.Locale;
  *
  * <h2>Overriding</h2>
  *
- * {@code -Dfastblake.kernel=auto|scalar|four|eight} forces a choice, for
- * benchmarking and for embedders who know their fleet. The existing
- * {@code fastblake.experimental.*} properties continue to take precedence over
- * everything, so every recorded experiment stays reproducible.
+ * {@code -Dfastblake.kernel=auto|scalar|four|eight} forces a production choice,
+ * for benchmarking and for embedders who know their fleet. Historical kernel
+ * switches belong to the experiment source set and are intentionally not
+ * interpreted by the shipped library.
  */
 final class KernelSelector {
 
