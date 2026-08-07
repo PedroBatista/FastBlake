@@ -102,9 +102,13 @@ public final class FastBlake {
     // A following byte proves every chunk in this buffer is non-final, at
     // which point the whole batch can be committed without changing BLAKE3's
     // rightmost-chunk/ROOT semantics.
-    private final byte[] vectorPending = USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR
-            ? new byte[4 * CHUNK_LEN] : null;
-    private final int[] cvStack = new int[MAX_DEPTH * 8];
+    // E025 P0a: allocated on first use, not in the constructor. A 64-byte hash
+    // needs none of these, and eagerly allocating them cost 3.4 KB per hasher
+    // -- 53 bytes of garbage per input byte at that size, against 0.0007 at
+    // 8 MiB. Steady-state large-input behaviour is unchanged: these are
+    // allocated exactly once per hasher, on the first call that needs them.
+    private byte[] vectorPending;
+    private int[] cvStack;
 
     // Scratch used only by mutating update/reset operations. Finalization owns
     // separate scratch so it cannot consume or perturb the hasher state.
@@ -114,14 +118,51 @@ public final class FastBlake {
     // Sized for the widest kernel any enabled property can select. Blake3Vector
     // and Blake3ChunkVectorWide both scale with the preferred species, so this
     // already covers the four-lane kernels on a wider machine.
-    private final int[] vectorPacked = ANY_VECTOR_KERNEL
-            ? new int[Math.max(Blake3ChunkVectorDual.packedWordsLength(),
+    private int[] vectorPacked;
+    private int[] vectorCvs;
+
+    /** The chaining-value stack, allocated when the input first exceeds one chunk. */
+    private int[] cvStack() {
+        int[] stack = cvStack;
+        if (stack == null) {
+            stack = cvStack = new int[MAX_DEPTH * 8];
+        }
+        return stack;
+    }
+
+    /** Transposed message scratch, allocated when a vector kernel first runs. */
+    private int[] vectorPacked() {
+        int[] packed = vectorPacked;
+        if (packed == null) {
+            // Sized for the widest kernel any enabled property can select.
+            packed = vectorPacked = new int[Math.max(
+                    Blake3ChunkVectorDual.packedWordsLength(),
                     Math.max(Blake3Vector.packedWordsLength(),
-                    Blake3ChunkVectorWide.packedWordsLength()))] : null;
-    private final int[] vectorCvs = ANY_VECTOR_KERNEL
-            ? new int[Math.max(Blake3ChunkVectorDual.outputLength(),
+                            Blake3ChunkVectorWide.packedWordsLength()))];
+        }
+        return packed;
+    }
+
+    /** Per-batch chaining values, allocated when a vector kernel first runs. */
+    private int[] vectorCvs() {
+        int[] cvs = vectorCvs;
+        if (cvs == null) {
+            cvs = vectorCvs = new int[Math.max(
+                    Blake3ChunkVectorDual.outputLength(),
                     Math.max(Blake3Vector.outputLength(),
-                    Blake3ChunkVectorWide.outputLength()))] : null;
+                            Blake3ChunkVectorWide.outputLength()))];
+        }
+        return cvs;
+    }
+
+    /** The retained streaming batch, allocated on the first streaming update. */
+    private byte[] vectorPending() {
+        byte[] pending = vectorPending;
+        if (pending == null) {
+            pending = vectorPending = new byte[4 * CHUNK_LEN];
+        }
+        return pending;
+    }
 
     private int chunkLength;
     private int vectorPendingLength;
@@ -207,7 +248,7 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_WIDE_CHUNK_VECTOR && chunkLength == 0
                     && remaining > Blake3ChunkVectorWide.LANES * CHUNK_LEN) {
                 Blake3ChunkVectorWide.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(Blake3ChunkVectorWide.LANES);
                 position += Blake3ChunkVectorWide.LANES * CHUNK_LEN;
                 remaining -= Blake3ChunkVectorWide.LANES * CHUNK_LEN;
@@ -217,7 +258,7 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_DUAL_CHUNK_VECTOR && chunkLength == 0
                     && remaining > 8 * CHUNK_LEN) {
                 Blake3ChunkVectorDual.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(8);
                 position += 8 * CHUNK_LEN;
                 remaining -= 8 * CHUNK_LEN;
@@ -227,7 +268,7 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(4);
                 position += 4 * CHUNK_LEN;
                 remaining -= 4 * CHUNK_LEN;
@@ -237,9 +278,9 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_HEAP_CHUNK_VECTOR && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVectorHeap.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                     chunksCompressed++;
                     pushChunkCv(scratchCv, chunksCompressed);
                 }
@@ -251,9 +292,9 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_ROUND_CACHE_VECTOR && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVectorRoundCache.hashChunks(inputSegment, position,
-                        chunksCompressed, key, modeFlags, vectorPacked, vectorCvs);
+                        chunksCompressed, key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                     chunksCompressed++;
                     pushChunkCv(scratchCv, chunksCompressed);
                 }
@@ -265,9 +306,9 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_LOW_LIVE_VECTOR && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVectorLowLive.hashChunks(inputSegment, position,
-                        chunksCompressed, key, modeFlags, vectorPacked, vectorCvs);
+                        chunksCompressed, key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                     chunksCompressed++;
                     pushChunkCv(scratchCv, chunksCompressed);
                 }
@@ -279,9 +320,9 @@ public final class FastBlake {
             if (USE_EXPERIMENTAL_CHUNK_VECTOR4 && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
                 Blake3ChunkVector4.hashChunks(inputSegment, position,
-                        chunksCompressed, key, modeFlags, vectorPacked, vectorCvs);
+                        chunksCompressed, key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                     chunksCompressed++;
                     pushChunkCv(scratchCv, chunksCompressed);
                 }
@@ -294,9 +335,9 @@ public final class FastBlake {
                     && remaining > Blake3Vector.lanes() * CHUNK_LEN) {
                 int vectorBytes = Blake3Vector.lanes() * CHUNK_LEN;
                 Blake3Vector.hashChunks(input, position, chunksCompressed, key,
-                        modeFlags, vectorPacked, vectorCvs);
+                        modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < Blake3Vector.lanes(); lane++) {
-                    System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                    System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                     chunksCompressed++;
                     pushChunkCv(scratchCv, chunksCompressed);
                 }
@@ -321,15 +362,15 @@ public final class FastBlake {
         int batchBytes = 4 * CHUNK_LEN;
         while (remaining > 0) {
             if (vectorPendingLength == batchBytes) {
-                Blake3ChunkVectorScratch.hashChunks(vectorPending, 0, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                Blake3ChunkVectorScratch.hashChunks(vectorPending(), 0, chunksCompressed,
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(4);
                 vectorPendingLength = 0;
             }
 
             if (vectorPendingLength == 0 && remaining > batchBytes) {
                 Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
-                        key, modeFlags, vectorPacked, vectorCvs);
+                        key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(4);
                 position += batchBytes;
                 remaining -= batchBytes;
@@ -337,7 +378,7 @@ public final class FastBlake {
             }
 
             int take = Math.min(remaining, batchBytes - vectorPendingLength);
-            System.arraycopy(input, position, vectorPending, vectorPendingLength, take);
+            System.arraycopy(input, position, vectorPending(), vectorPendingLength, take);
             vectorPendingLength += take;
             position += take;
             remaining -= take;
@@ -365,12 +406,12 @@ public final class FastBlake {
         int finalStackLength = cvStackLength;
 
         if (USE_EXPERIMENTAL_SCRATCH_CHUNK_VECTOR) {
-            finalStack = Arrays.copyOf(cvStack, cvStack.length);
+            finalStack = Arrays.copyOf(cvStack(), cvStack().length);
             byte[] pendingChunk = new byte[CHUNK_LEN];
             int chunksBeforeLast = vectorPendingLength == 0
                     ? 0 : (vectorPendingLength - 1) / CHUNK_LEN;
             for (int pending = 0; pending < chunksBeforeLast; pending++) {
-                System.arraycopy(vectorPending, pending * CHUNK_LEN,
+                System.arraycopy(vectorPending(), pending * CHUNK_LEN,
                         pendingChunk, 0, CHUNK_LEN);
                 chunkChainingValue(pendingChunk, CHUNK_LEN, finalChunkCounter,
                         key, modeFlags, rightCv, words, state);
@@ -381,7 +422,7 @@ public final class FastBlake {
             int lastOffset = chunksBeforeLast * CHUNK_LEN;
             finalChunkLength = vectorPendingLength - lastOffset;
             if (finalChunkLength > 0) {
-                System.arraycopy(vectorPending, lastOffset, pendingChunk, 0, finalChunkLength);
+                System.arraycopy(vectorPending(), lastOffset, pendingChunk, 0, finalChunkLength);
             }
             finalChunk = pendingChunk;
         }
@@ -442,11 +483,11 @@ public final class FastBlake {
         long count = totalChunks;
         while ((count & 1) == 0) {
             int leftOffset = --cvStackLength * 8;
-            parentCv(cvStack, leftOffset, scratchCv, key, modeFlags,
+            parentCv(cvStack(), leftOffset, scratchCv, key, modeFlags,
                     scratchCv, scratchWords, scratchState);
             count >>>= 1;
         }
-        System.arraycopy(scratchCv, 0, cvStack, cvStackLength * 8, 8);
+        System.arraycopy(scratchCv, 0, cvStack(), cvStackLength * 8, 8);
         cvStackLength++;
     }
 
@@ -459,7 +500,7 @@ public final class FastBlake {
                 || (firstChunk & (count - 1)) != 0
                 || count / 2 > Blake3ParentVector.LANES) {
             for (int lane = 0; lane < count; lane++) {
-                System.arraycopy(vectorCvs, lane * 8, scratchCv, 0, 8);
+                System.arraycopy(vectorCvs(), lane * 8, scratchCv, 0, 8);
                 chunksCompressed++;
                 pushChunkCv(scratchCv, chunksCompressed);
             }

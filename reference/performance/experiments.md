@@ -1988,3 +1988,208 @@ E021 and E022 all optimised the wrong quantity; E023 identified it and E024 is
 the first experiment since E014 to move the number.
 
 Artifacts: `build/e024-m5-dual-hashchunks.log`.
+
+## E025 plan — capability dispatch and the re-ranked priorities
+
+Date: 2026-08-07
+Status: plan. P0 in progress; P1-P3 not started.
+
+E024 is the first optimisation whose *sign* depends on the machine: +36% on
+Apple M5, -12 to -14% on a Ryzen 3200G. That is not a defect in the kernel and
+must not be resolved by dropping it. The reference Rust crate carries separate
+SSE2/SSE4.1/AVX2/AVX-512/NEON implementations and dispatches at runtime, and
+that is a large part of why it is the ceiling in this ladder. FastBlake needs
+the same structure.
+
+At the same time the 2-fork long run exposed that the largest remaining gaps
+are no longer in compression at all. This entry records both, because they are
+one design: the dispatch ladder and the size ladder are the same decision.
+
+### What the M5/Zen+ split actually says
+
+The goal E024 established is **eight chunks in flight**, not any particular
+kernel. The mechanism that achieves it differs by register file:
+
+| target | vector registers | 8-in-flight mechanism | state vectors | fit |
+|---|---:|---|---:|---|
+| AArch64 NEON | 32 x 128-bit | 2 interleaved 4-lane batches (E024) | 32 | 32/32, 30 spill instrs, wins |
+| x86-64 AVX2 | 16 x 256-bit | 8 lanes wide (E013) | 16 | 16/16, untested at this goal |
+| x86-64 AVX2 | 16 x 128-bit | 2 interleaved 4-lane batches (E024) | 32 | **32/16, spills, loses** |
+
+Dual-on-NEON and wide-on-AVX2 are register-equivalent: 32 state vectors into 32
+registers, 16 into 16. E013 and E020 rejected the wide kernel, but against the
+*four*-chunk kernel and before eight-in-flight was known to be the objective.
+**Retesting wide against E024 and E011 on the Zen+ machine is the first
+experiment this plan calls for**, and it is a genuine prediction, not a
+rationalisation: if the register-file model is right, wide should win there.
+
+Zen+ adds a wrinkle worth measuring rather than assuming. Zen and Zen+ execute
+256-bit AVX2 operations as two 128-bit micro-operations, so the wide kernel may
+gain no throughput from width itself while still halving instruction count and,
+more importantly, fitting the register file. Whether that nets out positive is
+exactly the kind of thing this project measures instead of predicting.
+
+### P3 — the capability database
+
+Data collection is a separate research task, owned by the project maintainer:
+vector register counts, datapath widths, and micro-op splitting behaviour per
+microarchitecture, from vendor documentation. This entry specifies only the
+*mechanism* that consumes it, so the data can land without redesign.
+
+What the JVM actually exposes is thin: `os.arch` and
+`IntVector.SPECIES_PREFERRED.vectorBitSize()`. Register count is not available
+through any API and must be derived from architecture plus width.
+
+```
+CpuCapabilities   arch, preferred vector bits, derived register count/width
+KernelSelector    (capabilities, remaining bytes, pending batch) -> kernel
+```
+
+Three rules keep the table honest:
+
+1. **Every entry cites a ledger experiment.** An unmeasured (arch, width) pair
+   selects the most conservative *measured-good* kernel, currently the
+   four-chunk E011 kernel, never an extrapolation. Unknown hardware produces a
+   task, not a gamble.
+2. **`-Dfastblake.kernel=` overrides selection** for benchmarking and for
+   embedders who know their fleet. `./gradlew contenders` prints the selected
+   kernel and the reason it was selected.
+3. **`./gradlew dispatchAudit` runs every available kernel on the current
+   machine and reports whether the selector's choice actually won.** This turns
+   the table from an assumption into a testable claim and is what keeps it
+   correct as JDKs change: E024 already showed a ~15% swing between Temurin 25
+   and a locally built JDK 28 on identical code.
+
+Conformance requirement: every kernel reachable through the selector runs the
+full official-vector suite, not only the default one.
+
+### The re-ranked priorities
+
+The 2-fork long run (Results table in README.md) puts one-shot at 8 MiB within
+14% of Rust while streaming is 61% behind and 64-byte one-shot is *behind
+Commons*. Compression is no longer where the gap lives.
+
+| rank | target | current (M5) | expected | rationale |
+|---|---|---|---|---|
+| **P0** | small-input one-shot | 199 MiB/s, 0.38x Commons | ~500, >= Commons | shipping worse than the baseline it exists to beat |
+| **P1** | streaming batching for E024 | 916 MiB/s, 39% of Rust | ~2000 | E016's mechanism, already proven at four chunks |
+| **P2** | size ladder | 16 KiB at 59% of peak | ~1800 | all-or-nothing dispatch wastes the mid range |
+| **P3** | capability dispatch | opt-in only | default-on | makes P0-P2 reach users |
+
+P1, P2 and P3 are one design. The ladder *is* the dispatch: each call selects on
+`(capabilities, remaining bytes, pending batch state)`. Implementing them
+separately would build the same decision three times.
+
+### P0 — the small-input regression
+
+Measured root cause, M5, 64-byte input, isolated JVM:
+
+| | time | allocated |
+|---|---:|---:|
+| one-shot, scalar default | 368.0 ns | **3,400 B/op** |
+| one-shot, dual kernel enabled | 360.9 ns | **4,200 B/op** |
+| reused instance | 122.5 ns | 288 B/op |
+
+Hashing 64 bytes allocates 3.4 KB: **53 bytes of garbage per input byte**, 66
+with a vector kernel enabled. Construction is 245 ns of the 368 ns total, 67%.
+The reused-instance figure of 498 MiB/s proves compression is not the problem.
+
+Eagerly allocated per hasher, whatever the input size:
+
+| field | bytes | needed when |
+|---|---:|---|
+| `cvStack` (`int[432]`) | ~1,744 | input exceeds one chunk |
+| `chunk` (`byte[1024]`) | ~1,040 | always, but avoidable for one-shot |
+| `vectorPacked` + `vectorCvs` | ~800 | a vector kernel actually runs |
+| `vectorPending` (`byte[4096]`) | ~4,112 | streaming, scratch kernel only |
+| `scratchState/Words/Cv`, `key` | ~256 | always |
+
+**This is a gap in the allocation gate, not just in the code.** The gate has
+been mandatory since E010 but has only ever been run at 8 MiB, where fixed
+setup divides away to 0.0007 B per input byte. The same code is at 53 B per
+input byte at 64 bytes. A gate that only samples the size at which it cannot
+fail is not a gate. Amend the protocol: **run the allocation gate at 64 B and
+1 KiB as well as 8 MiB.**
+
+P0 is two independent changes, measured separately per the one-idea-at-a-time
+rule:
+
+* **P0a — lazy allocation.** Allocate `cvStack`, the vector scratch and
+  `vectorPending` on first use rather than in the constructor. Contained, and
+  it benefits every call shape that constructs a hasher.
+* **P0b — dedicated single-chunk path.** For inputs of at most 1024 bytes there
+  is no tree, no CV stack and no vector batch: compress the blocks and finalize.
+  Guide section 17.1; Blake3.NET does exactly this. Note the benchmark's
+  `oneShot` reaches FastBlake through `newHasher()`, not the static
+  `FastBlake.hash`, so P0b only shows up in the measured number if the harness
+  path benefits too.
+
+Gates for both: full official-vector conformance; the allocation gate at 64 B,
+1 KiB and 8 MiB; and paired throughput at 64 B and 8 MiB to prove no regression
+at size.
+
+### E025 P0a result — lazy allocation: 2.05x at 64 bytes
+
+Date: 2026-08-07
+Environment: **A** (Apple M5). JMH figures are the project toolchain (Temurin
+25); allocation figures are the custom JDK 28 driver.
+
+Change: `cvStack`, `vectorPacked`, `vectorCvs` and `vectorPending` move from
+constructor-time initialisation to allocation on first use, behind private
+accessors. No algorithm, kernel, or dispatch change.
+
+**Conformance**: 542 tests, run four times — default dispatch and each of
+`scratchChunkVector`, `dualChunkVector`, `wideChunkVector` forced. All pass.
+Every kernel path was re-checked because lazy allocation changes when the
+scratch arrays come into existence on all of them.
+
+**Allocation gate**, now run at the three sizes the protocol amendment
+requires:
+
+| 64-byte one-shot | before | after |
+|---|---:|---:|
+| scalar default | 3,400 B/op | **1,656 B/op** |
+| dual kernel enabled | 4,200 B/op | **1,656 B/op** |
+| time | 368.0 ns | **184.6 ns** |
+
+At 8 MiB, allocation remains 0.00 B per input byte on both paths, and
+throughput is unchanged: 2395.6 MiB/s dual, 869.8 MiB/s scalar in the same
+driver. Enabling a vector kernel no longer costs anything at small sizes — the
+0.8 KB of vector scratch was previously allocated even when the input could
+never reach a vector kernel, and the two configurations now allocate
+identically.
+
+**Throughput**, JMH, `oneShot`, 2 forks x 5 warmup x 5 measurement:
+
+| size | commons | java-cpu before | java-cpu after |
+|---|---:|---:|---:|
+| 64 B | 530 | 199 (0.38x) | **408 (0.77x)** |
+| 1 KiB | 567 | 850 (1.52x) | 903 (1.59x) |
+| 8 MiB | 549 | 2148 (3.92x) | 2147 (3.91x) |
+
+**2.05x at 64 bytes, no measurable change at 8 MiB.**
+
+Decision: keep. This is a strict improvement with no size regression and no
+behavioural change.
+
+**P0 is not finished.** At 0.77x Commons the 64-byte one-shot is still slower
+than the baseline FastBlake exists to beat, so P0b remains open. The remaining
+1,656 B/op is now dominated by:
+
+| remaining allocation | bytes |
+|---|---:|
+| `chunk` (`byte[1024]`) | ~1,040 |
+| `doFinalize` temporaries (`state`, `words`, `rightCv`) | ~208 |
+| `scratchState`/`scratchWords`/`scratchCv` | ~208 |
+| `key`, object header | ~112 |
+
+P0b's single-chunk path addresses the largest of these directly: for inputs of
+at most one chunk there is no reason to copy into `chunk` at all, and no reason
+to build tree scratch. The `doFinalize` temporaries are a separate, smaller,
+independently measurable change and should not be bundled with it.
+
+Comment: this also closes the protocol gap the plan identified. The allocation
+gate had been mandatory since E010 but only ever run at 8 MiB, where 3.4 KB of
+fixed setup divides away to 0.0007 B per input byte and cannot fail. The same
+code was at 53 B per input byte at 64 bytes for fifteen experiments without
+anyone seeing it.
