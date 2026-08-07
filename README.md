@@ -2,18 +2,19 @@
 
 A pure-JVM BLAKE3 implementation, optimised for throughput.
 
-Status: **CPU implementation and comparison harness complete; SIMD kernels
-validated on two architectures and awaiting streaming support before
-promotion.** FastBlake implements the full BLAKE3 API in dependency-free Java.
-The allocation-free scalar kernel is the production default and the correctness
-baseline. Two opt-in chunk-parallel Vector API kernels sit above it: a
-four-chunk kernel, and an eight-chunk interleaved one that reaches **2140 MiB/s
-one-shot at 8 MiB on the Apple M5 — 85.4% of the reference Rust crate** and
-3.8× Commons Codec. FastBlake now matches or beats Commons Codec at every
-measured size, including the 64-byte one-shot that E025 P0 lifted from 0.38× to
-1.01×. Both stay opt-in because 4 KiB streaming updates still
-fall back to scalar, and because the eight-chunk kernel has not yet been
-validated on x86-64. GPU offload remains planned work.
+Status: **CPU implementation, comparison harness, and capability-based kernel
+dispatch complete.** FastBlake implements the full BLAKE3 API in
+dependency-free Java. A chunk-parallel Vector API kernel is now selected
+automatically from the machine's capabilities rather than being opt-in: on
+Apple M5 that is an eight-chunk interleaved kernel reaching **2135 MiB/s
+one-shot at 8 MiB — 85% of the reference Rust crate** and 3.8× Commons Codec,
+while x86-64 gets the four-chunk kernel, which measured faster there. All three
+call shapes have converged — 4 KiB streaming updates now run at 2094 MiB/s,
+within 3% of one-shot, where before E025 they fell back to scalar at 911.
+FastBlake matches or beats Commons Codec at every measured size and shape. A JVM
+started without `jdk.incubator.vector` falls back to the scalar kernel
+automatically and still produces identical digests. GPU offload remains planned
+work.
 
 ```
 ./gradlew contenders   # what can run here, and why anything can't
@@ -27,7 +28,7 @@ validated on x86-64. GPU offload remains planned work.
 |---|---|---|
 | `commons` | Apache Commons Codec `Blake3`, scalar Java | The floor. Always available. |
 | `rust` | Reference [`blake3`][crate] crate via FFM, SIMD, single-threaded | The ceiling. Optional. |
-| `java-cpu` | FastBlake CPU — allocation-free scalar Java, plus opt-in chunk-parallel Vector API kernels | Implemented and always available. |
+| `java-cpu` | FastBlake CPU — allocation-free scalar Java plus capability-selected chunk-parallel Vector API kernels | Implemented and always available. |
 | `java-gpu` | FastBlake GPU — device offload | **Planned.** |
 
 Everything is measured through one interface, `Blake3Engine`, so all four face
@@ -606,8 +607,9 @@ official-vector suite, and the allocation gate at 0.00 B per input byte —
 doubling the round body did not cross the escape-analysis cliff. At 8 MiB it
 measures **2149 MiB/s one-shot and reused, 1.36× the four-chunk kernel and 85.6%
 of Rust**, up from 63%; the 2-fork long run in the Results table above confirms
-this at 2148 one-shot and 2149 reused; the later post-E025 sweep in the
-Results table measures 2140 and 2141, or 85.4% of Rust. Enable with
+this at 2148 one-shot and 2149 reused; the final post-E025 sweep in the Results
+table measures 2135 one-shot and 2159 reused, or 85% of Rust, and selects this
+kernel automatically on AArch64. Forcing it explicitly still works with
 `-Dfastblake.experimental.dualChunkVector=true`.
 
 The generated code is the interesting part: the dual kernel executes **8.8% more

@@ -22,6 +22,14 @@ may combine details from several attempts.
 - Compare on the same machine and JVM. Thermal state and background load can
   move short runs, so treat differences below roughly 3% as inconclusive until
   confirmed by a longer run.
+- Corroboration gate (mandatory, added by E026): **a single cell in a sweep is
+  not evidence for a mechanism.** Before explaining any surprising number,
+  reproduce it in an isolated run of that one case. Sweeps on unpinned machines
+  produce outliers large enough to look like findings — E024 saw 11x and 14x
+  single-iteration spikes on the Ryzen, and E026 found two cells wrong by 25%
+  in a clean 2-fork x 5x5 M5 sweep. Both were mistaken for regressions.
+  `./gradlew dispatchAudit -PauditShape=<shape> -PauditSize=<bytes>` exists for
+  exactly this check.
 - Record the correctness result, decision, and explanation with every entry.
 
 ## Environment
@@ -2434,3 +2442,64 @@ average gain and the mechanism would have stayed hidden.
 Remaining in E025: nothing. P0, P1, P2, P2b and P3 are complete. The README's
 per-size tables predate P1 and now understate `java-cpu` badly in the streaming
 column; they need a fresh full sweep before publication.
+
+
+## E026 — two bad cells, a fabricated mechanism, and two harness bugs
+
+Date: 2026-08-07
+Environment: **A** (Apple M5).
+
+Type: protocol note. No production behaviour changed.
+
+The final E025 sweep reported `java-cpu` at 64 bytes as 368 MiB/s on
+`reusedInstance` and 363 on `streaming4k` — 0.80x and 0.86x Commons, against
+498 and 495 in the previous sweep. That reads as a clear regression, and there
+was a ready mechanism for it: E025 P3 had just made the SIMD kernel the default,
+so every `update()` call now routes through the streaming batch buffer, which is
+the wrong path for 64 bytes. The explanation was written up in the README as a
+known regression, complete with a proposed fix.
+
+**It was wrong. There is no regression.** `dispatchAudit` at 64 bytes:
+
+| shape | scalar | four | eight (selected) |
+|---|---:|---:|---:|
+| `reusedInstance` | 471 | 484 | 483 |
+| `streaming4k` | 481 | 479 | 475 |
+
+All three kernels are within about 2% of each other. The default costs nothing at
+64 bytes. The sweep produced two bad cells and a plausible mechanism was
+reasoned backwards from them.
+
+There had also been a contradicting measurement in hand and it was not chased: a
+standalone driver had measured the same configuration at 483 MiB/s — matching
+the audit exactly — while the sweep said 368. That discrepancy was noted at the
+time and treated as harness difference rather than as a reason to re-measure
+before drawing a conclusion.
+
+Corrections: the README cells now carry the audited values with a dagger
+footnote stating what the sweep reported, that the audit contradicted it, and
+the command to reproduce. The bad values are named rather than silently
+overwritten, because "a sweep can produce a 25%-wrong cell" is information a
+reader needs when weighing every other number in the same table.
+
+### Two harness bugs found while investigating
+
+**`dispatchAudit` cached its own verdict.** It declared `outputs.file(...)` with
+no meaningful inputs, so Gradle marked it UP-TO-DATE and it silently did nothing
+on invocation. A measurement task can never be up to date: its answer depends on
+the machine, the JDK and thermal state, none of which Gradle can observe. Fixed
+with `outputs.upToDateWhen { false }`.
+
+**`dispatchAudit` reported MISMATCH on a 0.2% difference.** The protocol treats
+anything under roughly 3% as inconclusive, so the audit was escalating
+run-to-run noise into a verdict that the dispatch table was wrong. A tool that
+reports a mismatch on every run is one nobody reads. It now reports OK inside
+the band and escalates only above 3%.
+
+Both are the same failure as the one they were investigating: a check that
+cannot fail, and a check that always fails, are equally uninformative.
+
+Rule learned: recorded above as the corroboration gate in the measurement
+protocol. A surprising cell earns an isolated re-measurement before it earns an
+explanation. The cost asymmetry is stark — the audit runs in about a minute,
+while the wrong explanation reached a committed document.
