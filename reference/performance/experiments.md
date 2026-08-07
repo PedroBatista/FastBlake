@@ -2653,3 +2653,15 @@ in [`results/e022-library-extraction-m5.md`](results/e022-library-extraction-m5.
 FastBlake measured 2,146 / 2,134 / 2,089 MiB/s for one-shot / reused /
 streaming, versus the recorded 2,116 / 2,114 / 2,063 MiB/s. Deltas were +1.4%,
 +0.9%, and +1.3%, all inside the 3% margin. Decision: keep the extraction.
+
+### E023 result — Commons-compatible API additions: no M5 regression
+
+Date: 2026-08-07. Environment: **A** (Apple M5).
+
+Added `keyedHash(byte[], byte[])` and Commons-compatible
+`doFinalize(byte[])`, including its variable-length XOF behavior. The exact
+8 MiB comparison is recorded in
+[`results/e023-api-compatibility-m5.md`](results/e023-api-compatibility-m5.md).
+FastBlake measured 2,137 / 2,141 / 2,083 MiB/s for one-shot / reused /
+streaming, versus 2,116 / 2,114 / 2,063 MiB/s in the recorded baseline. Deltas
+were +1.0%, +1.3%, and +1.0%, inside the 3% margin. Decision: keep.
