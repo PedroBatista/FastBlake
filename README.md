@@ -135,61 +135,86 @@ Apple M5 (10 core), Temurin JDK 25.0.4, Commons Codec 1.22.0, `blake3` crate
 1.8.5. 2 forks × 5 warmup × 5×1s measurement iterations, single-threaded, all
 three contenders measured in one session. MiB/s, higher is better; x-factor
 against the `commons` baseline. `java-cpu` is FastBlake with the E024
-eight-chunk kernel enabled (`-Dfastblake.experimental.dualChunkVector=true`),
-measured after E025 P0. Every contender is reached through its own best
+measured after E025 completed. **This is the shipped default**: no property is
+set, and `java-cpu` is whatever E025 P3's capability dispatch selects — on this
+machine the eight-chunk kernel. Every contender is reached through its own best
 one-shot entry point in the `oneShot` shape.
 
 **`oneShot`** — fresh hasher per buffer:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 524 | 828 (1.58×) | 527 (1.01×) |
-| 1 KiB | 561 | 1309 (2.34×) | 942 (1.68×) |
-| 16 KiB | 556 | 2481 (4.46×) | 1268 (2.28×) |
-| 256 KiB | 559 | 2506 (4.48×) | 2057 (3.68×) |
-| 4 MiB | 557 | 2505 (4.50×) | 2146 (3.85×) |
-| 8 MiB | 557 | 2507 (4.50×) | 2140 (3.84×) |
+| 64 B | 525 | 835 (1.59×) | 536 (1.02×) |
+| 1 KiB | 568 | 1311 (2.31×) | 940 (1.66×) |
+| 16 KiB | 554 | 2480 (4.47×) | 1510 (2.72×) |
+| 256 KiB | 561 | 2506 (4.47×) | 2088 (3.72×) |
+| 4 MiB | 559 | 2501 (4.48×) | 2140 (3.83×) |
+| 8 MiB | 560 | 2505 (4.48×) | 2135 (3.81×) |
 
 **`reusedInstance`** — `reset()` reuse:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 458 | 871 (1.90×) | 498 (1.09×) |
-| 1 KiB | 566 | 1312 (2.32×) | 922 (1.63×) |
-| 16 KiB | 555 | 2479 (4.47×) | 1283 (2.31×) |
-| 256 KiB | 548 | 2496 (4.56×) | 2077 (3.79×) |
-| 4 MiB | 549 | 2499 (4.56×) | 2087 (3.80×) |
-| 8 MiB | 548 | 2501 (4.56×) | 2141 (3.91×) |
+| 64 B | 460 | 877 (1.91×) | **368 (0.80×)** |
+| 1 KiB | 571 | 1317 (2.31×) | 929 (1.63×) |
+| 16 KiB | 557 | 2492 (4.47×) | 1531 (2.75×) |
+| 256 KiB | 562 | 2511 (4.46×) | 2109 (3.75×) |
+| 4 MiB | 550 | 2516 (4.58×) | 2149 (3.91×) |
+| 8 MiB | 550 | 2520 (4.59×) | 2159 (3.93×) |
 
 **`streaming4k`** — 4 KiB incremental updates:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 472 | 847 (1.79×) | 495 (1.05×) |
-| 1 KiB | 568 | 1301 (2.29×) | 919 (1.62×) |
-| 16 KiB | 551 | 2359 (4.28×) | 909 (1.65×) |
-| 256 KiB | 544 | 2351 (4.32×) | 909 (1.67×) |
-| 4 MiB | 544 | 2344 (4.30×) | 912 (1.67×) |
-| 8 MiB | 545 | 2340 (4.29×) | 911 (1.67×) |
+| 64 B | 421 | 848 (2.01×) | **363 (0.86×)** |
+| 1 KiB | 508 | 1303 (2.57×) | 921 (1.81×) |
+| 16 KiB | 483 | 2370 (4.90×) | 1509 (3.12×) |
+| 256 KiB | 481 | 2368 (4.92×) | 2050 (4.26×) |
+| 4 MiB | 495 | 2348 (4.74×) | 2102 (4.25×) |
+| 8 MiB | 497 | 2364 (4.76×) | 2094 (4.21×) |
 
 Three things this exposes that the 8 MiB headline hides:
 
-- **The eight-chunk kernel needs 8 KiB before it engages at all**, so 16 KiB
-  reaches only 1268 MiB/s — 59% of its 8 MiB rate — and does not saturate until
-  256 KiB. Rust saturates by 16 KiB. Widening the useful range downward is a
-  dispatch problem (fall back to the four-chunk kernel, then scalar), not a
-  kernel problem. This is now the largest structural gap after streaming.
-- **Streaming is flat at ~910 MiB/s from 16 KiB up**, against 2140 one-shot.
-  The SIMD kernels are simply not reachable from the 4 KiB update path, so
-  streaming is 39% of Rust where one-shot is 85%.
-- **The 64-byte one-shot was the worst number in the project and is now the
-  least interesting one.** It measured 199 MiB/s, 0.38× Commons, before E025 P0
-  removed the eager per-hasher buffers and added a single-chunk path that hashes
-  straight from the caller's array. It is now 527, or 1.01× Commons, having gone
-  from 3,400 to 256 bytes allocated per 64-byte hash. The remaining gap there is
-  to Rust, not to the baseline.
+- **The three call shapes have converged.** Before E025, streaming ran at
+  911 MiB/s against 2140 one-shot at 8 MiB — the SIMD kernel was simply not
+  reachable from a 4 KiB update path. P1 gave the eight-chunk kernel the same
+  retained-batch treatment E016 gave the four-chunk one, and P2/P2b added a
+  four-chunk rung to both the update loop and the finalization drain. Streaming
+  is now within 3% of one-shot at every size from 16 KiB up, and at 8 MiB it is
+  85% of Rust where it used to be 39%.
+- **Mid-sized inputs still lag.** 16 KiB reaches 1510 MiB/s, 71% of the 8 MiB
+  rate, where Rust is already saturated by 16 KiB. The eight-chunk kernel needs
+  8 KiB of input before it engages at all, and the rungs beneath it are coarse.
+  This is now the largest structural gap.
+- **`java-cpu` is slower than Commons at 64 bytes in two of three shapes** —
+  0.80× on `reusedInstance` and 0.86× on `streaming4k`. This is a *regression
+  introduced by E025 P3*: making SIMD the default routes every `update()` call
+  through the streaming batch buffer, which is the wrong path for 64 bytes.
+  The `oneShot` shape is unaffected at 1.02× because P0b's single-chunk path
+  bypasses the hasher entirely. Before P3 made the kernel automatic, these cells
+  read 498 and 495. See "Known regression" below.
+- **The 64-byte one-shot was the worst number in the project and is now fine.**
+  It measured 199 MiB/s, 0.38× Commons, before E025 P0 removed the eager
+  per-hasher buffers and added a single-chunk path that hashes straight from the
+  caller's array. It is now 536, or 1.02× Commons, having gone from 3,400 to
+  256 bytes allocated per 64-byte hash.
 
-Raw JSON: `build/jmh-e025-long.json`. Re-measure on your own machine before
+#### Known regression: small inputs on the incremental API
+
+E025 P3 turned the eight-chunk SIMD kernel on by default, which is a large win
+almost everywhere — but `update()` now always routes through the streaming batch
+path, and for a 64-byte hash that path is pure overhead. The two incremental
+shapes lost about a quarter of their small-input throughput, from ~495 to ~365
+MiB/s, and now sit below Commons Codec.
+
+The trade is real and lopsided in favour of the default: +130% on 8 MiB
+streaming against −26% at 64 bytes. But "slower than the baseline we exist to
+beat" is the exact failure P0 was written to remove, and it should not be
+reintroduced by a dispatch decision. The fix is the same ladder taken one rung
+further down — route inputs below one chunk away from the batch buffer
+entirely, as `oneShot` already does. Tracked as the first item after E025.
+
+Raw JSON: `build/jmh-e025-final.json`. Re-measure on your own machine before
 drawing conclusions — and that is not a formality. E012 re-ran the ledger on an
 Intel N97 (AVX2, Linux, Temurin 25+36) and two of the headline ratios above do
 not transfer:

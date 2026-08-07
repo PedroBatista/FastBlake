@@ -2374,3 +2374,63 @@ batch holds four or more whole non-final chunks, compress them four at a time
 with the four-chunk kernel instead of one at a time with the scalar path. This
 is a separate change to a separate code path and should be measured separately;
 `streaming4k` at 8-16 KiB is its target and its control.
+
+### E025 P2b result — ladder in the drain: streaming converges with one-shot
+
+Date: 2026-08-07
+Environment: **A** (Apple M5), Gradle daemon pinned to Java 25.
+
+Change: apply P2's ladder to the finalization drain as well as the update loop.
+Complete groups of four retained non-final chunks go through the four-chunk
+kernel instead of one at a time through the scalar compressor. Safe for the same
+reason E016's retention is: a complete batch is committed only on proof that
+more input follows, so every chunk in the drain except the last is provably not
+the root.
+
+Motivation was P2's own measurement. P2's rung fires only when
+`vectorPendingLength == 0 && remaining > 4 * CHUNK_LEN`; under 4 KiB streaming
+updates `remaining` is always exactly 4096, so it never fired and input
+accumulated in the retained buffer instead. That is why `streaming4k` was flat
+while `oneShot` and `reusedInstance` gained 21%.
+
+**Conformance**: 542 tests under five dispatch configurations — automatic,
+`experimental.scratchChunkVector`, `experimental.dualChunkVector`,
+`-Dfastblake.kernel=scalar` and `-Dfastblake.kernel=four`. All pass. The
+suite's fragmented-update cases across all 35 official vectors are exactly this
+drain path, and the finalize-twice case covers the repeatable-finalize
+invariant the drain must preserve.
+
+**Throughput**, JMH `streaming4k`, 2 forks x 5 warmup x 5 measurement:
+
+| size | post-P2 | post-P2b | change |
+|---|---:|---:|---:|
+| 8 KiB | 881 | **1179** | +33.8% |
+| 16 KiB | 1242 | **1493** | +20.2% |
+| 32 KiB | not measured | 1738 | — |
+| 256 KiB | 1991 | 2032 | +2.1% |
+| 8 MiB | 2076 | 2070 | unchanged |
+
+**The three call shapes have now converged across the whole size range**, which
+was the point of P1, P2 and P2b together:
+
+| size | oneShot | streaming4k |
+|---|---:|---:|
+| 8 KiB | 1153 | 1179 |
+| 16 KiB | 1494 | 1493 |
+| 8 MiB | 2126 | 2070 |
+
+Streaming is no longer a second-class path. Before P1 it was 911 MiB/s at
+8 MiB against 2140 one-shot; it is now within 3%.
+
+Decision: keep. Large mid-range gain, no change at 8 MiB, no regression in any
+other shape.
+
+Comment: P2 and P2b are the same idea applied to two code paths, and splitting
+them was worth it. P2 alone looked like a partial success — +21% on two shapes,
+nothing on the third — and the shape that did not move is what identified the
+second path. Had they been bundled, the measurement would have shown one
+average gain and the mechanism would have stayed hidden.
+
+Remaining in E025: nothing. P0, P1, P2, P2b and P3 are complete. The README's
+per-size tables predate P1 and now understate `java-cpu` badly in the streaming
+column; they need a fresh full sweep before publication.
