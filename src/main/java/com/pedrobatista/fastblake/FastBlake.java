@@ -210,7 +210,66 @@ public final class FastBlake {
     /** Computes a one-shot 32-byte digest. */
     public static byte[] hash(byte[] input) {
         Objects.requireNonNull(input, "input");
-        return initHash().update(input).doFinalize(OUT_LEN);
+        return hash(input, 0, input.length, OUT_LEN);
+    }
+
+    /**
+     * Computes a one-shot digest of any length over a range of {@code input}.
+     *
+     * <p>E025 P0b: an input of at most one chunk is its own root node, so it
+     * needs no chaining-value stack, no chunk buffer and no tree machinery.
+     * That path is taken here directly from the caller's array, with no copy
+     * and no hasher instance. Larger inputs use the ordinary incremental path.
+     */
+    public static byte[] hash(byte[] input, int offset, int length, int outputLength) {
+        Objects.requireNonNull(input, "input");
+        Objects.checkFromIndexSize(offset, length, input.length);
+        if (outputLength < 0) {
+            throw new IllegalArgumentException("output length must not be negative");
+        }
+        if (length <= CHUNK_LEN) {
+            return hashSingleChunk(input, offset, length, outputLength);
+        }
+        return initHash().update(input, offset, length).doFinalize(outputLength);
+    }
+
+    /**
+     * Hashes at most one chunk straight from the caller's array.
+     *
+     * <p>Allocates only the three small scratch arrays and the result. No
+     * hasher, no 1 KiB chunk copy, no CV stack: at 64 bytes those dominated
+     * everything else. Plain hashing mode only, which is what the static
+     * one-shot entry points expose.
+     */
+    private static byte[] hashSingleChunk(byte[] input, int offset, int length,
+                                          int outputLength) {
+        int[] words = new int[16];
+        int[] state = new int[16];
+        int[] cv = Arrays.copyOf(IV_WORDS, 8);
+
+        int blocksBeforeLast = length == 0 ? 0 : (length - 1) / BLOCK_LEN;
+        for (int block = 0; block < blocksBeforeLast; block++) {
+            bytesToWords(input, offset + block * BLOCK_LEN, words, 16);
+            compress(cv, words, 0, BLOCK_LEN, block == 0 ? CHUNK_START : 0, state);
+            System.arraycopy(state, 0, cv, 0, 8);
+        }
+
+        Arrays.fill(words, 0);
+        int lastOffset = blocksBeforeLast * BLOCK_LEN;
+        int lastLength = length - lastOffset;
+        partialBytesToWords(input, offset + lastOffset, lastLength, words);
+        int flags = CHUNK_END | (blocksBeforeLast == 0 ? CHUNK_START : 0) | ROOT;
+
+        byte[] output = new byte[outputLength];
+        long outputBlockCounter = 0;
+        int written = 0;
+        while (written < outputLength) {
+            compress(cv, words, outputBlockCounter++, lastLength, flags, state);
+            int take = Math.min(BLOCK_LEN, outputLength - written);
+            wordsToBytes(state, output, written, take);
+            written += take;
+        }
+        return output;
     }
 
     /** Appends all input bytes. */

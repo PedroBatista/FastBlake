@@ -7,9 +7,11 @@ validated on two architectures and awaiting streaming support before
 promotion.** FastBlake implements the full BLAKE3 API in dependency-free Java.
 The allocation-free scalar kernel is the production default and the correctness
 baseline. Two opt-in chunk-parallel Vector API kernels sit above it: a
-four-chunk kernel, and an eight-chunk interleaved one that reaches **2148 MiB/s
-one-shot at 8 MiB on the Apple M5 — 85.8% of the reference Rust crate** and
-3.9× Commons Codec. Both stay opt-in because 4 KiB streaming updates still
+four-chunk kernel, and an eight-chunk interleaved one that reaches **2140 MiB/s
+one-shot at 8 MiB on the Apple M5 — 85.4% of the reference Rust crate** and
+3.8× Commons Codec. FastBlake now matches or beats Commons Codec at every
+measured size, including the 64-byte one-shot that E025 P0 lifted from 0.38× to
+1.01×. Both stay opt-in because 4 KiB streaming updates still
 fall back to scalar, and because the eight-chunk kernel has not yet been
 validated on x86-64. GPU offload remains planned work.
 
@@ -133,57 +135,61 @@ Apple M5 (10 core), Temurin JDK 25.0.4, Commons Codec 1.22.0, `blake3` crate
 1.8.5. 2 forks × 5 warmup × 5×1s measurement iterations, single-threaded, all
 three contenders measured in one session. MiB/s, higher is better; x-factor
 against the `commons` baseline. `java-cpu` is FastBlake with the E024
-eight-chunk kernel enabled (`-Dfastblake.experimental.dualChunkVector=true`).
+eight-chunk kernel enabled (`-Dfastblake.experimental.dualChunkVector=true`),
+measured after E025 P0. Every contender is reached through its own best
+one-shot entry point in the `oneShot` shape.
 
 **`oneShot`** — fresh hasher per buffer:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 525 | 834 (1.59×) | **199 (0.38×)** |
-| 1 KiB | 559 | 1309 (2.34×) | 850 (1.52×) |
-| 16 KiB | 544 | 2480 (4.55×) | 1269 (2.33×) |
-| 256 KiB | 554 | 2503 (4.51×) | 2058 (3.71×) |
-| 4 MiB | 548 | 2507 (4.57×) | 2142 (3.91×) |
-| 8 MiB | 548 | 2503 (4.57×) | 2148 (3.92×) |
+| 64 B | 524 | 828 (1.58×) | 527 (1.01×) |
+| 1 KiB | 561 | 1309 (2.34×) | 942 (1.68×) |
+| 16 KiB | 556 | 2481 (4.46×) | 1268 (2.28×) |
+| 256 KiB | 559 | 2506 (4.48×) | 2057 (3.68×) |
+| 4 MiB | 557 | 2505 (4.50×) | 2146 (3.85×) |
+| 8 MiB | 557 | 2507 (4.50×) | 2140 (3.84×) |
 
 **`reusedInstance`** — `reset()` reuse:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 422 | 873 (2.07×) | 458 (1.09×) |
-| 1 KiB | 524 | 1315 (2.51×) | 921 (1.76×) |
-| 16 KiB | 498 | 2473 (4.97×) | 1286 (2.59×) |
-| 256 KiB | 512 | 2506 (4.90×) | 2081 (4.07×) |
-| 4 MiB | 520 | 2506 (4.82×) | 2147 (4.13×) |
-| 8 MiB | 494 | 2498 (5.05×) | 2149 (4.35×) |
+| 64 B | 458 | 871 (1.90×) | 498 (1.09×) |
+| 1 KiB | 566 | 1312 (2.32×) | 922 (1.63×) |
+| 16 KiB | 555 | 2479 (4.47×) | 1283 (2.31×) |
+| 256 KiB | 548 | 2496 (4.56×) | 2077 (3.79×) |
+| 4 MiB | 549 | 2499 (4.56×) | 2087 (3.80×) |
+| 8 MiB | 548 | 2501 (4.56×) | 2141 (3.91×) |
 
 **`streaming4k`** — 4 KiB incremental updates:
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 423 | 854 (2.02×) | 467 (1.10×) |
-| 1 KiB | 529 | 1308 (2.47×) | 926 (1.75×) |
-| 16 KiB | 501 | 2367 (4.72×) | 916 (1.83×) |
-| 256 KiB | 505 | 2362 (4.68×) | 917 (1.82×) |
-| 4 MiB | 532 | 2351 (4.42×) | 916 (1.72×) |
-| 8 MiB | 507 | 2349 (4.64×) | 916 (1.81×) |
+| 64 B | 472 | 847 (1.79×) | 495 (1.05×) |
+| 1 KiB | 568 | 1301 (2.29×) | 919 (1.62×) |
+| 16 KiB | 551 | 2359 (4.28×) | 909 (1.65×) |
+| 256 KiB | 544 | 2351 (4.32×) | 909 (1.67×) |
+| 4 MiB | 544 | 2344 (4.30×) | 912 (1.67×) |
+| 8 MiB | 545 | 2340 (4.29×) | 911 (1.67×) |
 
 Three things this exposes that the 8 MiB headline hides:
 
-- **`java-cpu` is 2.6× *slower* than Commons on a 64-byte one-shot** (199 vs
-  525). The same input under `reusedInstance` reaches 458, so this is per-hasher
-  construction cost, not compression. It is the worst number in the project and
-  the one a general-purpose library would be judged on first.
 - **The eight-chunk kernel needs 8 KiB before it engages at all**, so 16 KiB
-  reaches only 1269 MiB/s — 59% of its 8 MiB rate — and does not saturate until
+  reaches only 1268 MiB/s — 59% of its 8 MiB rate — and does not saturate until
   256 KiB. Rust saturates by 16 KiB. Widening the useful range downward is a
   dispatch problem (fall back to the four-chunk kernel, then scalar), not a
-  kernel problem.
-- **Streaming is flat at ~916 MiB/s from 16 KiB up**, against 2148 one-shot.
+  kernel problem. This is now the largest structural gap after streaming.
+- **Streaming is flat at ~910 MiB/s from 16 KiB up**, against 2140 one-shot.
   The SIMD kernels are simply not reachable from the 4 KiB update path, so
-  streaming is 39% of Rust where one-shot is 86%.
+  streaming is 39% of Rust where one-shot is 85%.
+- **The 64-byte one-shot was the worst number in the project and is now the
+  least interesting one.** It measured 199 MiB/s, 0.38× Commons, before E025 P0
+  removed the eager per-hasher buffers and added a single-chunk path that hashes
+  straight from the caller's array. It is now 527, or 1.01× Commons, having gone
+  from 3,400 to 256 bytes allocated per 64-byte hash. The remaining gap there is
+  to Rust, not to the baseline.
 
-Raw JSON: `build/jmh-e024-long.json`. Re-measure on your own machine before
+Raw JSON: `build/jmh-e025-long.json`. Re-measure on your own machine before
 drawing conclusions — and that is not a formality. E012 re-ran the ledger on an
 Intel N97 (AVX2, Linux, Temurin 25+36) and two of the headline ratios above do
 not transfer:
@@ -198,7 +204,7 @@ not transfer:
 These are the E011-era figures that prompted the cross-architecture work; they
 are kept because the *divergence* is the point. The M5 SIMD row has since been
 superseded twice, by E014's loader and E024's interleaved kernel, and now stands
-at 85.8% of Rust — see the E024 paragraph below. The N97 column has its own
+at 85.4% of Rust — see the E024 and E025 paragraphs below. The N97 column has its own
 later history under E016 and E019.
 
 Correctness, the allocation gate, and C2's escape-analysis behaviour *did*
@@ -643,7 +649,8 @@ official-vector suite, and the allocation gate at 0.00 B per input byte —
 doubling the round body did not cross the escape-analysis cliff. At 8 MiB it
 measures **2149 MiB/s one-shot and reused, 1.36× the four-chunk kernel and 85.6%
 of Rust**, up from 63%; the 2-fork long run in the Results table above confirms
-this at 2148 one-shot and 2149 reused, or 85.8% of Rust. Enable with
+this at 2148 one-shot and 2149 reused; the later post-E025 sweep in the
+Results table measures 2140 and 2141, or 85.4% of Rust. Enable with
 `-Dfastblake.experimental.dualChunkVector=true`.
 
 The generated code is the interesting part: the dual kernel executes **8.8% more
@@ -666,6 +673,29 @@ about 25× faster, but the complete kernel allocated roughly 159 bytes per input
 byte, invalidating its throughput as a SIMD comparison. It remains available
 behind `-Dfastblake.experimental.heapChunkVector=true` on little-endian systems;
 the production dispatch remains scalar. Details are in the experiment ledger.
+
+E025 re-ranked the work and closed its first item. The 2-fork sweep showed the
+remaining gaps were no longer in compression: one-shot at 8 MiB sits within 15%
+of Rust, while streaming is 61% behind and the 64-byte one-shot was *behind
+Commons*. P0 fixed the last of those in two measured steps. P0a made `cvStack`,
+the vector scratch and the streaming batch lazily allocated instead of
+constructor-time, which took 64-byte one-shot from 199 to 408 MiB/s and cut
+allocation from 3,400 to 1,656 bytes per call; enabling a vector kernel had been
+adding 800 bytes per hasher even for inputs that could never reach one. P0b then
+added a single-chunk path: an input of at most 1 KiB is its own root node, so it
+needs no chaining-value stack, no 1 KiB chunk copy and no hasher instance, and
+is hashed straight from the caller's array. That reached 527 MiB/s at 256 bytes
+allocated — **2.7× overall, and 1.01× Commons**, with nothing above one chunk
+moving. The remaining items are P1 streaming batching for the eight-chunk
+kernel, P2 a size ladder so mid-sized inputs fall back through four-chunk to
+scalar instead of all-or-nothing, and P3 the capability-based dispatch that lets
+a kernel be default-on where it wins and off where it does not.
+
+E025 also closed a gap in the method, not just the code. The allocation gate has
+been mandatory since E010 but had only ever been run at 8 MiB, where 3.4 KB of
+fixed setup divides away to 0.0007 bytes per input byte and cannot fail. The
+same code was at 53 bytes per input byte at 64 bytes, unnoticed across fifteen
+experiments. The gate now runs at 64 B and 1 KiB as well.
 
 The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
 makes every 1 KiB chunk independent, so a large input decomposes into thousands

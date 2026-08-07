@@ -32,6 +32,20 @@ final class CommonsCodecEngine implements Blake3Engine {
         return "Apache Commons Codec (scalar Java)";
     }
 
+    /**
+     * Uses Commons Codec's static one-shot entry point for the 32-byte digest,
+     * so this contender is measured through its best one-shot path too. Added
+     * alongside FastBlake's in E025 P0b; before that both used the generic
+     * hasher path and the comparison was fair for a different reason.
+     */
+    @Override
+    public byte[] hash(byte[] input, int outputLen) {
+        if (outputLen == 32) {
+            return Blake3.hash(input);
+        }
+        return Blake3Engine.super.hash(input, outputLen);
+    }
+
     @Override
     public Hasher newHasher() {
         return new CommonsHasher(Blake3.initHash());

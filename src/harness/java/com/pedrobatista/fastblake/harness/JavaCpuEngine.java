@@ -35,6 +35,15 @@ final class JavaCpuEngine implements Blake3Engine {
         return "FastBlake CPU (Java scalar; experimental Vector API available)";
     }
 
+    /**
+     * Uses FastBlake's dedicated one-shot entry point, which takes a
+     * single-chunk fast path for inputs of at most 1 KiB (E025 P0b).
+     */
+    @Override
+    public byte[] hash(byte[] input, int outputLen) {
+        return FastBlake.hash(input, 0, input.length, outputLen);
+    }
+
     @Override
     public Hasher newHasher() {
         return new FastBlakeHasher(FastBlake.initHash());

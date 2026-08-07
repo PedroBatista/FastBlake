@@ -2193,3 +2193,69 @@ gate had been mandatory since E010 but only ever run at 8 MiB, where 3.4 KB of
 fixed setup divides away to 0.0007 B per input byte and cannot fail. The same
 code was at 53 B per input byte at 64 bytes for fifteen experiments without
 anyone seeing it.
+
+### E025 P0b result — single-chunk one-shot path: P0 target met
+
+Date: 2026-08-07
+Environment: **A** (Apple M5). JMH on the project toolchain; allocation on the
+custom JDK 28 driver.
+
+Change: an input of at most one chunk is its own root node, so it needs no
+chaining-value stack, no 1 KiB chunk copy and no tree machinery. `FastBlake`
+gains `hash(byte[], int offset, int length, int outputLength)`, which takes that
+path directly from the caller's array with no hasher instance. Plain hashing
+mode only, which is all the static one-shot entry points expose. Larger inputs
+fall through to the ordinary incremental path unchanged.
+
+**Harness change, stated explicitly because it moves a baseline.** The
+benchmark's `oneShot` shape reaches a contender through `Blake3Engine.hash`,
+whose default implementation builds a hasher. `RustEngine` has always overridden
+it to use the crate's one-shot native entry point. `JavaCpuEngine` now overrides
+it too — and so does `CommonsCodecEngine`, using Commons Codec's own static
+`Blake3.hash`, so FastBlake is not credited with a fast path its baseline was
+denied. In the event the Commons figures did not move materially (528-568
+across sizes, against 525-567 before), so the comparison is unchanged in
+substance; but the change was made before the measurement, not after seeing it.
+
+**Conformance**: 542 tests, default dispatch and with `dualChunkVector` forced.
+Both pass. The suite exercises `engine.hash(...)` over all 35 official vectors,
+so the new path is covered at length 0, at every boundary below one chunk, and
+above it where it must fall through.
+
+**Allocation gate**, static one-shot path:
+
+| input | allocated | throughput |
+|---|---:|---:|
+| 64 B | **256 B/op** | 559.6 MiB/s |
+| 1 KiB | **256 B/op** | 961.0 MiB/s |
+| 8 KiB (falls through, control) | 3,816 B/op | 934.3 MiB/s |
+
+At 64 bytes: 3,400 B/op originally, 1,656 after P0a, **256 after P0b** — a 13x
+reduction, and 4 bytes per input byte where the original code was at 53.
+
+**Throughput**, JMH `oneShot`, 2 forks x 5 warmup x 5 measurement:
+
+| size | commons | rust | before P0 | after P0a | after P0b |
+|---|---:|---:|---:|---:|---:|
+| 64 B | 528 | 828 | 199 (0.38x) | 408 (0.77x) | **538 (1.02x)** |
+| 1 KiB | 568 | 1306 | 850 (1.52x) | 903 (1.59x) | **939 (1.65x)** |
+| 16 KiB | 554 | 2478 | 1269 | 1271 | 1271 (2.30x) |
+| 8 MiB | 558 | 2497 | 2148 | 2147 | 2140 (3.84x) |
+
+**P0 is complete: 2.7x at 64 bytes, and FastBlake is no longer slower than the
+baseline it exists to beat at any measured size.** Nothing above one chunk
+moved, which is the intended blast radius.
+
+Decision: keep. Remaining gap at 64 bytes is to Rust (538 against 828, 65%), not
+to Commons.
+
+Comment: the two halves of P0 attacked different costs and the split was worth
+keeping. P0a removed eager per-hasher buffers and helped every call shape that
+constructs a hasher, including `reusedInstance` construction and the streaming
+path. P0b removed the remaining 1 KiB chunk copy and the tree scratch for the
+single-chunk case only. Bundling them would have hidden that P0a alone gets to
+0.77x and is not sufficient.
+
+Next: P1 (streaming batching for the E024 kernel) is now the largest remaining
+gap at 39% of Rust, followed by P2's size ladder, which the 16 KiB row above
+shows untouched at 2.30x Commons against 3.84x at 8 MiB.
