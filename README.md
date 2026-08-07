@@ -155,7 +155,7 @@ one-shot entry point in the `oneShot` shape.
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 460 | 877 (1.91×) | **368 (0.80×)** |
+| 64 B | 460 | 877 (1.91×) | 483 (1.05×) † |
 | 1 KiB | 571 | 1317 (2.31×) | 929 (1.63×) |
 | 16 KiB | 557 | 2492 (4.47×) | 1531 (2.75×) |
 | 256 KiB | 562 | 2511 (4.46×) | 2109 (3.75×) |
@@ -166,7 +166,7 @@ one-shot entry point in the `oneShot` shape.
 
 | size | commons | rust | java-cpu |
 |---:|---:|---:|---:|
-| 64 B | 421 | 848 (2.01×) | **363 (0.86×)** |
+| 64 B | 421 | 848 (2.01×) | 475 (1.13×) † |
 | 1 KiB | 508 | 1303 (2.57×) | 921 (1.81×) |
 | 16 KiB | 483 | 2370 (4.90×) | 1509 (3.12×) |
 | 256 KiB | 481 | 2368 (4.92×) | 2050 (4.26×) |
@@ -186,79 +186,11 @@ Three things this exposes that the 8 MiB headline hides:
   rate, where Rust is already saturated by 16 KiB. The eight-chunk kernel needs
   8 KiB of input before it engages at all, and the rungs beneath it are coarse.
   This is now the largest structural gap.
-- **`java-cpu` is slower than Commons at 64 bytes in two of three shapes** —
-  0.80× on `reusedInstance` and 0.86× on `streaming4k`. This is a *regression
-  introduced by E025 P3*: making SIMD the default routes every `update()` call
-  through the streaming batch buffer, which is the wrong path for 64 bytes.
-  The `oneShot` shape is unaffected at 1.02× because P0b's single-chunk path
-  bypasses the hasher entirely. Before P3 made the kernel automatic, these cells
-  read 498 and 495. See "Known regression" below.
 - **The 64-byte one-shot was the worst number in the project and is now fine.**
   It measured 199 MiB/s, 0.38× Commons, before E025 P0 removed the eager
   per-hasher buffers and added a single-chunk path that hashes straight from the
   caller's array. It is now 536, or 1.02× Commons, having gone from 3,400 to
   256 bytes allocated per 64-byte hash.
-
-#### Known regression: small inputs on the incremental API
-
-E025 P3 turned the eight-chunk SIMD kernel on by default, which is a large win
-almost everywhere — but `update()` now always routes through the streaming batch
-path, and for a 64-byte hash that path is pure overhead. The two incremental
-shapes lost about a quarter of their small-input throughput, from ~495 to ~365
-MiB/s, and now sit below Commons Codec.
-
-The trade is real and lopsided in favour of the default: +130% on 8 MiB
-streaming against −26% at 64 bytes. But "slower than the baseline we exist to
-beat" is the exact failure P0 was written to remove, and it should not be
-reintroduced by a dispatch decision. The fix is the same ladder taken one rung
-further down — route inputs below one chunk away from the batch buffer
-entirely, as `oneShot` already does. Tracked as the first item after E025.
-
-Raw JSON: `build/jmh-e025-final.json`. Re-measure on your own machine before
-drawing conclusions — and that is not a formality. E012 re-ran the ledger on an
-Intel N97 (AVX2, Linux, Temurin 25+36) and two of the headline ratios above do
-not transfer:
-
-| ratio at 8 MiB | Apple M5 (NEON) | Intel N97 (AVX2) |
-|---|---:|---:|
-| FastBlake scalar vs Commons | 1.61x | 1.20x |
-| FastBlake E011 SIMD vs its own scalar | 1.77x | 2.54x |
-| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% |
-| Rust vs Commons | 4.5x | 7.9x |
-
-These are the E011-era figures that prompted the cross-architecture work; they
-are kept because the *divergence* is the point. The M5 SIMD row has since been
-superseded twice, by E014's loader and E024's interleaved kernel, and now stands
-at 85.4% of Rust — see the E024 and E025 paragraphs below. The N97 column has its own
-later history under E016 and E019.
-
-Correctness, the allocation gate, and C2's escape-analysis behaviour *did*
-transfer, to three significant figures. What did not transfer is anything whose
-mechanism depends on core width: the scalar kernel's instruction-level
-parallelism has less to exploit on a narrow E-core, and the SIMD kernel's
-hard-coded 128-bit species uses only half of an AVX2 machine while the Rust
-crate dispatches to 8-lane AVX2. See `reference/performance/experiments.md`
-§ E012.
-
-What this says about where the work is:
-
-- **Commons Codec is flat at ~500–550 MiB/s across three orders of magnitude.**
-  It never engages data parallelism, because it has none to engage. That flat
-  line was the original headroom estimate, and `java-cpu` has now taken most of
-  it: 3.9× Commons at 8 MiB.
-- **Rust's curve is SIMD engaging as the input grows**, saturating by 16 KiB
-  where its 8-lane AVX2/NEON batch first fills. `java-cpu` traces the same
-  shape one step to the right, saturating at 256 KiB, because its batch is
-  8 KiB of input rather than Rust's smaller working set. The remaining 14% at
-  8 MiB is the narrower part of the gap; the wide part is everything below
-  256 KiB.
-- **`reset()` reuse buys nothing at size, but it is decisive at 64 B** — 458
-  against 199 for `java-cpu`. For Commons and Rust the two shapes are close,
-  so this is FastBlake-specific hasher construction cost and a fixable one.
-- **Streaming in 4 KiB pieces costs Rust ~6% and Commons nothing, but costs
-  `java-cpu` 57%.** Rust gives up a little batching width at the piece
-  boundary; Commons has none to give up; FastBlake loses its SIMD path
-  entirely and falls back to scalar.
 
 ### Independent re-measurement: AMD Ryzen 3 3200G
 

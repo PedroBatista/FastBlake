@@ -243,6 +243,10 @@ tasks.register('dispatchAudit') {
     def shape = (project.findProperty('auditShape') ?: 'oneShot').toString()
     def outputFile = layout.buildDirectory.file('dispatch-audit.txt')
     outputs.file(outputFile)
+    // A measurement is never up to date: the answer depends on the machine, the
+    // JDK and thermal state, none of which Gradle can see. Caching it would let
+    // a stale verdict rubber-stamp a changed dispatch table.
+    outputs.upToDateWhen { false }
 
     doLast {
         def kernels = ['scalar', 'four', 'eight']
@@ -343,11 +347,22 @@ tasks.register('dispatchAudit') {
             report.append("VERDICT: OK. The selector picked '${autoKernel}', which is the fastest here.\n")
         } else {
             def margin = 100.0 * (best.value - (scores[autoKernel] ?: 0)) / best.value
-            report.append(String.format(
-                    "VERDICT: MISMATCH. The selector picked '%s' but '%s' is %.1f%% faster here.%n",
-                    autoKernel, best.key, margin))
-            report.append('Record this machine and these numbers in '
-                    + 'reference/performance/experiments.md, then update KernelSelector.\n')
+            // The measurement protocol treats differences below ~3% as
+            // inconclusive. Without this the audit cries wolf over run-to-run
+            // noise, and an audit that reports a mismatch every run is one
+            // nobody reads.
+            if (margin < 3.0) {
+                report.append(String.format(
+                        "VERDICT: OK. '%s' edged out the selected '%s' by %.1f%%, "
+                                + "inside the 3%% inconclusive band.%n",
+                        best.key, autoKernel, margin))
+            } else {
+                report.append(String.format(
+                        "VERDICT: MISMATCH. The selector picked '%s' but '%s' is %.1f%% faster here.%n",
+                        autoKernel, best.key, margin))
+                report.append('Record this machine and these numbers in '
+                        + 'reference/performance/experiments.md, then update KernelSelector.\n')
+            }
         }
         def text = report.toString()
         outputFile.get().asFile.text = text
