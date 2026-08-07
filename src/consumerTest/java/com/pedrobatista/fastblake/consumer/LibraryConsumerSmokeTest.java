@@ -21,6 +21,19 @@ public final class LibraryConsumerSmokeTest {
         if (!EMPTY_HASH.equals(actual)) {
             throw new AssertionError("empty BLAKE3 mismatch: " + actual);
         }
+        byte[] xof = new byte[64];
+        FastBlake.initHash().doFinalize(xof);
+        if (!java.util.Arrays.equals(digest, java.util.Arrays.copyOf(xof, digest.length))) {
+            throw new AssertionError("Commons-compatible doFinalize(byte[]) XOF mismatch");
+        }
+
+        byte[] key = new byte[32];
+        byte[] keyed = FastBlake.keyedHash(key, new byte[0]);
+        byte[] keyedViaInstance = new byte[32];
+        FastBlake.initKeyedHash(key).doFinalize(keyedViaInstance);
+        if (!java.util.Arrays.equals(keyed, keyedViaInstance)) {
+            throw new AssertionError("Commons-compatible keyedHash API mismatch");
+        }
 
         FastBlake hasher = FastBlake.initHash();
         hasher.update(new byte[] {1, 2, 3, 4}).doFinalize(new byte[32], 0, 32);

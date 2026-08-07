@@ -53,3 +53,10 @@ Until version 1.0, public API changes are allowed but must be documented. A
 the optional `jdk.incubator.vector` module requirement, and publish source and
 Javadoc jars alongside the binary. Automatic dispatch may change performance,
 but never digest bytes.
+
+The overlapping Commons Codec `Blake3` API is the compatibility baseline:
+`initHash`, `initKeyedHash`, `initKeyDerivationFunction`, `hash`, `keyedHash`,
+`update`, `doFinalize`, and `reset` have matching signatures and behavior where
+the concepts overlap. FastBlake additionally exposes offset/XOF-oriented
+extensions and diagnostics such as `selectedKernel`; those are intentionally
+FastBlake-specific.

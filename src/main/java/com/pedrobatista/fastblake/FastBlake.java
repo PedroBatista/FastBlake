@@ -195,6 +195,19 @@ public final class FastBlake {
     }
 
     /**
+     * Computes a keyed 32-byte BLAKE3 hash, matching Commons Codec's
+     * {@code Blake3.keyedHash(key, data)} convenience method.
+     *
+     * @param key 32-byte secret key
+     * @param input message bytes
+     * @return the 32-byte keyed digest
+     */
+    public static byte[] keyedHash(byte[] key, byte[] input) {
+        Objects.requireNonNull(input, "input");
+        return initKeyedHash(key).update(input).doFinalize(OUT_LEN);
+    }
+
+    /**
      * Computes a one-shot digest of any length over a range of {@code input}.
      *
      * <p>E025 P0b: an input of at most one chunk is its own root node, so it
@@ -459,6 +472,20 @@ public final class FastBlake {
         }
         root.rootBytes(output, offset, length, state);
         return this;
+    }
+
+    /**
+     * Writes an XOF result whose length is {@code output.length}.
+     *
+     * <p>This overload is source- and behavior-compatible with Commons Codec's
+     * {@code Blake3.doFinalize(byte[])} method.
+     *
+     * @param output destination array; its length selects the XOF output length
+     * @return this hasher
+     */
+    public FastBlake doFinalize(byte[] output) {
+        Objects.requireNonNull(output, "output");
+        return doFinalize(output, 0, output.length);
     }
 
     /** Returns extended output in a new array. */
