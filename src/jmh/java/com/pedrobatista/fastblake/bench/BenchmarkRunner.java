@@ -67,11 +67,18 @@ public final class BenchmarkRunner {
         System.out.println("Benchmarking: " + String.join(", ", selected));
         System.out.println();
 
+        // ChainedOptionsBuilder#jvmArgsAppend(...) *replaces* whatever
+        // jvmArgsAppend .parent(cmdLine) just copied from the command line
+        // instead of adding to it, so a caller-supplied -jvmArgsAppend (e.g.
+        // to flip an experimental kernel on) would otherwise be silently
+        // dropped. Merge explicitly instead.
+        List<String> jvmArgsAppend = new ArrayList<>(cmdLine.getJvmArgsAppend().orElse(List.of()));
+        // JMH forks a new JVM, and incubator modules are not inherited
+        // reliably from the Gradle JavaExec process.
+        jvmArgsAppend.add("--add-modules=jdk.incubator.vector");
         ChainedOptionsBuilder builder = new OptionsBuilder()
                 .parent(cmdLine)
-                // JMH forks a new JVM, and incubator modules are not inherited
-                // reliably from the Gradle JavaExec process.
-                .jvmArgsAppend("--add-modules=jdk.incubator.vector");
+                .jvmArgsAppend(jvmArgsAppend.toArray(String[]::new));
         if (!cmdLine.getParameter("impl").hasValue()) {
             builder.param("impl", selected.toArray(String[]::new));
         }

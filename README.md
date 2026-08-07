@@ -229,6 +229,79 @@ What this says about where the work is:
   boundary; Commons has none to give up; FastBlake loses its SIMD path
   entirely and falls back to scalar.
 
+### Independent re-measurement: AMD Ryzen 3 3200G
+
+AMD Ryzen 3 3200G (Zen, 4C/4T), Windows 10, Temurin JDK 25.0.4, Commons Codec
+1.22.0. No cargo toolchain on this machine, so `./gradlew contenders` reports
+2 of 4 (`commons`, `java-cpu`; `rust` and `java-gpu` skip with their reasons,
+as designed). Same harness, same protocol: 2 forks × 5×1s warmup + 5×1s
+measurement, single-threaded. `./gradlew test` passes the full official-vector
+suite for both contenders first.
+
+Commons vs the FastBlake production scalar kernel:
+
+| size | `oneShot` commons | `oneShot` java-cpu | `reusedInstance` commons | `reusedInstance` java-cpu | `streaming4k` commons | `streaming4k` java-cpu |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 B | 161 | 91 (0.57×) | 141 | 157 (1.11×) | 138 | 156 (1.13×) |
+| 1 KiB | 189 | 283 (1.49×) | 187 | 268 (1.43×) | 175 | 298 (1.70×) |
+| 16 KiB | 155 | 304 (1.96×) | 157 | 304 (1.93×) | 155 | 305 (1.97×) |
+| 256 KiB | 167 | 309 (1.86×) | 156 | 308 (1.97×) | 156 | 310 (1.99×) |
+| 4 MiB | 153 | 310 (2.02×) | 157 | 313 (1.99×) | 165 | 310 (1.87×) |
+| 8 MiB | 166 | 318 (1.92×) | 166 | 310 (1.89×) | 155 | 310 (2.00×) |
+
+Raw JSON: `build/jmh-contenders-ryzen.json`.
+
+Re-running with the opt-in E011/E014 SIMD kernel
+(`-Dfastblake.experimental.scratchChunkVector=true`) against that same scalar
+column:
+
+| size | `oneShot` scalar | `oneShot` SIMD | `reusedInstance` scalar | `reusedInstance` SIMD | `streaming4k` scalar | `streaming4k` SIMD |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 B | 91 | 38 (0.42×) | 157 | 76 (0.48×) | 156 | 81 (0.52×) |
+| 1 KiB | 283 | 223 (0.79×) | 268 | 272 (1.01×) | 298 | 271 (0.91×) |
+| 16 KiB | 304 | 589 (1.94×) | 304 | 592 (1.95×) | 305 | 574 (1.88×) |
+| 256 KiB | 309 | 894 (2.89×) | 308 | 898 (2.92×) | 310 | 917 (2.96×) |
+| 4 MiB | 310 | 889 (2.87×) | 313 | 911 (2.91×) | 310 | 845 (2.73×) |
+| 8 MiB | 318 | 888 (2.79×) | 310 | 897 (2.89×) | 310 | 870 (2.81×) |
+
+Raw JSON: `build/jmh-vector-ryzen.json`. Adding this machine to the ledger:
+
+| ratio at 8 MiB | Apple M5 (NEON) | Intel N97 (AVX2) | AMD Ryzen 3 3200G (AVX2) |
+|---|---:|---:|---:|
+| FastBlake scalar vs Commons | 1.61x | 1.20x | 1.92x |
+| FastBlake E011 SIMD vs its own scalar | 1.77x | 2.54x | 2.79x |
+| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% | n/a — no cargo here |
+| Rust vs Commons | 4.5x | 7.9x | n/a — no cargo here |
+
+Both headline ratios move further in the same direction the N97 already
+established: a core wider/more OoO than the N97's Gracemont E-cores gives the
+scalar kernel more instruction-level parallelism to exploit (1.92x here vs
+1.20x there), and the hard-coded 128-bit SIMD kernel does correspondingly
+better relative to its own scalar baseline (2.79x here vs 2.54x there) even
+though its lane width is unchanged. Without a Rust build on this machine there
+is no ceiling column to place either number against.
+
+The SIMD kernel is a **loss** at 64 B and roughly break-even at 1 KiB on this
+machine — 0.42-0.52x and 0.79-1.01x respectively — before crossing over
+between 1 KiB and 16 KiB and settling near 2.8-2.9x at 8 MiB. That crossover
+point matches the architecture note above: 16 KiB is the smallest input that
+fills a 4-lane SIMD batch, and below it the kernel pays batching overhead with
+nothing to amortize it against.
+
+Getting a correct SIMD number here required a harness fix first:
+`BenchmarkRunner` called `OptionsBuilder.jvmArgsAppend("--add-modules=...")`
+after `.parent(cmdLine)`, which *replaces* rather than merges the
+`-jvmArgsAppend` JMH already captured from the command line — so passing
+`-jvmArgsAppend -Dfastblake.experimental.scratchChunkVector=true` on the
+`jmh.args` command line was silently dropped, and the first attempt at this
+measurement quietly re-ran the scalar kernel under the `SIMD` label. Confirmed
+by inspecting the fork's `# VM options:` line in the JMH log — it never
+contained the property — then fixed by merging the two lists explicitly. Every
+prior experiment in `reference/performance/experiments.md` sidestepped this by
+setting the flag via `JAVA_TOOL_OPTIONS` instead (see E012), which was never
+affected and remains the more foolproof way to flip these flags for
+`./gradlew jmh`.
+
 ## How the Rust contender is wired
 
 `cargo build --release` produces a `cdylib` from `native/rust-blake3`, which the
