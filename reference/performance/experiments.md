@@ -2503,3 +2503,80 @@ Rule learned: recorded above as the corroboration gate in the measurement
 protocol. A surprising cell earns an isolated re-measurement before it earns an
 explanation. The cost asymmetry is stark — the audit runs in about a minute,
 while the wrong explanation reached a committed document.
+
+## E027 — retained footprint per hasher: 12 KiB, and 9 KiB of it to hash 64 bytes
+
+Date: 2026-08-07
+Environment: **A** (Apple M5), OpenJDK 25.0.4, aarch64.
+
+Allocation rate has been gated since E010. This measures the other memory axis:
+how much a *live* hasher holds. The two are independent — FastBlake's update
+path is allocation-free at 8 MiB and still retains buffers afterwards, and a
+caller pooling one hasher per connection pays the second number, not the first.
+
+Change: added `org.openjdk.jol:jol-core:0.17` at harness scope (`main` stays
+dependency-free) and a `Footprint` reporter behind `./gradlew footprint`. It
+walks the object graph reachable from one hasher with
+`GraphLayout.parseInstance(...).totalSize()` at three lifecycle points.
+
+`jol.magicFieldOffset=true` is required: the harness `Hasher` adapters are
+records, and `Unsafe` refuses field offsets on record classes.
+
+### Result
+
+| contender | fresh | after 64 B | after 8 MiB | growth |
+|---|---:|---:|---:|---:|
+| `commons` | 464 B | 464 B | 1,136 B | +672 B |
+| `rust` | 88 B | 88 B | 88 B | +0 B |
+| `java-cpu` | 1,384 B | **9,592 B** | **12,136 B** | **+10,752 B** |
+
+**FastBlake retains 10.7x what Commons Codec does** after the same work. The
+composition accounts for all of it, with nothing attributable to reachable
+statics:
+
+| field | bytes |
+|---|---:|
+| `vectorPending` (`byte[8192]`) | 8,208 |
+| `cvStack` (`int[432]`) | 1,744 |
+| `chunk` (`byte[1024]`) | 1,040 |
+| `vectorPacked` (`int[128]`) | 528 |
+| `vectorCvs` (`int[64]`) | 272 |
+| scratch, key, headers | ~344 |
+
+**The 64-byte column is the finding.** A hasher that has done nothing but hash
+64 bytes already holds 9.4 KiB, because E025 P1/P3 route every `update()` call
+through `updateVectorStream`, which calls `vectorPending()` and allocates the
+full 8 KiB streaming batch on first touch. E025 P0a made these buffers lazy
+specifically so small work would not pay for large-input machinery; P1 and P3
+then made the smallest possible update touch the largest buffer, and the
+laziness now buys nothing for the common case.
+
+At scale that is the difference between 11 MB and 121 MB of live data for
+10,000 pooled hashers.
+
+`rust` is a Java wrapper over an off-heap `blake3::Hasher`; its 88 B row is a
+floor, not a total, and JOL cannot see the native allocation. The static
+one-shot entry points on every contender retain nothing between calls, so this
+axis only matters for callers holding hasher instances.
+
+Decision: record; no code change in this entry. The throughput work stands —
+P1 is worth 2.26x on streaming and is not in question. What is in question is
+that its buffer is allocated on a code path that cannot use it.
+
+### Proposed fix, for a separate experiment
+
+Defer `vectorPending` until the input actually needs a batch. While at most one
+chunk has been seen, buffer into the existing `chunk` array; allocate the batch
+buffer only when a second update pushes past `CHUNK_LEN`. Finalization already
+handles a retained batch of at most one chunk as a special case, so the shape is
+close to what is there. Expected: fresh and small-input hashers drop to roughly
+1.4 KiB, with large-input behaviour and all E025 throughput unchanged.
+
+Gate it on both axes: `./gradlew footprint` for the retained numbers, and
+`dispatchAudit` plus the standard sweep to prove streaming throughput did not
+move.
+
+Rule learned: allocation rate and retained footprint are different measurements
+and can move in opposite directions. E025 P0a reduced allocation per call while
+*increasing* what a hasher retains, and nothing in the protocol would have
+caught that. `./gradlew footprint` is now the second memory gate.

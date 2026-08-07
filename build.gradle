@@ -27,6 +27,7 @@ ext {
     commonsCodecVersion = '1.22.0'
     junitVersion = '5.12.2'
     jmhVersion = '1.37'
+    jolVersion = '0.17'
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +68,9 @@ dependencies {
     // Apache Commons Codec is a contender and the correctness oracle. It is a
     // harness dependency only -- `main` has no dependencies and never will.
     harnessImplementation "commons-codec:commons-codec:${commonsCodecVersion}"
+    // E027: retained-footprint measurement. Harness scope only; `main` stays
+    // dependency-free.
+    harnessImplementation "org.openjdk.jol:jol-core:${jolVersion}"
 
     testImplementation "org.junit.jupiter:junit-jupiter:${junitVersion}"
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
@@ -369,4 +373,24 @@ tasks.register('dispatchAudit') {
         logger.lifecycle('')
         logger.lifecycle(text)
     }
+}
+
+// E027. Deep retained size of one hasher per contender, at three lifecycle
+// points. Allocation rate (bytes/op) has been gated since E010; this measures
+// the other axis — how much a live hasher *keeps*, which matters for any caller
+// holding many of them.
+//
+//   ./gradlew footprint
+tasks.register('footprint', JavaExec) {
+    group = 'verification'
+    description = 'Deep retained size per hasher, per contender (JOL).'
+    mainClass = 'com.pedrobatista.fastblake.harness.Footprint'
+    classpath = sourceSets.harness.runtimeClasspath
+    configureNativeAccess(it)
+    // JOL reads object layout through the JDK internals it is designed for.
+    // magicFieldOffset is required because the harness Hasher adapters are
+    // records, and Unsafe refuses field offsets on record classes.
+    systemProperty 'jol.magicFieldOffset', 'true'
+    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED',
+            '--add-opens=java.base/java.util=ALL-UNNAMED'
 }
