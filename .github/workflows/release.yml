@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The workflow only needs to read the repository. Signing and Central
+# credentials are supplied by the protected `release` environment below.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Test and verify release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run release checks
+        run: ./gradlew --no-daemon releaseCheck
+
+  publish:
+    name: Sign and publish to Central Portal
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    env:
+      # These are environment secrets, never repository files or plaintext
+      # workflow values. Gradle maps ORG_GRADLE_PROJECT_* to project properties.
+      ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_PRIVATE_KEY }}
+      ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_PASSPHRASE }}
+      CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+      CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Verify tag matches project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          project_version="$(./gradlew --no-daemon properties -q | awk -F': ' '$1 == "version" { print $2; exit }')"
+          if [[ "$tag_version" != "$project_version" ]]; then
+            echo "Tag version ($tag_version) does not match build version ($project_version)." >&2
+            exit 1
+          fi
+
+      - name: Build signed Central bundle
+        run: ./gradlew --no-daemon centralBundle -Prelease
+
+      - name: Upload and publish bundle
+        id: central
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="build/central/fastblake-${GITHUB_REF_NAME#v}-central-bundle.zip"
+          [[ -f "$bundle" ]] || { echo "Missing bundle: $bundle" >&2; exit 1; }
+          [[ -n "${CENTRAL_USERNAME}" && -n "${CENTRAL_PASSWORD}" ]] || {
+            echo "CENTRAL_USERNAME and CENTRAL_PASSWORD must be configured in the release environment." >&2
+            exit 1
+          }
+
+          # Central Portal user tokens are base64(username:password), sent as
+          # a Bearer token. Do not print this value or add it to workflow output.
+          central_auth="$(printf '%s:%s' "$CENTRAL_USERNAME" "$CENTRAL_PASSWORD" | base64 | tr -d '\n')"
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer ${central_auth}" \
+            --form "bundle=@${bundle}" \
+            'https://central.sonatype.com/api/v1/publisher/upload?publishingType=AUTOMATIC')"
+
+          # The API currently returns the deployment UUID as a string. Accept
+          # the object form too, so a harmless API response-shape change does
+          # not make the deployment appear to have failed.
+          if printf '%s' "$response" | jq -e . >/dev/null 2>&1; then
+            deployment_id="$(printf '%s' "$response" | jq -r 'if type == "string" then . else (.deploymentId // .id // .) end')"
+          else
+            deployment_id="$(printf '%s' "$response" | tr -d '\r\n' | sed 's/^"//; s/"$//')"
+          fi
+          [[ -n "$deployment_id" ]] || { echo "Central returned no deployment id." >&2; exit 1; }
+          echo "::add-mask::$deployment_id"
+          echo "deployment_id=$deployment_id" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Central Portal deployment'
+            echo
+            echo "Uploaded an automatic deployment for \`${GITHUB_REF_NAME}\`."
+            echo "Deployment id: \`${deployment_id}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for attempt in {1..36}; do
+            status_response="$(curl --fail-with-body --silent --show-error \
+              --request POST \
+              --header "Authorization: Bearer ${central_auth}" \
+              "https://central.sonatype.com/api/v1/publisher/status?id=${deployment_id}")"
+            state="$(printf '%s' "$status_response" | jq -r '.deploymentState // empty')"
+            echo "Central deployment state: ${state:-unknown}"
+            case "$state" in
+              PUBLISHED)
+                echo 'Central Portal reports the deployment as PUBLISHED.' >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              FAILED)
+                echo "$status_response" >&2
+                echo 'Central Portal validation or publication failed.' >&2
+                exit 1
+                ;;
+              PENDING|VALIDATING|PUBLISHING)
+                sleep 10
+                ;;
+              *)
+                echo "$status_response" >&2
+                echo 'Central Portal returned an unknown deployment state.' >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo 'Timed out waiting for Central Portal to publish the deployment.' >&2
+          exit 1

@@ -240,9 +240,10 @@ The build currently lacks publication configuration. Add:
 
 The likely coordinate can initially be:
 
-com.pedrobatista:fastblake:0.x.y
+eu.pedrobatista:fastblake:0.1.0
 
-The group should use a domain you control before Maven Central publication if com.pedrobatista does not satisfy repository ownership verification.
+The `eu.pedrobatista` namespace is registered in Sonatype Central Portal and is
+the coordinate used by the first publication.
 
 ## 10. Add a consumer integration test
 
@@ -307,5 +308,4 @@ A production release should require:
 
 The key principle is: experiments remain first-class citizens of the repository, but they are no longer first-class citizens of the distributed artifact. That preserves
 FastBlake’s performance laboratory without making downstream users carry its entire history.
-
 
