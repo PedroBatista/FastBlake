@@ -484,6 +484,14 @@ publishing {
                         url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
                     }
                 }
+                developers {
+                    developer {
+                        id = 'pedrobatista'
+                        name = 'Pedro Batista'
+                        email = 'pedrobatistawork@gmail.com'
+                        url = 'https://pedrobatista.eu'
+                    }
+                }
                 scm {
                     connection = 'scm:git:https://github.com/pedrobatista/FastBlake.git'
                     developerConnection = 'scm:git:ssh://git@github.com/pedrobatista/FastBlake.git'
@@ -574,9 +582,20 @@ tasks.register('centralStaging', Sync) {
         include '*.asc'
     }
     doLast {
-        def digestNames = ['SHA-256': 'sha256', 'SHA-512': 'sha512']
+        def digestNames = [
+                'MD5'    : 'md5',
+                'SHA-1'  : 'sha1',
+                'SHA-256': 'sha256',
+                'SHA-512': 'sha512'
+        ]
         fileTree(new File(centralStagingDir, centralGroupVersionDir)).files
-                .findAll { !it.name.endsWith('.asc') && !it.name.endsWith('.sha256') && !it.name.endsWith('.sha512') }
+                .findAll {
+                    !it.name.endsWith('.asc')
+                            && !it.name.endsWith('.md5')
+                            && !it.name.endsWith('.sha1')
+                            && !it.name.endsWith('.sha256')
+                            && !it.name.endsWith('.sha512')
+                }
                 .each { artifact ->
                     digestNames.each { algorithm, suffix ->
                         def digest = java.security.MessageDigest.getInstance(algorithm)
