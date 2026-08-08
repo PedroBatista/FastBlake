@@ -558,10 +558,19 @@ tasks.register('centralStaging', Sync) {
         include 'module.json'
         rename { "fastblake-${project.version}.module" }
     }
-    from(layout.buildDirectory.dir('libs')) {
-        include '*.asc'
+    // The detached signatures must use the same renamed filenames as the
+    // publication artifacts. Central derives the required artifact path from
+    // each .asc filename; leaving pom-default.xml.asc beside a renamed POM
+    // makes the Portal report the POM as missing.
+    from(layout.buildDirectory.dir('publications/mavenJava')) {
+        include 'pom-default.xml.asc'
+        rename { "fastblake-${project.version}.pom.asc" }
     }
     from(layout.buildDirectory.dir('publications/mavenJava')) {
+        include 'module.json.asc'
+        rename { "fastblake-${project.version}.module.asc" }
+    }
+    from(layout.buildDirectory.dir('libs')) {
         include '*.asc'
     }
     doLast {
@@ -574,6 +583,16 @@ tasks.register('centralStaging', Sync) {
                                 .digest(artifact.bytes)
                         def hex = digest.collect { String.format('%02x', it & 0xff) }.join()
                         new File(artifact.parentFile, artifact.name + ".${suffix}").text = hex + System.lineSeparator()
+                    }
+                }
+        fileTree(new File(centralStagingDir, centralGroupVersionDir)).files
+                .findAll { it.name.endsWith('.asc') }
+                .each { signature ->
+                    def artifact = new File(signature.parentFile,
+                            signature.name.substring(0, signature.name.length() - '.asc'.length()))
+                    if (!artifact.isFile()) {
+                        throw new GradleException(
+                                "Signature ${signature.name} has no matching artifact ${artifact.name}")
                     }
                 }
         logger.lifecycle("centralStaging: staged ${centralStagingDir}/${centralGroupVersionDir}")
