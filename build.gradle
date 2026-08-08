@@ -501,8 +501,17 @@ publishing {
 signing {
     def signingKey = providers.gradleProperty('signingInMemoryKey')
     def signingPassword = providers.gradleProperty('signingInMemoryKeyPassword')
+    def signingKeyId = providers.gradleProperty('signingKeyId')
     if (signingKey.isPresent()) {
-        useInMemoryPgpKeys(signingKey.get(), signingPassword.orElse('').get())
+        // CI exports the signing subkey rather than the primary secret key.
+        // Gradle requires the subkey id for an in-memory subkey ring; without
+        // it it tries to query an absent default-key provider at execution time.
+        if (!signingKeyId.isPresent() || signingKeyId.get().trim().isEmpty()) {
+            throw new GradleException(
+                    'signingKeyId is required when signingInMemoryKey contains a signing subkey '
+                            + '(use the final 8 hex digits of its key id).')
+        }
+        useInMemoryPgpKeys(signingKeyId.get(), signingKey.get(), signingPassword.orElse('').get())
     }
     required { project.hasProperty('release') }
     sign publishing.publications.mavenJava

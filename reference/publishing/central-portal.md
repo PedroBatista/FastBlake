@@ -70,6 +70,7 @@ subkey through Gradle properties:
 ```bash
 export ORG_GRADLE_PROJECT_signingInMemoryKey="$(< fastblake-signing-subkey.asc)"
 export ORG_GRADLE_PROJECT_signingInMemoryKeyPassword='your-key-password'
+export ORG_GRADLE_PROJECT_signingKeyId='96167B95'
 ./gradlew centralBundle -Prelease
 ```
 
@@ -107,6 +108,8 @@ unzip -l build/central/fastblake-0.1.0-central-bundle.zip
 2. Add these **environment secrets** (not ordinary repository secrets):
    `GPG_PRIVATE_KEY` = the complete contents of
    `fastblake-signing-subkey.asc`; `GPG_PASSPHRASE` = its passphrase;
+   `GPG_KEY_ID` = the final 8 hexadecimal characters of the signing subkey's
+   key ID (for this key: `96167B95`);
    `CENTRAL_USERNAME` and `CENTRAL_PASSWORD` = the two values from a Central
    Portal **User Token**. Do not paste the base64 token itself into the source
    tree.

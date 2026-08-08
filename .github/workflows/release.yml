@@ -45,6 +45,7 @@ jobs:
       # workflow values. Gradle maps ORG_GRADLE_PROJECT_* to project properties.
       ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_PRIVATE_KEY }}
       ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_PASSPHRASE }}
+      ORG_GRADLE_PROJECT_signingKeyId: ${{ secrets.GPG_KEY_ID }}
       CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
       CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
     steps:
