@@ -2843,6 +2843,29 @@ The throughput column is a consistency check, not a result: at 128 bits the wide
 kernel is the four-chunk kernel with a computed stride, and it measures within
 0.3% of it. If those two rows had disagreed, the port would have been wrong.
 
+Regression gate on the production default, full protocol — 2 forks × 5×1s
+warmup × 5×1s measurement, 8 MiB, no override, so `EIGHT_CHUNK` as always:
+
+| shape | recorded baseline | E028 | delta |
+|---|---:|---:|---:|
+| `oneShot` | 2,137 | 2,148 | +0.5% |
+| `reusedInstance` | 2,141 | 2,154 | +0.6% |
+| `streaming4k` | 2,083 | 2,044 | −1.9% |
+
+All inside the 3% inconclusive band. Raw JSON:
+`build/e028-m5-default-regression.json` (3,723,805 / 3,714,417 / 3,914,389
+ns/op). **E028 moves no number on this machine and was never going to**: the
+kernel it ships is unreachable without a property, and at this machine's 128-bit
+preferred width it would be the four-chunk kernel even if it were reached. The
+gate exists to prove the dispatch changes cost nothing, not to show a win.
+
+That sweep also priced the `-Dfastblake.wideBits` warning above, which had been
+an assertion until now. On this 128-bit machine `WideVectorAllocationBenchmark`
+measured `mixChain128` at 3,550 ns against `mixChain256` at 41,267 ns — the
+Vector API emulating a 256-bit species is **11.6x slower** than the native
+width. Pinning a wider species is therefore usable for correctness and
+worthless, not merely imprecise, for timing.
+
 ### Two fixes made in passing
 
 * **Forcing a vector kernel on a JVM without `jdk.incubator.vector` was a
