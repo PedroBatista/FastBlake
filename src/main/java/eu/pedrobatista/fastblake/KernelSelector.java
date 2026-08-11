@@ -28,10 +28,15 @@ import java.util.Locale;
  *
  * <h2>Overriding</h2>
  *
- * {@code -Dfastblake.kernel=auto|scalar|four|eight} forces a production choice,
- * for benchmarking and for embedders who know their fleet. Historical kernel
- * switches belong to the experiment source set and are intentionally not
+ * {@code -Dfastblake.kernel=auto|scalar|four|eight|wide} forces a production
+ * choice, for benchmarking and for embedders who know their fleet. Historical
+ * kernel switches belong to the experiment source set and are intentionally not
  * interpreted by the shipped library.
+ *
+ * <p>{@code wide} is shipped, conformance-tested and reachable, but is not
+ * selected automatically anywhere: no machine has measured it as the winner
+ * yet. That is the table's rule working as intended rather than an oversight —
+ * see {@link #selectAutomatically()}.
  */
 final class KernelSelector {
 
@@ -42,7 +47,15 @@ final class KernelSelector {
         /** E011/E014 four independent chunks in 128-bit lanes. */
         FOUR_CHUNK(4),
         /** E024 two interleaved four-chunk batches, eight chunks in flight. */
-        EIGHT_CHUNK(8);
+        EIGHT_CHUNK(8),
+        /**
+         * E013/E028 one chunk per lane at the machine's preferred width.
+         *
+         * <p>Batch size is the lane count, so this is four chunks on NEON or
+         * SSE, eight on AVX2 and sixteen on AVX-512. Reachable only through
+         * {@code -Dfastblake.kernel=wide}: see {@link #selectAutomatically}.
+         */
+        WIDE(CpuCapabilities.WIDE_LANES);
 
         final int chunksPerBatch;
 
@@ -63,9 +76,21 @@ final class KernelSelector {
             case "scalar" -> Kernel.SCALAR;
             case "four", "four-chunk" -> Kernel.FOUR_CHUNK;
             case "eight", "eight-chunk", "dual" -> Kernel.EIGHT_CHUNK;
+            case "wide", "preferred" -> Kernel.WIDE;
             default -> null;
         };
-        if (forced != null) {
+        if (forced != null && forced != Kernel.SCALAR
+                && CpuCapabilities.PREFERRED_VECTOR_BITS == 0) {
+            // Forcing a vector kernel on a JVM that has no Vector API used to
+            // fail with NoClassDefFoundError on the first input large enough to
+            // form a batch: the kernel classes hold their species in a static
+            // final field, so merely reaching one initialises it. The override
+            // is a benchmarking convenience and must not be able to break the
+            // documented scalar fallback.
+            SELECTED = Kernel.SCALAR;
+            REASON = "-D" + OVERRIDE_PROPERTY + "=" + override + " requests a vector kernel, but "
+                    + CpuCapabilities.VECTOR_UNAVAILABLE_REASON;
+        } else if (forced != null) {
             SELECTED = forced;
             REASON = "forced by -D" + OVERRIDE_PROPERTY + "=" + override;
         } else if (!override.equals("auto")) {
@@ -110,6 +135,19 @@ final class KernelSelector {
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
         // registers spills more than the added parallelism buys. E011/E014's
         // four-chunk kernel is the measured-good choice on x86-64 so far.
+        //
+        // UNRESOLVED, and the largest known headroom in the project: this
+        // four-chunk kernel is 128-bit, so on x86-64 it emits XMM and uses half
+        // an AVX2 datapath or a quarter of an AVX-512 one (E021 confirmed the
+        // XMM encoding from disassembly). Kernel.WIDE reaches eight chunks in
+        // flight the way the register file allows here -- eight lanes wide
+        // rather than E024's two interleaved four-lane batches -- and E028
+        // predicts it wins on AVX2 for exactly the reason E024 loses.
+        //
+        // It stays out of automatic selection until a machine measures it,
+        // because rule 1 of this table admits no extrapolation. Running
+        // `./gradlew dispatchAudit` on an AVX2 or AVX-512 machine is the whole
+        // experiment; a MISMATCH verdict there is what flips this branch.
         if (CpuCapabilities.IS_X86_64) {
             return Kernel.FOUR_CHUNK;
         }

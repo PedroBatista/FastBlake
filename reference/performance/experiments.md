@@ -2665,3 +2665,223 @@ Added `keyedHash(byte[], byte[])` and Commons-compatible
 FastBlake measured 2,137 / 2,141 / 2,083 MiB/s for one-shot / reused /
 streaming, versus 2,116 / 2,114 / 2,063 MiB/s in the recorded baseline. Deltas
 were +1.0%, +1.3%, and +1.0%, inside the 3% margin. Decision: keep.
+
+## E028 — ISA headroom audit: where assembly work is finished, and where it is not
+
+Date: 2026-08-11
+Environment: **A** (Apple M5, macOS 26.6), Temurin JDK 25.0.4.
+
+A review question — "are there other CPU instruction-set optimisations C2 can
+produce, or is this as good as the ROI allows?" — turned out to have two
+different answers depending on the architecture, and the ledger already
+contained most of the evidence for both. This entry states the audit, ranks what
+is left, and implements the one item that was a standing unrun prediction.
+
+No new throughput claim is made here. Nothing in this entry changes what any
+machine selects by default.
+
+### AArch64: finished, and provably so
+
+Three prior results compose into a closure argument that no further
+instruction-level work on the M5 four-chunk kernel can pay:
+
+1. **E022** disassembled the round body: 48 vector adds, 32 eors, 64
+   `ushr`+`sli`, 16 message loads. That is the exact theoretical minimum for one
+   four-lane BLAKE3 round, with **zero** vector spill traffic. `ushr`+`sli` is
+   what `VectorOperators.ROR` must lower to — AArch64 has no 32-bit vector
+   rotate.
+2. **E023** proved the loop is latency-bound, not issue-bound: deleting all 85
+   scalar index and bounds-check instructions, 35% of the body, bought 0.7%.
+3. **E024** confirmed the consequence from the other side: a kernel with 8.8%
+   *more* instructions per unit of work, and 30 spills where there had been
+   none, was 36% faster.
+
+The mixing math is at the ISA floor and the surrounding scalar work is free.
+There is nothing left to win here by emitting different instructions; only by
+putting more independent work in flight.
+
+### x86-64: the production kernels are 128-bit, i.e. SSE-width
+
+Both shipped chunk-parallel kernels hard-code `IntVector.SPECIES_128`, and
+`KernelSelector` returns `FOUR_CHUNK` for every x86-64 machine. E021 confirmed
+from disassembly that this emits XMM, not YMM. So on x86-64 FastBlake uses half
+an AVX2 datapath, or a quarter of an AVX-512 one, while the reference crate
+dispatches to its 8-way or 16-way kernel. That is consistent with where the two
+architectures stand against the ceiling: 85% of Rust on the M5 against 44%
+(Ryzen 3200G) and 38% (N97).
+
+The E025 plan already identified the fix and called retesting it "the first
+experiment this plan calls for", on an explicit register-file model: eight
+chunks in flight is the goal, and on AVX2 the register-equivalent route is eight
+lanes wide (16 state vectors into 16 YMM) rather than E024's two interleaved
+four-lane batches (32 into 16, which spills and loses). **That retest was never
+run.** The ledger goes P0 → P1 → P2 → P2b → E026 → E027 with no entry for it.
+
+Prior evidence is real but does not settle it, because every measurement of the
+wide kernel predates the objective it should be judged against. E013 and E020
+compared it to the *four*-chunk kernel, not to E024, and E020's per-byte margin
+on the N97 was only 5.2% stock — with instructions per KiB down 44.6% but IPC
+down from 3.65 to 2.21. The one x86 machine available for the retest, a Ryzen
+3200G, is Zen+, which cracks 256-bit AVX2 into two 128-bit micro-operations and
+is therefore the least favourable host it could run on. A Zen 3+ or Golden Cove
+part is what would answer the question cleanly.
+
+### The AVX2 rotate item is closed, but worth watching
+
+E016, E019 and E020 settled this: AVX2 has no 32-bit vector rotate below
+AVX-512's `VPRORD`, the `vpshufb` expression for ROR8/ROR16 is correct in
+isolation and unshippable when integrated (205,426,540 B allocated per 8 MiB
+hash; 774 → 245 MiB/s), and a locally patched JDK that lowers it properly gave
++20.3% at four lanes and +19.8% at eight. The consequence for planning: **if a
+stock JDK ever ships that lowering, x86-64 gains roughly 20% with no source
+change at all.** Re-running `VectorPrimitiveBenchmark` once per JDK bump is the
+entire cost of tracking it.
+
+### Two candidates the ledger does not yet contain
+
+Both follow from E023's finding rather than contradicting it, and neither has
+been measured.
+
+1. **Byte-shuffle rotates on AArch64.** The note in `Blake3ChunkVectorScratch`
+   records E016's rejection, but that was measured on x86 and justified by
+   instruction count, which E023 retired as a metric. The latency argument is
+   different and still open: `ushr`+`sli` is two *dependent* operations, a table
+   lookup is one, and two of the four rotations per G (16 and 8) are pure byte
+   permutations. On a loop whose critical path is ~18 dependent vector
+   operations per G, that is a candidate for shortening the chain by roughly
+   11%, not for shrinking a free instruction count. The E016 allocation blocker
+   applies equally and must be gated first — isolated rung, then integration.
+2. **Overlapping the transpose with the round loop.** The transpose is 64 scalar
+   `LE_INT` loads per block (128 in the dual kernel), serialised ahead of the
+   rounds. Block N+1's transpose is independent of block N's rounds, and E023
+   measured spare issue capacity in exactly that window. Double-buffering the
+   message scratch and transposing one block ahead is the same "more independent
+   work in flight" lever that won E024. E023's probe never covered this: variant
+   B removed the message *loads* inside the round loop and left the transpose
+   running in both arms. Size the prize with a probe before building it — E014
+   already cut this phase from ~30% of the kernel to something much smaller.
+
+### Ranked by return, which is not the same as ranked by interest
+
+| rank | item | payoff | cost | blocker |
+|---|---|---|---|---|
+| 1 | mid-size ladder (16 KiB) | +~25% at a real size | medium | none |
+| 2 | intra-hash threading | multiples on 10 cores | high | none |
+| 3 | wide kernel on AVX2 | +5–20% on x86-64 | medium | needs a modern x86 machine |
+| 4 | transpose overlap | ~5–10%, all architectures | low | none |
+| 5 | AArch64 shuffle rotates | ~10% on M5 if it survives the allocation gate | low | none |
+| 6 | AVX-512 kernel | large on that hardware | high | no hardware |
+
+The honest headline is that **ISA work is no longer where the gap lives.** The
+README's own numbers say it: 16 KiB runs at 71% of the 8 MiB rate, and Rust is
+saturated by 16 KiB. Items 1 and 2 beat every instruction-selection item on this
+list, and item 2 is the only one on it that can move the number by a multiple.
+
+### What this entry implements: the wide kernel becomes a shipped kernel
+
+Item 3 is the one that was a standing, written-down prediction with no result,
+so it is the one that gets built. `Blake3ChunkVectorWide` moves from
+`src/experiment` to `src/main` and becomes reachable as
+`-Dfastblake.kernel=wide`, joining `scalar`/`four`/`eight`.
+
+* `KernelSelector.Kernel.WIDE` takes its batch size from the lane count, so it
+  is four chunks on NEON or SSE, eight on AVX2 and sixteen on AVX-512.
+* `FastBlake` dispatches to it through a separate `WIDE_KERNEL` static final
+  flag rather than by widening the `VECTOR_STREAM_CHUNKS == 8` tests, so on
+  machines that do not select it the fixed-width dispatch stays exactly the
+  constant-folded integer compare it was. It inherits the E025 P1 streaming
+  batch, the P2 four-chunk ladder rung and the P2b drain unchanged, which is the
+  gap that made E020's wide route fall back to scalar at 398 MiB/s on 4 KiB
+  updates.
+* `-Dfastblake.wideBits=128|256|512` pins the species instead of taking the
+  preferred width. The Vector API implements a species wider than the hardware
+  by splitting it, so this makes the eight- and sixteen-lane paths — and, more
+  importantly, FastBlake's batch, ladder and drain arithmetic around a batch
+  size that is neither 4 nor 8 — testable on a 128-bit machine. It is a
+  correctness lever only; a pinned width is slower than the native one and
+  `describe()` says so on every line it prints, so a pinned run cannot be
+  mistaken for a measurement.
+
+**Automatic selection is unchanged on every machine, deliberately.** Rule 1 of
+the dispatch table admits no extrapolation, and this machine cannot measure an
+8-lane kernel. Shipping the kernel while leaving the table alone is the rule
+working, not an omission.
+
+### Gates, in protocol order
+
+Correctness, full official-vector suite, `./gradlew test --rerun`:
+
+| configuration | lanes per batch | result |
+|---|---:|---|
+| default (`EIGHT_CHUNK`) | 8 | 547 pass |
+| `-Dfastblake.kernel=wide` | 4 | 547 pass |
+| `-Dfastblake.kernel=wide -Dfastblake.wideBits=256` | 8 | 547 pass |
+| `-Dfastblake.kernel=wide -Dfastblake.wideBits=512` | 16 | 547 pass |
+
+542 of those are the official vectors across every available contender; the
+other 5 are new. `WideChunkKernelTest` holds the wide kernel against the
+four-chunk kernel lane-for-lane — plain mode, non-zero flags, a batch straddling
+the 2^32 counter boundary, and a non-zero input offset — so the kernel keeps
+coverage in an ordinary build on a machine that never selects it. The oracle is
+valid at any lane count that is a multiple of four, which is all of them.
+
+Allocation gate, `oneShot` at 8 MiB, 1 fork × 3 warmup × 3 measurement,
+`-prof gc`, this machine:
+
+| kernel | B/op | B per input byte | ns/op | MiB/s |
+|---|---:|---:|---:|---:|
+| `wide` (4 lanes here) | 12,442 | 0.0015 | 4,939,663 | 1,620 |
+| `four` | 12,826 | 0.0015 | 4,924,689 | 1,625 |
+| `eight` (the default) | 16,915 | 0.0020 | 3,950,749 | 2,025 |
+
+Allocation is fixed per call, not proportional to input, which is the property
+the gate exists to protect. The wide row sitting a few hundred bytes *under*
+`four` is the expected consequence of sizing the message scratch from the
+selected kernel rather than from the maximum over all of them.
+
+The throughput column is a consistency check, not a result: at 128 bits the wide
+kernel is the four-chunk kernel with a computed stride, and it measures within
+0.3% of it. If those two rows had disagreed, the port would have been wrong.
+
+### Two fixes made in passing
+
+* **Forcing a vector kernel on a JVM without `jdk.incubator.vector` was a
+  latent crash.** `-Dfastblake.kernel=four` set `VECTOR_STREAM_CHUNKS` to 4
+  regardless of the capability probe, so any input large enough to form a batch
+  reached the kernel class and failed with `NoClassDefFoundError` — verified
+  directly: `Class.forName` on `Blake3ChunkVectorScratch` under a module-less
+  JVM throws, because the species is a static final field. Small inputs never
+  reached it, which is why the consumer smoke test never caught it.
+  Pre-existing and unrelated to this work, but on the exact lines being edited.
+  All four overrides now degrade to the scalar kernel and report why, checked
+  against the published jar with no `--add-modules`. The documented fallback is
+  a promise the property was able to break.
+* **Dead branches in `update()`.** The two chunk-parallel blocks in `update()`
+  are unreachable: the method returns to `updateVectorStream` whenever
+  `VECTOR_STREAM_CHUNKS > 0`, and those branches test for 8 and 4. They are left
+  in place rather than removed as a drive-by, but nothing new was added to them
+  and they should be deleted by whoever next touches that method.
+
+### To close item 3, on a machine that can
+
+```
+./gradlew dispatchAudit            # now measures scalar, four, eight and wide
+```
+
+`wide` is in the audit's kernel list, so on an AVX2 or AVX-512 machine one
+command produces the comparison this entry could not. A `MISMATCH` verdict
+naming `wide` is the evidence that authorises changing the x86-64 branch of
+`KernelSelector`, and nothing less is. On a 128-bit machine the audit will
+report `wide` and `four` as near-duplicates, which is correct and uninteresting.
+
+Predictions on record, so the retest can falsify them rather than confirm a
+preference:
+
+1. On AVX2 with a full-width 256-bit datapath (Zen 3+, Golden Cove), `wide`
+   beats both `four` and `eight`.
+2. On Zen+ (the 3200G), `wide` beats `eight` but its margin over `four` is
+   small, because 256-bit operations are cracked into two 128-bit
+   micro-operations and only the register-file fit remains as a mechanism.
+3. On AVX-512, `wide` wins by more than width alone accounts for, because
+   `VPRORD` collapses each rotation to one instruction and removes the penalty
+   E019 measured at ~20%.

@@ -21,7 +21,8 @@ kernels. Historical and candidate kernels live under `src/experiment` and can
 be compiled with `./gradlew experimentClasses`; JMH receives them on its
 benchmark classpath. The old `fastblake.experimental.*` properties are archived
 experiment records and are no longer interpreted by `FastBlake`. Use
-`-Dfastblake.kernel=auto|scalar|four|eight` for current dispatch experiments.
+`-Dfastblake.kernel=auto|scalar|four|eight|wide` for current dispatch
+experiments.
 
 ```
 ./gradlew contenders   # what can run here, and why anything can't
@@ -416,6 +417,56 @@ limitation E011 had before E016.
 Raw JSON: `build/jmh-dual-ryzen.json` (full sweep, includes the outlier
 iterations for anyone who wants to see them), plus the two targeted re-checks
 noted above.
+
+### Where the remaining headroom is
+
+E028 audited what instruction-set work is left. The answer differs by
+architecture, and the short version is that **assembly is no longer where the
+gap lives.**
+
+On AArch64 the kernels are at the ISA floor and it is provable rather than
+asserted. E022 disassembled the round body and found the exact theoretical
+minimum of vector arithmetic — 48 adds, 32 eors, 64 `ushr`+`sli`, 16 loads —
+with zero spill traffic; E023 then showed the loop is latency-bound, so deleting
+35% of its instructions bought 0.7%. Nothing is left to win by emitting
+different instructions on this machine, only by putting more independent work in
+flight, which is what E024 did.
+
+On x86-64 there is real headroom, and it is exactly the width question:
+**both shipped chunk-parallel kernels are 128-bit**, so an AVX2 core runs at
+half its datapath and an AVX-512 core at a quarter. That matches where the two
+architectures stand against the ceiling — 85% of Rust here against 38–44% on the
+two x86 machines measured. E028 promotes `Blake3ChunkVectorWide` to a shipped
+kernel (`-Dfastblake.kernel=wide`, one chunk per lane at the machine's preferred
+width) so that the comparison E025 predicted but never ran is one command:
+
+```
+./gradlew dispatchAudit    # measures scalar, four, eight and wide, and judges
+```
+
+It passes the full official-vector suite at 4, 8 and 16 lanes and holds the
+allocation gate, but **no machine selects it automatically**, because no machine
+has measured it as the winner. The dispatch table takes measurements, never
+extrapolations, and the machine that could settle this is an AVX2 or AVX-512 box
+rather than this one.
+
+Ranked by return, the ISA items are not the top of the list:
+
+| rank | item | payoff | blocker |
+|---|---|---|---|
+| 1 | mid-size ladder (16 KiB) | +~25% at a real size | none |
+| 2 | intra-hash threading | multiples on 10 cores | none |
+| 3 | wide kernel on AVX2 | +5–20% on x86-64 | needs a modern x86 machine |
+| 4 | transpose overlap | ~5–10%, all architectures | none |
+| 5 | AArch64 shuffle rotates | ~10% here, if it clears the allocation gate | none |
+| 6 | AVX-512 kernel | large on that hardware | no hardware |
+
+One item costs nothing to hold: AVX2 has no 32-bit vector rotate below
+AVX-512's `VPRORD`, and a locally patched JDK that lowers the `vpshufb`
+expression properly measured +20% (E019/E020). The library-only form of it
+allocates and is unshippable (E016), so if a stock JDK ever ships that lowering,
+x86-64 gains roughly 20% with no source change at all. See E028 in
+`reference/performance/experiments.md` for the full audit.
 
 ## How the Rust contender is wired
 
