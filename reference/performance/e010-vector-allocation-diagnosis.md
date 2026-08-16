@@ -315,5 +315,5 @@ java ... -Xmx2g -Dfastblake.experimental.heapChunkVector=true AllocDriver
 java ... -Xlog:gc -Xmx2g Driver 6 | grep -c "Pause Young"
 
 # method sizes
-javap -c -p build/classes/java/main/com/pedrobatista/fastblake/Blake3ChunkVector4.class
+javap -c -p build/classes/java/main/eu/pedrobatista/fastblake/Blake3ChunkVector4.class
 ```
