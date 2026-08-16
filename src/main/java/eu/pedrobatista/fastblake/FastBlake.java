@@ -20,6 +20,15 @@ public final class FastBlake {
     /** The production selector chooses only measured, shipped kernels. */
     private static final int VECTOR_STREAM_CHUNKS = KernelSelector.selected().chunksPerBatch;
 
+    // E028: the preferred-width kernel's batch size is its lane count, which is
+    // 4, 8 or 16 depending on the machine, so it cannot be identified by
+    // VECTOR_STREAM_CHUNKS the way the fixed-width kernels are. A separate
+    // static final flag keeps the fixed-width dispatch below a constant-folded
+    // integer compare on machines that do not select it -- which is every
+    // machine that does not ask for it by property.
+    private static final boolean WIDE_KERNEL =
+            KernelSelector.selected() == KernelSelector.Kernel.WIDE;
+
     /** The kernel this JVM selected, and why. For diagnostics and the harness. */
     public static String selectedKernel() {
         return KernelSelector.describe();
@@ -88,10 +97,18 @@ public final class FastBlake {
     private int[] vectorPacked() {
         int[] packed = vectorPacked;
         if (packed == null) {
-            // Sized for the widest kernel any enabled property can select.
-            packed = vectorPacked = new int[Math.max(
-                    Blake3ChunkVectorDual.packedWordsLength(),
-                    Blake3ChunkVectorScratch.packedWordsLength())];
+            // Sized for the selected kernel. The four-chunk kernel shares this
+            // scratch as the ladder's lower rung, and every selectable batch is
+            // at least four chunks, so the selected kernel's requirement is
+            // always the larger of the two. Sizing stays inside this lazy
+            // method on purpose: naming a kernel class from a static
+            // initialiser would load it, and loading it on a JVM without
+            // jdk.incubator.vector is exactly what the scalar fallback exists
+            // to avoid.
+            packed = vectorPacked = new int[WIDE_KERNEL
+                    ? Blake3ChunkVectorWide.packedWordsLength()
+                    : Math.max(Blake3ChunkVectorDual.packedWordsLength(),
+                            Blake3ChunkVectorScratch.packedWordsLength())];
         }
         return packed;
     }
@@ -100,9 +117,10 @@ public final class FastBlake {
     private int[] vectorCvs() {
         int[] cvs = vectorCvs;
         if (cvs == null) {
-            cvs = vectorCvs = new int[Math.max(
-                    Blake3ChunkVectorDual.outputLength(),
-                    Blake3ChunkVectorScratch.outputLength())];
+            cvs = vectorCvs = new int[WIDE_KERNEL
+                    ? Blake3ChunkVectorWide.outputLength()
+                    : Math.max(Blake3ChunkVectorDual.outputLength(),
+                            Blake3ChunkVectorScratch.outputLength())];
         }
         return cvs;
     }
@@ -378,7 +396,10 @@ public final class FastBlake {
 
     /** Runs one complete batch through the selected kernel and pushes its CVs. */
     private void hashStreamBatch(byte[] source, int sourceOffset) {
-        if (VECTOR_STREAM_CHUNKS == 8) {
+        if (WIDE_KERNEL) {
+            Blake3ChunkVectorWide.hashChunks(source, sourceOffset, chunksCompressed,
+                    key, modeFlags, vectorPacked(), vectorCvs());
+        } else if (VECTOR_STREAM_CHUNKS == 8) {
             Blake3ChunkVectorDual.hashChunks(source, sourceOffset, chunksCompressed,
                     key, modeFlags, vectorPacked(), vectorCvs());
         } else {

@@ -23,8 +23,16 @@ experiment classpath.
 
 New rejected and diagnostic kernels go into `src/experiment`. Their switches
 must remain in experiment-only runners. Production dispatch retains only the
-measured scalar, four-chunk, and eight-chunk choices and the single diagnostic
-override `fastblake.kernel=auto|scalar|four|eight`.
+measured scalar, four-chunk, eight-chunk and preferred-width choices and the
+single diagnostic override `fastblake.kernel=auto|scalar|four|eight|wide`.
+
+E028 added `wide` and, with it, the only case where a kernel ships without any
+machine selecting it automatically. That is not a loophole in the rule above: it
+is conformance-tested and production-quality, and the dispatch table simply has
+no measurement authorising it yet. `-Dfastblake.wideBits=128|256|512` pins its
+lane width and is a **correctness lever for tests only** — a pinned species
+wider than the hardware is emulated by splitting, so it is always slower than
+the native width and must never appear in a throughput measurement.
 
 Experiments should call a package-private kernel contract or a dedicated
 experiment runner. The public `FastBlake` API must not grow experiment classes,

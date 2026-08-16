@@ -93,7 +93,7 @@ That creates several problems:
 
 Production should only recognize:
 
-fastblake.kernel=auto|scalar|four|eight
+fastblake.kernel=auto|scalar|four|eight|wide
 
 Experiments should be selected by an experiment-specific runner or factory under the experiment source set. Historical properties can remain there so recorded commands stay
 reproducible.

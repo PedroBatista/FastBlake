@@ -55,6 +55,84 @@ better. Speedups are relative to Commons Codec.
 | `reusedInstance` | 527 | 2,456 (4.66x) | 2,114 (4.01x) |
 | `streaming4k` | 521 | 2,288 (4.39x) | 2,063 (3.96x) |
 
+## Full size sweep
+
+A separate post-E025 session, same protocol (2 forks × 5 warmup × 5×1s
+measurement, single-threaded), sweeping every benchmark size with all three
+contenders measured together. This is the **shipped default**: no property is
+set, and `java-cpu` is whatever E025 P3's capability dispatch selects — on this
+machine the eight-chunk kernel. Every contender is reached through its own best
+one-shot entry point in the `oneShot` shape. MiB/s, higher is better; x-factor
+against the `commons` baseline.
+
+Absolute values differ by 1-3% from the 8 MiB table above because it is a
+different session; the protocol's inconclusive band is 3%.
+
+**`oneShot`** — fresh hasher per buffer:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 525 | 835 (1.59×) | 536 (1.02×) |
+| 1 KiB | 568 | 1311 (2.31×) | 940 (1.66×) |
+| 16 KiB | 554 | 2480 (4.47×) | 1510 (2.72×) |
+| 256 KiB | 561 | 2506 (4.47×) | 2088 (3.72×) |
+| 4 MiB | 559 | 2501 (4.48×) | 2140 (3.83×) |
+| 8 MiB | 560 | 2505 (4.48×) | 2135 (3.81×) |
+
+**`reusedInstance`** — `reset()` reuse:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 460 | 877 (1.91×) | 483 (1.05×) † |
+| 1 KiB | 571 | 1317 (2.31×) | 929 (1.63×) |
+| 16 KiB | 557 | 2492 (4.47×) | 1531 (2.75×) |
+| 256 KiB | 562 | 2511 (4.46×) | 2109 (3.75×) |
+| 4 MiB | 550 | 2516 (4.58×) | 2149 (3.91×) |
+| 8 MiB | 550 | 2520 (4.59×) | 2159 (3.93×) |
+
+**`streaming4k`** — 4 KiB incremental updates:
+
+| size | commons | rust | java-cpu |
+|---:|---:|---:|---:|
+| 64 B | 421 | 848 (2.01×) | 475 (1.13×) † |
+| 1 KiB | 508 | 1303 (2.57×) | 921 (1.81×) |
+| 16 KiB | 483 | 2370 (4.90×) | 1509 (3.12×) |
+| 256 KiB | 481 | 2368 (4.92×) | 2050 (4.26×) |
+| 4 MiB | 495 | 2348 (4.74×) | 2102 (4.25×) |
+| 8 MiB | 497 | 2364 (4.76×) | 2094 (4.21×) |
+
+† These two cells carry the **audited** values, not what the sweep reported. The
+sweep produced 368 MiB/s (`reusedInstance`) and 363 (`streaming4k`) at 64 bytes,
+which reads as a 25%-wrong regression and had a plausible mechanism reasoned
+backwards from it. `dispatchAudit` at 64 bytes contradicted it: scalar, four and
+eight are all within 2% of each other, and the default costs nothing at this
+size. The bad values are named rather than silently overwritten, because "a sweep
+can produce a 25%-wrong cell" is information a reader needs when weighing every
+other number in the same table. See E026; reproduce with:
+
+```bash
+./gradlew dispatchAudit -PauditShape=reusedInstance -PauditSize=64
+```
+
+Three things the sweep exposes that the 8 MiB headline hides:
+
+- **The three call shapes have converged.** Before E025, streaming ran at
+  911 MiB/s against 2140 one-shot at 8 MiB — the SIMD kernel was simply not
+  reachable from a 4 KiB update path. P1 gave the eight-chunk kernel the same
+  retained-batch treatment E016 gave the four-chunk one, and P2/P2b added a
+  four-chunk rung to both the update loop and the finalization drain. Streaming
+  is now within 3% of one-shot at every size from 16 KiB up, and at 8 MiB it is
+  85% of Rust where it used to be 39%.
+- **Mid-sized inputs still lag.** 16 KiB reaches 1510 MiB/s, 71% of the 8 MiB
+  rate, where Rust is already saturated by 16 KiB. The eight-chunk kernel needs
+  8 KiB of input before it engages at all, and the rungs beneath it are coarse.
+  This is now the largest structural gap — item 1 of the E028 ranking.
+- **The 64-byte one-shot was the worst number in the project and is now fine.**
+  It measured 199 MiB/s, 0.38× Commons, before E025 P0 removed the eager
+  per-hasher buffers and added a single-chunk path that hashes straight from the
+  caller's array. It is now 536, or 1.02× Commons, having gone from 3,400 to
+  256 bytes allocated per 64-byte hash.
+
 ## Retained footprint
 
 Deep retained size of one hasher, measured with JOL. This axis is independent of

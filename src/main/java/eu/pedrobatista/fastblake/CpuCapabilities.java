@@ -49,6 +49,21 @@ final class CpuCapabilities {
      */
     static final int VECTOR_REGISTERS = deriveVectorRegisters();
 
+    /**
+     * Lane width in bits used by the preferred-width kernel, or 0 when the
+     * Vector API is unavailable.
+     *
+     * <p>Normally the preferred width. {@code -Dfastblake.wideBits=128|256|512}
+     * pins it instead, which is how the eight- and sixteen-lane paths are made
+     * testable on a 128-bit machine — the Vector API implements a species wider
+     * than the hardware by splitting it, so the result is correct but slow.
+     * Never pin this for a throughput measurement.
+     */
+    static final int WIDE_VECTOR_BITS = resolveWideVectorBits();
+
+    /** Chunks the preferred-width kernel consumes per batch, or 0 if unavailable. */
+    static final int WIDE_LANES = WIDE_VECTOR_BITS / Integer.SIZE;
+
     private CpuCapabilities() {
     }
 
@@ -68,6 +83,22 @@ final class CpuCapabilities {
             return "jdk.incubator.vector is not available; "
                     + "start the JVM with --add-modules jdk.incubator.vector to enable SIMD kernels";
         }
+    }
+
+    private static int resolveWideVectorBits() {
+        if (PREFERRED_VECTOR_BITS == 0) {
+            return 0;
+        }
+        String requested = System.getProperty("fastblake.wideBits");
+        if (requested == null) {
+            return PREFERRED_VECTOR_BITS;
+        }
+        return switch (requested.trim()) {
+            case "128" -> 128;
+            case "256" -> 256;
+            case "512" -> 512;
+            default -> PREFERRED_VECTOR_BITS;
+        };
     }
 
     private static int deriveVectorRegisters() {
@@ -91,6 +122,12 @@ final class CpuCapabilities {
                     .append(')').toString();
         }
         sb.append(", preferred vector width ").append(PREFERRED_VECTOR_BITS).append(" bits");
+        if (WIDE_VECTOR_BITS != PREFERRED_VECTOR_BITS) {
+            // A pinned width is a correctness lever that silently changes what
+            // any throughput number means, so it is never left implicit.
+            sb.append(" (wide kernel pinned to ").append(WIDE_VECTOR_BITS)
+                    .append(" bits by -Dfastblake.wideBits; not a valid measurement)");
+        }
         if (VECTOR_REGISTERS > 0) {
             sb.append(", ~").append(VECTOR_REGISTERS).append(" vector registers");
         } else {

@@ -8,31 +8,69 @@ import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
 /**
- * E013 preferred-width chunk-parallel kernel.
+ * E013/E028 preferred-width chunk-parallel kernel: one chunk per lane, as many
+ * chunks as the machine is actually wide.
  *
  * <p>Structurally identical to {@link Blake3ChunkVectorScratch}: reusable
  * primitive word-major message scratch, sixteen named state vectors, and the
  * compact seven-round schedule loop that E011 found to be the shape C2 keeps
  * allocation-free. The only change is that the species, and every stride
- * derived from it, come from {@link IntVector#SPECIES_PREFERRED} instead of a
- * hard-coded 128 bits, so one chunk per lane means as many chunks as the
- * machine is actually wide.
+ * derived from it, come from the machine's preferred width instead of a
+ * hard-coded 128 bits.
  *
- * <p>E012 measured the cost of the hard-coding: on a 256-bit AVX2 target the
- * four-lane kernel used half the available width while the reference Rust
- * implementation dispatched to its eight-way kernel. Lane count here is only a
- * batch size — unlike {@link Blake3BlockVector}, where four lanes hold a BLAKE3
- * state row and are intrinsic to the algorithm.
+ * <h2>Why this kernel exists</h2>
  *
- * <p>Endian-neutral: message words are assembled with explicit byte shifts
- * rather than by reinterpreting a byte vector, so no little-endian guard is
- * needed.
+ * E012 measured the cost of hard-coding 128 bits: on a 256-bit AVX2 target the
+ * four-lane kernel uses half the available width — E021 confirmed from
+ * disassembly that it emits XMM, not YMM — while the reference Rust crate
+ * dispatches to its eight-way kernel. Lane count here is only a batch size,
+ * unlike a block-parallel kernel where four lanes hold a BLAKE3 state row and
+ * are intrinsic to the algorithm.
+ *
+ * <p>E013 and E020 measured this kernel against the <em>four</em>-chunk kernel
+ * and rejected it. E024 then changed the question: the objective is eight
+ * chunks in flight, and on AVX2 the register-equivalent way to reach it is
+ * eight lanes wide rather than two interleaved four-lane batches, which spill
+ * 32 state vectors into 16 YMM registers. E028 records that retest as pending;
+ * see {@link KernelSelector} for why automatic selection does not yet choose
+ * this kernel on any machine.
+ *
+ * <h2>Lane width is overridable, for experiments and for tests</h2>
+ *
+ * {@code -Dfastblake.wideBits=128|256|512} pins the species instead of taking
+ * the preferred width. The Vector API supports species wider than the hardware
+ * by splitting them, so this makes the eight- and sixteen-lane paths — and
+ * FastBlake's batch arithmetic around them — testable on a 128-bit machine,
+ * which is the only way to validate them before AVX2 or AVX-512 hardware is at
+ * hand. It is a correctness lever, not a throughput one: a split species is
+ * slower than the native width and must never be pinned for a measurement.
+ *
+ * <p>Endian-neutral: message words are read through a little-endian
+ * {@link VarHandle} rather than by reinterpreting a byte vector, so no
+ * byte-order guard is needed.
  */
 final class Blake3ChunkVectorWide {
-    private static final VectorSpecies<Integer> S = IntVector.SPECIES_PREFERRED;
+    private static final VectorSpecies<Integer> S =
+            speciesFor(CpuCapabilities.WIDE_VECTOR_BITS);
 
     /** Chunks processed per call; also the message scratch stride. */
     static final int LANES = S.length();
+
+    /**
+     * The species for a resolved lane width.
+     *
+     * <p>{@link CpuCapabilities#WIDE_VECTOR_BITS} has already applied the
+     * override and the availability probe, so anything unrecognised here simply
+     * takes the preferred width rather than failing.
+     */
+    private static VectorSpecies<Integer> speciesFor(int bits) {
+        return switch (bits) {
+            case 128 -> IntVector.SPECIES_128;
+            case 256 -> IntVector.SPECIES_256;
+            case 512 -> IntVector.SPECIES_512;
+            default -> IntVector.SPECIES_PREFERRED;
+        };
+    }
 
     // E014: always reads little-endian regardless of platform byte order, so
     // the kernel stays endian-neutral and needs no guard.
