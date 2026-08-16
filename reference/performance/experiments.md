@@ -10,6 +10,13 @@ compiled with `./gradlew experimentClasses`; the shipped `FastBlake` class no
 longer interprets `fastblake.experimental.*` properties. New production dispatch
 measurements use `-Dfastblake.kernel=auto|scalar|four|eight`.
 
+Entries below refer to "the README's Results table" and similar. The README is
+now a consumer-facing document; those full size sweeps moved to
+`reference/performance/results/apple-m5.md` (§ Full size sweep) and
+`reference/performance/results/amd-ryzen-3200g.md` (§ Historical), and the
+harness itself is described in `reference/architecture/benchmark-harness.md`.
+The numbers are unchanged.
+
 ## Measurement protocol
 
 - Correctness gate: `./gradlew test`

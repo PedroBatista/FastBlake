@@ -1,754 +1,199 @@
 # FastBlake
 
-A pure-JVM BLAKE3 implementation, optimised for throughput.
-
-Status: **CPU implementation, comparison harness, and capability-based kernel
-dispatch complete.** FastBlake implements the full BLAKE3 API in
-dependency-free Java. A chunk-parallel Vector API kernel is now selected
-automatically from the machine's capabilities rather than being opt-in: on
-Apple M5 that is an eight-chunk interleaved kernel reaching **2135 MiB/s
-one-shot at 8 MiB — 85% of the reference Rust crate** and 3.8× Commons Codec,
-while x86-64 gets the four-chunk kernel, which measured faster there. All three
-call shapes have converged — 4 KiB streaming updates now run at 2094 MiB/s,
-within 3% of one-shot, where before E025 they fell back to scalar at 911.
-FastBlake matches or beats Commons Codec at every measured size and shape. A JVM
-started without `jdk.incubator.vector` falls back to the scalar kernel
-automatically and still produces identical digests. GPU offload remains planned
-work.
-
-The generated library jar contains the public API and measured production
-kernels. Historical and candidate kernels live under `src/experiment` and can
-be compiled with `./gradlew experimentClasses`; JMH receives them on its
-benchmark classpath. The old `fastblake.experimental.*` properties are archived
-experiment records and are no longer interpreted by `FastBlake`. Use
-`-Dfastblake.kernel=auto|scalar|four|eight|wide` for current dispatch
-experiments.
+A fast, dependency-free BLAKE3 hash for the JVM.
 
 ```
-./gradlew contenders   # what can run here, and why anything can't
-./gradlew test         # conformance: every contender vs. the official vectors
-./gradlew jmh          # the comparison table
+eu.pedrobatista:fastblake:0.1.0
 ```
 
-## The contenders
+- **Fast.** 3.9× Apache Commons Codec on Apple M5, 5.8× on a Ryzen 3200G, and
+  85% of the reference Rust crate — single-threaded, on the same bytes.
+- **Zero dependencies.** The jar contains one package and nothing else.
+- **Complete BLAKE3.** Hashing, keyed hashing, key derivation, arbitrary-length
+  XOF output, incremental updates, repeatable finalization, reset.
+- **Verified.** Every release passes the official BLAKE3 test vectors, in all
+  three modes, across 35 input lengths and eight streaming chunk sizes.
+- **No configuration.** SIMD kernels are picked from the machine's capabilities
+  at startup. If the Vector API is unavailable, it falls back to scalar and
+  produces identical digests.
 
-| id | what it is | role |
-|---|---|---|
-| `commons` | Apache Commons Codec `Blake3`, scalar Java | The floor. Always available. |
-| `rust` | Reference [`blake3`][crate] crate via FFM, SIMD, single-threaded | The ceiling. Optional. |
-| `java-cpu` | FastBlake CPU — allocation-free scalar Java plus capability-selected chunk-parallel Vector API kernels | Implemented and always available. |
-| `java-gpu` | FastBlake GPU — device offload | **Planned.** |
+Requires **Java 25 or newer**.
 
-Everything is measured through one interface, `Blake3Engine`, so all four face
-identical call shapes on identical bytes. Adding a contender is one class plus
-one line in `Contenders` — no test or benchmark changes.
+## Get it
 
-**Absence is never failure.** A contender that cannot run here — no Rust
-toolchain or no GPU — reports *why* and is skipped. A machine
-with no Rust gets the same green build with one fewer column. That property is
-tested, not assumed: breaking the crate build on purpose leaves `test` and `jmh`
-passing with `rust` correctly reported as unavailable.
+**Gradle**
 
-Commons Codec, JMH and the harness are all off the `main` source set. The
-shipped jar has no dependencies and never will.
-
-## Correctness first
-
-A benchmark between implementations that compute different functions measures
-nothing. So every contender is held to the **official BLAKE3 test vectors**,
-vendored verbatim from the reference implementation:
-
-```
-src/harness/resources/blake3/test_vectors.json
-  <- https://github.com/BLAKE3-team/BLAKE3/blob/master/test_vectors/test_vectors.json
+```groovy
+dependencies {
+    implementation 'eu.pedrobatista:fastblake:0.1.0'
+}
 ```
 
-35 input lengths from 0 to 102,400 bytes, each checked in all three modes
-(`hash`, `keyed_hash`, `derive_key`) at 131 bytes of extended output — long
-enough to exercise the XOF path past the first output block. On top of that,
-per contender:
+**Maven**
 
-- the one-shot 32-byte digest is a prefix of the extended output (this also
-  exercises Rust's separate one-shot native entry point),
-- every case re-hashed in chunk sizes 1/7/63/64/65/1023/1024/1025, straddling
-  the 64-byte block and 1024-byte chunk boundaries where buffering bugs live,
-- finalizing twice yields the same bytes and does not consume the state,
-- a short output is a prefix of a long one,
-- `reset()` returns to the initial state,
-- input and output offsets are honoured without clobbering neighbouring bytes.
+```xml
+<dependency>
+    <groupId>eu.pedrobatista</groupId>
+    <artifactId>fastblake</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
 
-The suite covers hundreds of cases with Rust present and remains fully usable
-without a native toolchain.
+To get the SIMD kernels, run your JVM with the incubating Vector API enabled:
 
-## Benchmarks
+```
+--add-modules jdk.incubator.vector
+```
 
-Three call shapes, because they stress different things:
+Without it FastBlake still works, still returns the same digests, and just uses
+the scalar kernel. Nothing in the public API exposes vector types, so you never
+need this flag at compile time.
 
-| benchmark | what it isolates |
-|---|---|
-| `oneShot` | Realistic call: fresh hasher per buffer. Includes setup and allocation. |
-| `reusedInstance` | `reset()`-reuse. Raw compression throughput. |
-| `streaming4k` | 4 KiB incremental updates — the file/socket shape, which punishes anything needing the whole input up front to parallelise. |
+## Quick start
 
-Sizes sweep `64, 1024, 16384, 262144, 4194304, 8388608`. 64 B and 1 KiB sit at
-or below BLAKE3's 1024-byte chunk boundary where per-call overhead dominates;
-16 KiB is the smallest input that can fill a 16-lane SIMD batch; the larger
-sizes measure steady-state throughput, with 8 MiB representing the project's
-typical workload.
+Copy this into `Example.java` and run it:
+
+```java
+import eu.pedrobatista.fastblake.FastBlake;
+import java.util.HexFormat;
+
+public class Example {
+    public static void main(String[] args) {
+        byte[] digest = FastBlake.hash("hello world".getBytes());
+        System.out.println(HexFormat.of().formatHex(digest));
+    }
+}
+```
+
+```console
+$ java --add-modules jdk.incubator.vector -cp fastblake-0.1.0.jar Example.java
+d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24
+```
+
+## Usage
+
+**One-shot hash** — the fast path. Inputs up to 1 KiB never allocate a hasher.
+
+```java
+byte[] digest = FastBlake.hash(data);                    // 32 bytes
+byte[] part   = FastBlake.hash(data, 16, 512, 32);       // offset, length, output length
+```
+
+**Keyed hash** — the key must be exactly 32 bytes.
+
+```java
+byte[] mac = FastBlake.keyedHash(key32, message);
+```
+
+**Key derivation** — the context string should be a hardcoded, application-unique
+constant, per the BLAKE3 spec.
+
+```java
+byte[] sessionKey = FastBlake.initKeyDerivationFunction("example.com 2026 session key")
+                             .update(secret)
+                             .doFinalize(32);
+```
+
+**Streaming** — feed it a file or socket in whatever pieces arrive.
+
+```java
+FastBlake hasher = FastBlake.initHash();
+byte[] buffer = new byte[8192];
+int read;
+while ((read = in.read(buffer)) != -1) {
+    hasher.update(buffer, 0, read);
+}
+byte[] digest = hasher.doFinalize(32);
+```
+
+**Extended output (XOF)** — ask for as many bytes as you want. A short output is
+always a prefix of a longer one.
+
+```java
+byte[] stream = FastBlake.initHash().update(data).doFinalize(1024);
+FastBlake.initHash().update(data).doFinalize(out, 0, out.length);  // into your array
+```
+
+**Reuse** — `doFinalize` does not consume the state, so you can finalize twice
+or keep reading XOF output. `reset()` returns to the initial state, keeping the
+mode and key.
+
+```java
+hasher.reset();
+```
+
+Instances are mutable and **not thread-safe**; give each thread its own hasher.
+The static `hash`/`keyedHash` methods are safe to call from anywhere.
+
+### Coming from Commons Codec
+
+`initHash`, `initKeyedHash`, `initKeyDerivationFunction`, `hash`, `keyedHash`,
+`update`, `doFinalize` and `reset` match `org.apache.commons.codec.digest.Blake3`
+in signature and behavior, so migration is usually just the import. FastBlake
+adds offset/XOF-oriented overloads and `selectedKernel()` on top.
+
+```java
+System.out.println(FastBlake.selectedKernel());
+// aarch64, preferred vector width 128 bits, ~32 vector registers -> EIGHT_CHUNK (...)
+```
+
+## Performance
+
+8 MiB one-shot hash, single-threaded on both sides, MiB/s (higher is better).
+`rust` is the reference [`blake3`](https://crates.io/crates/blake3) crate called
+in-process through the FFM API, with Rayon off — it is the ceiling, not a
+competitor.
+
+| machine | Commons Codec | FastBlake | vs. Commons | Rust | % of Rust |
+|---|---:|---:|---:|---:|---:|
+| Apple M5 (NEON) | 537 | **2,116** | 3.9× | 2,480 | 85% |
+| AMD Ryzen 3 3200G (AVX2) | 155 | **893** | 5.8× | 1,922 | 46% |
+| Intel N97 (AVX2) | 157 | **716** | 4.6× | 1,429 | 50% |
+
+All three call shapes are close together — on the M5, streaming 4 KiB at a time
+costs 2.5% against one-shot. FastBlake matches or beats Commons Codec at every
+measured size and shape, from 64 bytes up.
+
+Allocation is fixed per call, not proportional to input: a 8 MiB hash allocates
+about 0.002 bytes per input byte, with zero collections. A hasher that has
+streamed 8 MiB retains 12 KiB, most of it the batch buffer that makes streaming
+fast; a hasher doing small work retains 1.4 KiB and does not grow.
+
+Measure it yourself on your own hardware:
 
 ```bash
-./gradlew jmh                                          # every available contender
-./gradlew jmh -P'jmh.args=oneShot -p size=1048576 -f1' # one case, fast
-./gradlew jmh -P'jmh.args=-p impl=rust,commons'        # pick contenders
-./gradlew jmh -P'jmh.args=-rf json -rff build/x.json'  # machine-readable
+./gradlew jmh          # full comparison against Commons Codec and Rust
+./gradlew dispatchAudit # confirm the kernel picked here is the fastest available
 ```
 
-JMH prints ns/op; the runner appends a MiB/s table with speedups against the
-`commons` baseline. Naming an unavailable contender explicitly fails fast with
-the reason, rather than running for ten minutes first.
+Full protocol, per-machine detail and size sweeps are in
+[`reference/performance/results/`](reference/performance/results/).
 
-### Threading
+## Building from source
 
-**Every number below is single-threaded, on both sides**, and that is a
-deliberate choice rather than an oversight:
-
-- JMH runs one thread (`@State(Scope.Thread)`, no `@Threads`).
-- The `blake3` crate is compiled with only `default` + `std` — the `rayon`
-  feature is off, so `update` does not fan out across cores.
-- Commons Codec is scalar and single-threaded anyway.
-
-So the comparison is honest as far as it goes: one core against one core, which
-is the right way to judge implementation quality. But it leaves two axes
-unmeasured, and one of them matters a lot for what comes next.
-
-1. **Intra-hash parallelism** — one hash spread over many cores. BLAKE3's tree
-   structure makes every 1 KiB chunk independent, so this scales close to
-   linearly; it is the crate's headline feature, exposed as `update_rayon`.
-2. **Concurrent throughput** — many independent hashes on many threads. Already
-   supported: `-t N` works today, since each JMH thread gets its own buffers and
-   hasher. At 1 MiB with `-t 4`, per-thread throughput held at 516 MiB/s
-   (`commons`) and 2334 MiB/s (`rust`), i.e. it scales with cores rather than
-   contending.
-
-The catch is the GPU contender. A GPU hashing one buffer across thousands of
-device threads, compared against a deliberately single-threaded CPU number, is
-not a comparison — it is a handicap match that the GPU wins by construction.
-Before `java-gpu` lands, the ladder needs a multithreaded rung: a separate
-`rust-mt` contender built with the `rayon` feature, so the ceiling is visible in
-both regimes and the GPU is measured against a CPU that is also using the whole
-machine.
-
-### Results
-
-Apple M5 (10 core), Temurin JDK 25.0.4, Commons Codec 1.22.0, `blake3` crate
-1.8.5. 2 forks × 5 warmup × 5×1s measurement iterations, single-threaded, all
-three contenders measured in one session. MiB/s, higher is better; x-factor
-against the `commons` baseline. `java-cpu` is FastBlake with the E024
-measured after E025 completed. **This is the shipped default**: no property is
-set, and `java-cpu` is whatever E025 P3's capability dispatch selects — on this
-machine the eight-chunk kernel. Every contender is reached through its own best
-one-shot entry point in the `oneShot` shape.
-
-**`oneShot`** — fresh hasher per buffer:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 525 | 835 (1.59×) | 536 (1.02×) |
-| 1 KiB | 568 | 1311 (2.31×) | 940 (1.66×) |
-| 16 KiB | 554 | 2480 (4.47×) | 1510 (2.72×) |
-| 256 KiB | 561 | 2506 (4.47×) | 2088 (3.72×) |
-| 4 MiB | 559 | 2501 (4.48×) | 2140 (3.83×) |
-| 8 MiB | 560 | 2505 (4.48×) | 2135 (3.81×) |
-
-**`reusedInstance`** — `reset()` reuse:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 460 | 877 (1.91×) | 483 (1.05×) † |
-| 1 KiB | 571 | 1317 (2.31×) | 929 (1.63×) |
-| 16 KiB | 557 | 2492 (4.47×) | 1531 (2.75×) |
-| 256 KiB | 562 | 2511 (4.46×) | 2109 (3.75×) |
-| 4 MiB | 550 | 2516 (4.58×) | 2149 (3.91×) |
-| 8 MiB | 550 | 2520 (4.59×) | 2159 (3.93×) |
-
-**`streaming4k`** — 4 KiB incremental updates:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 421 | 848 (2.01×) | 475 (1.13×) † |
-| 1 KiB | 508 | 1303 (2.57×) | 921 (1.81×) |
-| 16 KiB | 483 | 2370 (4.90×) | 1509 (3.12×) |
-| 256 KiB | 481 | 2368 (4.92×) | 2050 (4.26×) |
-| 4 MiB | 495 | 2348 (4.74×) | 2102 (4.25×) |
-| 8 MiB | 497 | 2364 (4.76×) | 2094 (4.21×) |
-
-Three things this exposes that the 8 MiB headline hides:
-
-- **The three call shapes have converged.** Before E025, streaming ran at
-  911 MiB/s against 2140 one-shot at 8 MiB — the SIMD kernel was simply not
-  reachable from a 4 KiB update path. P1 gave the eight-chunk kernel the same
-  retained-batch treatment E016 gave the four-chunk one, and P2/P2b added a
-  four-chunk rung to both the update loop and the finalization drain. Streaming
-  is now within 3% of one-shot at every size from 16 KiB up, and at 8 MiB it is
-  85% of Rust where it used to be 39%.
-- **Mid-sized inputs still lag.** 16 KiB reaches 1510 MiB/s, 71% of the 8 MiB
-  rate, where Rust is already saturated by 16 KiB. The eight-chunk kernel needs
-  8 KiB of input before it engages at all, and the rungs beneath it are coarse.
-  This is now the largest structural gap.
-- **The 64-byte one-shot was the worst number in the project and is now fine.**
-  It measured 199 MiB/s, 0.38× Commons, before E025 P0 removed the eager
-  per-hasher buffers and added a single-chunk path that hashes straight from the
-  caller's array. It is now 536, or 1.02× Commons, having gone from 3,400 to
-  256 bytes allocated per 64-byte hash.
-
-### Memory
-
-Throughput is one axis; how much memory a hasher holds is another, and they can
-move in opposite directions. `./gradlew footprint` reports deep retained size
-per hasher via JOL, at three lifecycle points:
-
-| contender | fresh | after 64 B | after 8 MiB |
-|---|---:|---:|---:|
-| `commons` | 464 B | 464 B | 1,136 B |
-| `rust` | 88 B † | 88 B † | 88 B † |
-| `java-cpu` | 1,384 B | 1,384 B | 12,136 B |
-
-† `rust` is a Java wrapper over an off-heap `blake3::Hasher`; JOL cannot see the
-native allocation, so that row is a floor rather than a total.
-
-A hasher that has streamed 8 MiB retains 12 KiB, most of it the 8 KiB batch
-buffer that makes streaming fast — that is the price of the 2.26× streaming win,
-paid only by hashers that actually stream. A hasher doing small work retains
-1.4 KiB and does not grow: the batch buffer is allocated only once input exceeds
-one chunk. Static one-shot entry points retain nothing between calls, so this
-axis only matters for callers that hold hasher instances.
-
-This was not free by default. E025 made the SIMD kernel automatic and routed
-every `update()` through the streaming path, so a 64-byte hash briefly retained
-9.4 KiB — the per-operation allocation gate stayed at zero throughout and could
-never have caught it, because the buffer is allocated once and then held.
-Allocation rate and retained footprint are separate measurements and both are
-now gated.
-
-### Independent re-measurement: AMD Ryzen 3 3200G
-
-AMD Ryzen 3 3200G (Zen, 4C/4T), Windows 10, Temurin JDK 25.0.4, Commons Codec
-1.22.0. Same harness, same protocol: 2 forks × 5×1s warmup + 5×1s measurement,
-single-threaded.
-
-This machine had no Rust toolchain at first, so the earliest runs here covered
-only `commons`/`java-cpu` (2 of 4, with `rust` and `java-gpu` reporting why
-they were skipped, exactly as designed) — those numbers are still below,
-unchanged. Rust was then installed via `rustup` (stable,
-`x86_64-pc-windows-msvc`; this machine already had the VS 2022 Build Tools
-Rust needs, so no other install was required) specifically so this machine's
-figures would carry a Rust ceiling like the M5/N97 rows do. `./gradlew
-contenders` now reports 3 of 4, and the full official-vector suite passes all
-542 tests across all three contenders (`./gradlew test --rerun`).
-
-Commons / Rust / the FastBlake production scalar kernel, all three now
-measured together in one session:
-
-**`oneShot`**:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 165 | 449 (2.73×) | 146 (0.89×) |
-| 1 KiB | 182 | 810 (4.46×) | 321 (1.77×) |
-| 16 KiB | 159 | 2155 (13.55×) | 320 (2.01×) |
-| 256 KiB | 145 | 2183 (15.05×) | 328 (2.26×) |
-| 4 MiB | 135 | 2075 (15.32×) | 328 (2.42×) |
-| 8 MiB | 167 | 2033 (12.15×) | 327 (1.96×) |
-
-**`reusedInstance`**:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 152 | 414 (2.73×) | 170 (1.12×) |
-| 1 KiB | 194 | 827 (4.27×) | 316 (1.63×) |
-| 16 KiB | 163 | 2120 (12.97×) | 327 (2.00×) |
-| 256 KiB | 166 | 2203 (13.26×) | 333 (2.01×) |
-| 4 MiB | 167 | 2048 (12.26×) | 331 (1.98×) |
-| 8 MiB | 163 | 2026 (12.45×) | 331 (2.03×) |
-
-**`streaming4k`**:
-
-| size | commons | rust | java-cpu |
-|---:|---:|---:|---:|
-| 64 B | 150 | 413 (2.75×) | 168 (1.12×) |
-| 1 KiB | 201 | 807 (4.01×) | 316 (1.57×) |
-| 16 KiB | 167 | 1371 (8.21×) | 330 (1.98×) |
-| 256 KiB | 168 | 1386 (8.25×) | 328 (1.95×) |
-| 4 MiB | 168 | 1312 (7.79×) | 324 (1.92×) |
-| 8 MiB | 165 | 1322 (7.99×) | 330 (1.99×) |
-
-Raw JSON: `build/jmh-contenders-ryzen-full.json` (supersedes the earlier
-2-contender `build/jmh-contenders-ryzen.json`, kept for history). x-factors
-are against `commons`; `java-cpu` here is the production scalar kernel, not
-either opt-in SIMD kernel below.
-
-**Rust vs Commons is far wider on this machine than on either the M5 or the
-N97** — 12.15x at 8 MiB `oneShot`, peaking at 15.32x at 4 MiB, against 4.5x
-(M5) and 7.9x (N97). Both `rust` and `commons` are single-threaded scalar
-executables/JVM code doing the identical work as elsewhere, so this isn't a
-new mechanism, just a data point that the *size* of the Rust ceiling varies
-enormously by machine — a Zen core apparently gives the 8-lane AVX2 SIMD path
-much more room over undualized Commons than either the wide M5 or the narrow
-N97 do. `java-cpu` scalar vs Commons also improved a little on this fresh
-combined run versus the earlier isolated run (1.96x vs the previously
-reported 1.92x at 8 MiB `oneShot`) — within normal run-to-run noise for this
-harness, not a regression signal.
-
-Re-running with the opt-in E011/E014 SIMD kernel
-(`-Dfastblake.experimental.scratchChunkVector=true`) against that same scalar
-column:
-
-| size | `oneShot` scalar | `oneShot` SIMD | `reusedInstance` scalar | `reusedInstance` SIMD | `streaming4k` scalar | `streaming4k` SIMD |
-|---:|---:|---:|---:|---:|---:|---:|
-| 64 B | 91 | 38 (0.42×) | 157 | 76 (0.48×) | 156 | 81 (0.52×) |
-| 1 KiB | 283 | 223 (0.79×) | 268 | 272 (1.01×) | 298 | 271 (0.91×) |
-| 16 KiB | 304 | 589 (1.94×) | 304 | 592 (1.95×) | 305 | 574 (1.88×) |
-| 256 KiB | 309 | 894 (2.89×) | 308 | 898 (2.92×) | 310 | 917 (2.96×) |
-| 4 MiB | 310 | 889 (2.87×) | 313 | 911 (2.91×) | 310 | 845 (2.73×) |
-| 8 MiB | 318 | 888 (2.79×) | 310 | 897 (2.89×) | 310 | 870 (2.81×) |
-
-Raw JSON: `build/jmh-vector-ryzen.json`. Adding this machine to the ledger,
-now with a real Rust ceiling instead of "n/a":
-
-| ratio at 8 MiB | Apple M5 (NEON) | Intel N97 (AVX2) | AMD Ryzen 3 3200G (AVX2) |
-|---|---:|---:|---:|
-| FastBlake scalar vs Commons | 1.61x | 1.20x | 1.96x |
-| FastBlake E011 SIMD vs its own scalar | 1.77x | 2.54x | 2.79x |
-| FastBlake E011 SIMD as a fraction of Rust | 63% | 38% | **44%** |
-| Rust vs Commons | 4.5x | 7.9x | **12.15x** |
-
-E011's fraction-of-Rust on this machine (44%) lands close to the N97's 38% and
-well below the M5's 63% — consistent with the standing explanation that E011's
-hard-coded 128-bit species leaves half an AVX2 machine's lane width unused
-while Rust dispatches to the full 8-lane path, on both x86-64 boxes measured
-so far. That the *absolute* Rust ceiling is nearly 3x higher here than on the
-N97 (2033 vs an implied lower N97 figure) while E011's fraction-of-Rust is
-similar says the two machines' `java-cpu` SIMD kernels are closer to each
-other in absolute terms than their Rust ceilings are — i.e. most of this
-machine's outsized Rust/Commons gap is a Commons-side and Rust-side story, not
-something `java-cpu` is failing to capture proportionally more of here.
-
-The SIMD kernel is a **loss** at 64 B and roughly break-even at 1 KiB on this
-machine — 0.42-0.52x and 0.79-1.01x respectively — before crossing over
-between 1 KiB and 16 KiB and settling near 2.8-2.9x at 8 MiB. That crossover
-point matches the architecture note above: 16 KiB is the smallest input that
-fills a 4-lane SIMD batch, and below it the kernel pays batching overhead with
-nothing to amortize it against.
-
-Getting a correct SIMD number here required a harness fix first:
-`BenchmarkRunner` called `OptionsBuilder.jvmArgsAppend("--add-modules=...")`
-after `.parent(cmdLine)`, which *replaces* rather than merges the
-`-jvmArgsAppend` JMH already captured from the command line — so passing
-`-jvmArgsAppend -Dfastblake.experimental.scratchChunkVector=true` on the
-`jmh.args` command line was silently dropped, and the first attempt at this
-measurement quietly re-ran the scalar kernel under the `SIMD` label. Confirmed
-by inspecting the fork's `# VM options:` line in the JMH log — it never
-contained the property — then fixed by merging the two lists explicitly. Every
-prior experiment in `reference/performance/experiments.md` sidestepped this by
-setting the flag via `JAVA_TOOL_OPTIONS` instead (see E012), which was never
-affected and remains the more foolproof way to flip these flags for
-`./gradlew jmh`.
-
-#### E024 on this machine: a regression, not a repeat of the M5 win
-
-E024 interleaves two independent four-chunk batches (8 chunks, 8192 bytes) in
-one round body, still at 128-bit lanes — more independent work per round
-rather than wider vectors. On Apple M5 it beat E011 by 1.36-1.37x (see the
-main Results table above and `reference/performance/experiments.md` § E024).
-This machine is the first non-AArch64 measurement of it.
-
-Correctness passes (`JAVA_TOOL_OPTIONS=-Dfastblake.experimental.dualChunkVector=true
-./gradlew test --rerun`, full official-vector suite) and the allocation gate
-holds: ~5,980 B fixed per 8 MiB call, i.e. ~0.0007 B per input byte, matching
-E011's near-zero figure.
-
-The first full-sweep throughput run (2 forks × 5+5×1s, same protocol as
-everything else on this page) was contaminated by a handful of extreme
-single-iteration outliers — an 11x spike at 8 MiB `oneShot` (118.6M ns against
-a ~10.3M ns cluster) and a 14x spike at 256 KiB `reusedInstance` (4.57M ns
-against a ~400K ns cluster), both visible in the raw JSON's `rawData` and
-absent from every neighboring iteration and size. On a shared desktop with no
-core pinning that reads as OS/background-process jitter, not kernel behavior,
-but it skewed the tool's plain-average summary table badly enough to report
-an implausible dip at those two cells. Re-running just those cells at 3 forks
-× 10 iterations resolved it:
-
-| shape / size | first sweep (contaminated) | re-check (3f×10i) |
-|---|---:|---:|
-| `oneShot` 256 KiB | 785 | **775** |
-| `oneShot` 8 MiB | 379 | **778** |
-| `reusedInstance` 256 KiB | 317 | **784** |
-| `reusedInstance` 8 MiB | 771 | 777 (unaffected, kept as a check) |
-
-Clean numbers against the E011 single four-chunk kernel and the scalar/Commons
-baselines already measured on this machine, at 8 MiB:
-
-| | commons | rust | scalar (`java-cpu`) | E011 (4-chunk SIMD) | E024 (8-chunk SIMD) |
-|---|---:|---:|---:|---:|---:|
-| `oneShot` | 166 | 2033 | 318 | 888 (44% of rust) | **778 (38% of rust, 0.88x of E011)** |
-| `reusedInstance` | 166 | 2026 | 310 | 897 (44% of rust) | **777 (38% of rust, 0.87x of E011)** |
-| `streaming4k` | 155 | 1322 | 310 | 870 (66% of rust) | ~300 (unchanged — see below) |
-
-**E024 is about 12-14% slower than E011 here**, not 1.36x faster as on the
-M5 — though it still beats scalar by ~2.4-2.5x and Commons by ~4.7x. This is
-exactly the inversion the experiment doc's open item #2 flagged as a risk
-before promotion: AVX2 gives the JIT only 16 architectural vector registers
-against AArch64's 32, and doubling the interleaved round body from 4 to 8
-independent chunks raises live vector state accordingly. What is a free
-latency-hiding win on a register-rich core can cost more in spills/pressure
-than it buys in independent work on a narrower one. This machine and the N97
-share that 16-register constraint, so this result is a concrete data point
-for — not a substitute for — running E024 on the N97 itself. Against Rust the
-picture is unambiguous either way: on this machine's outsized ~12x Rust
-ceiling, neither opt-in kernel gets past the mid-40s percent on the direct
-path, so E024's loss to E011 here is a real regression, not a rounding
-difference near parity.
-
-`streaming4k` stays at scalar-level throughput (~300 MiB/s) regardless of the
-kernel, because E024 has no streaming-batch integration yet (open item #1 in
-the experiment doc) — it only takes the direct one-shot/reused path, same
-limitation E011 had before E016.
-
-Raw JSON: `build/jmh-dual-ryzen.json` (full sweep, includes the outlier
-iterations for anyone who wants to see them), plus the two targeted re-checks
-noted above.
-
-### Where the remaining headroom is
-
-E028 audited what instruction-set work is left. The answer differs by
-architecture, and the short version is that **assembly is no longer where the
-gap lives.**
-
-On AArch64 the kernels are at the ISA floor and it is provable rather than
-asserted. E022 disassembled the round body and found the exact theoretical
-minimum of vector arithmetic — 48 adds, 32 eors, 64 `ushr`+`sli`, 16 loads —
-with zero spill traffic; E023 then showed the loop is latency-bound, so deleting
-35% of its instructions bought 0.7%. Nothing is left to win by emitting
-different instructions on this machine, only by putting more independent work in
-flight, which is what E024 did.
-
-On x86-64 there is real headroom, and it is exactly the width question:
-**both shipped chunk-parallel kernels are 128-bit**, so an AVX2 core runs at
-half its datapath and an AVX-512 core at a quarter. That matches where the two
-architectures stand against the ceiling — 85% of Rust here against 38–44% on the
-two x86 machines measured. E028 promotes `Blake3ChunkVectorWide` to a shipped
-kernel (`-Dfastblake.kernel=wide`, one chunk per lane at the machine's preferred
-width) so that the comparison E025 predicted but never ran is one command:
-
-```
-./gradlew dispatchAudit    # measures scalar, four, eight and wide, and judges
+```bash
+./gradlew test          # official BLAKE3 test vectors
+./gradlew contenders    # what can be benchmarked here, and why anything can't
+./gradlew jmh           # benchmarks
+./gradlew releaseCheck  # conformance + jar boundary + downstream consumer smoke test
 ```
 
-It passes the full official-vector suite at 4, 8 and 16 lanes and holds the
-allocation gate, but **no machine selects it automatically**, because no machine
-has measured it as the winner. The dispatch table takes measurements, never
-extrapolations, and the machine that could settle this is an AVX2 or AVX-512 box
-rather than this one.
+## Documentation
 
-Ranked by return, the ISA items are not the top of the list:
+| | |
+|---|---|
+| [Benchmark harness](reference/architecture/benchmark-harness.md) | Contenders, correctness gates, call shapes, threading policy |
+| [Library packaging](reference/architecture/library-packaging.md) | What ships and what doesn't; release gates; compatibility policy |
+| [Experiment ledger](reference/performance/experiments.md) | Every performance change, including the failed ones (E001–E028) |
+| [Measured results](reference/performance/results/) | Per-machine throughput, allocation and footprint |
+| [Publishing](reference/publishing/central-portal.md) | Maven Central release process |
 
-| rank | item | payoff | blocker |
-|---|---|---|---|
-| 1 | mid-size ladder (16 KiB) | +~25% at a real size | none |
-| 2 | intra-hash threading | multiples on 10 cores | none |
-| 3 | wide kernel on AVX2 | +5–20% on x86-64 | needs a modern x86 machine |
-| 4 | transpose overlap | ~5–10%, all architectures | none |
-| 5 | AArch64 shuffle rotates | ~10% here, if it clears the allocation gate | none |
-| 6 | AVX-512 kernel | large on that hardware | no hardware |
+## Status
 
-One item costs nothing to hold: AVX2 has no 32-bit vector rotate below
-AVX-512's `VPRORD`, and a locally patched JDK that lowers the `vpshufb`
-expression properly measured +20% (E019/E020). The library-only form of it
-allocates and is unshippable (E016), so if a stock JDK ever ships that lowering,
-x86-64 gains roughly 20% with no source change at all. See E028 in
-`reference/performance/experiments.md` for the full audit.
+FastBlake is at **0.1.0** and the API is not frozen yet. Until 1.0, public API
+changes are allowed but documented; digest bytes never change. GPU offload and
+intra-hash threading are planned.
 
-## How the Rust contender is wired
+## License
 
-`cargo build --release` produces a `cdylib` from `native/rust-blake3`, which the
-JVM calls through the Foreign Function & Memory API. It is measured *in process*
-— shelling out to `b3sum` would measure process startup and file I/O instead of
-the hash.
-
-Downcalls use `Linker.Option.critical(true)`, so heap `byte[]` buffers pass
-straight through with no copy: Rust hashes the very same array the Java
-contenders do. The cost is that GC cannot run during a call — fine for a
-benchmark harness, not something to imitate in production code.
-
-The crate pins `panic = "abort"` and leaves the `rayon` feature off, so it races
-one core against one Java thread. `fb_abi_version` is checked at link time, so a
-stale library is rejected rather than silently mismeasured.
-
-**Requires cargo 1.85 or newer.** `blake3` 1.8.5 pulls in `cpufeatures` 0.3.0,
-which needs edition 2024. On an older cargo the crate fails to build and the
-contender is skipped with the cargo error as its reason — the build stays green,
-but the ceiling column silently disappears. `rustup update stable` fixes it.
-
-Gradle's `cargoBuild` task is best-effort: missing cargo, a failed compile, or a
-platform that produces no shared library each record a reason in
-`build/native/rust-status.txt` and clear the staged library. The Java side treats
-that directory as authoritative — a stale artifact in the crate's own `target/`
-will **not** resurrect a contender the current build failed to produce.
-
-## Current FastBlake CPU implementation
-
-`FastBlake` supports ordinary hashing, keyed hashing, context-based key
-derivation, arbitrary-length XOF output, incremental updates, repeatable
-finalization and reset. Its update hot path reuses flat primitive scratch and a
-flat chaining-value stack; completed chunks allocate nothing. The final chunk
-is deliberately retained until finalization so the correct `ROOT` node remains
-available for XOF output.
-
-A focused 8 MiB run (1 fork, 3 warmup and 3 measurement iterations) measured
-894 MiB/s one-shot, 883 MiB/s with instance reuse, and 874 MiB/s with 4 KiB
-streaming updates: 1.61–1.62× Commons Codec on this machine. The production
-compressor uses 16 named integer locals and seven fully expanded rounds; the
-former array-and-loop compressor remains selectable with
-`-Dfastblake.experimental.legacyScalar=true` for diagnostic comparisons. The
-Vector API `hash_many` kernel over independent 1 KiB chunks has since landed as
-E011, described below; the remaining CPU milestones are streaming support for
-the E024 eight-chunk kernel, x86-64 validation of it, and confirming automatic
-dispatch across architectures. Reducing the SIMD kernel's instruction count is
-no longer among them — E023 measured that target at 0.7% on AArch64. E016
-completed the streaming batch buffer and promoted the scalar little-endian
-VarHandle loader; direct-input bypass and message-local experiments remain
-possible follow-ups. The first array-based Vector API
-experiment is retained behind `-Dfastblake.experimental.vector=true` but is
-disabled by default because measurement showed a severe regression. A second
-intra-block row-vector experiment is retained behind
-`-Dfastblake.experimental.blockVector=true` and is also disabled after indexed
-gathers and diagonal shuffles proved even slower. See
-`reference/performance/experiments.md` for the results and follow-up design.
-The later E010 allocation audit supersedes the causal explanations originally
-attached to these Vector API results. The properties reached the JMH forks and
-the vector branches ran, but the cross-chunk kernels allocated 159–255 heap
-bytes per input byte because C2 failed to eliminate vector wrapper objects.
-Their low throughput measures allocation and GC overhead, not the ceiling of
-allocation-free SIMD; register-pressure and cache-layout conclusions from
-E002–E008 are therefore unproven. The kernels remain opt-in diagnostic
-artifacts, and future SIMD work starts with a mandatory per-fork allocation
-gate.
-
-E011 follows that gate with reusable primitive transposed-message scratch and a
-compact seven-round loop. It is the first correct allocation-free SIMD win:
-1584 MiB/s one-shot and 1569 MiB/s reused at 8 MiB, about 1.77x the production
-scalar path and 63% of Rust on the Apple M5. **Those M5 figures predate E014 and
-no longer describe the code in the tree**. A later focused current-code run
-measured 1750 MiB/s one-shot and 1769 MiB/s reused; this is a one-fork quick
-result rather than a long confirmation. E012 validated it on x86-64, where
-it is a *larger* relative win — 2.54x the scalar path — while still passing the
-allocation gate and the full official-vector suite. It remains opt-in behind
-`-Dfastblake.experimental.scratchChunkVector=true`; E016 has now completed its
-streaming batching, while a long environment A rerun and wider CPU coverage
-remain before automatic dispatch.
-
-E013 answered the width question E012 raised. `Blake3ChunkVectorWide` is E011's
-kernel with the species and every derived stride taken from
-`IntVector.SPECIES_PREFERRED`, so one chunk per lane means as many chunks as the
-machine is wide; enable it with
-`-Dfastblake.experimental.wideChunkVector=true`. It is correct, passes the
-allocation gate at 0.00071 B/input byte, and does not hit the seven-round cliff
-at eight lanes — and it is **3–4% slower** than the four-lane kernel on AVX2, so
-it is not promoted. Doubling the width helped compression by only 5% per byte,
-while the *scalar* byte-shift transpose — about 30% of the kernel, and untouched
-by any amount of vector width — got 21% worse per byte from striding across
-eight chunks instead of four.
-
-E014 acted on that. Replacing the transpose's manual byte-shift word assembly
-with a cached little-endian `VarHandle` read — 2.96× faster in isolation, and
-endian-neutral, so no guard is needed — gained **+28% on the four-lane kernel
-and +30% on the preferred-width one**, from a one-line loader change. At 8 MiB
-the four-lane SIMD kernel now reaches 822 MiB/s one-shot: 3.25× the production
-scalar path, 3.90× Commons, and 49% of Rust on this machine. Both remain opt-in
-pending a long environment A confirmation and broader dispatch measurements.
-The intuitive alternative — doing the transpose with vector loads and in-register
-4×4 rearranges — was measured and **rejected at 2.3× slower** than the plain
-VarHandle read. A fully expanded seven-round variant is retained only as
-diagnostic evidence: it crosses a C2 cliff and allocates
-43,776 bytes per block invocation, while the compact loop allocates effectively
-zero.
-
-A pre-E014 follow-up on the Apple M5 found no regression from E013 itself: the
-fixed and preferred-width kernels measured 1600/1598 and 1594/1592 MiB/s for
-one-shot/reuse respectively. Both were four-lane kernels on NEON and differed by
-less than 1%. Those runs used the old byte-shift loader and therefore do not
-measure the current E014 code; the later current-code run measured 1750/1769
-MiB/s one-shot/reused. Kernel selection is not automatic yet: the N97
-result proves that `SPECIES_PREFERRED` is a capability signal, not a guarantee
-that the widest kernel is fastest. Current width comparisons favor 128 bits on
-both M5 and N97; other AVX2 cores and AVX-512 still require measurements.
-
-E015 tested preferred-species parent compression and batched reduction of each
-aligned four-leaf SIMD result. It is correct and allocation-free, but underfills
-the four M5 lanes with only two parents and then one: 1713/1690 MiB/s versus the
-1750/1769 baseline. It remains opt-in behind
-`-Dfastblake.experimental.parentVector=true` as negative evidence. A future
-parent experiment must aggregate at least eight leaves before reducing them.
-
-E016 used the custom JDK 28 hdis build to compare Java and Rust on the Intel
-N97. Rust's AVX2 kernel uses `vpshufb` for ROR8/ROR16 while Java emits
-shift/shift/OR. Isolated shuffle probes were 2.17–2.27× faster, but inserting
-even ROR16 into the full Vector kernel crossed an escape-analysis cliff and was
-rejected. The accepted four-chunk pending buffer instead lifted 4 KiB streaming
-from 361 to 747 MiB/s, matching Java's 747/779 MiB/s one-shot/reused class, with
-fixed-size allocation and full conformance. The production scalar VarHandle
-loader also improved one-shot/reused from 362/363 to 390/378 MiB/s, with
-streaming neutral at 365 MiB/s. Rust remains ahead at 1561/1574/1027 MiB/s; the
-next investigation is paired hardware counters and phase-level probes before
-changing the large, spill-heavy compression kernel again.
-
-The E016 follow-up on Apple M5 also passed. Current scratch-vector throughput is
-1759 MiB/s one-shot, 1763 MiB/s reused and 1726 MiB/s streaming 4 KiB. Relative
-to the pre-E016 1750/1769/907 control, contiguous input is unchanged within 1%
-and streaming improves by about 90%. Allocation remains fixed-size with zero
-collections. The production scalar path measured 923/919/921 MiB/s, a
-directional 3–5% improvement over the earlier M5 quick run.
-
-E017 decomposed the current SIMD kernel on the N97. A three-fork core-pinned
-run measures Java at 801 MiB/s and Rust at 1599 MiB/s. Exact phase probes put
-90.5% of Java kernel time in the seven compression rounds, 9.2% in
-load/transpose, and 0.4% in CV extraction; their sum matches the complete
-kernel within 0.1%. A smaller-live-set state-scratch boundary was allocation-free
-but 56.8% slower and is retained only as a negative benchmark control. Linux
-hardware counters then established the main mechanism: Java executes 4.28× as
-many instructions and 61× as many branches as Rust, while sustaining 3.02 IPC
-versus Rust's 1.43 and recording only 15% more cache misses. The remaining 2.03×
-cycle gap is therefore instruction volume, not poor issue utilization or a
-cache bottleneck. Details and reproducible commands are in the E017 result
-document.
-
-E018 rules out Java-source partial unrolling as the remedy. The best
-allocation-free guarded 2x block removes only 2.5% of instructions in
-isolation; its C2 body grows from 4.7 KiB to 20.9 KiB, and integration regresses
-the exact four-chunk kernel by 52%. Production therefore retains the compact
-seven-iteration loop; the next useful target is custom-JDK AVX2 lowering of
-constant ROR8/ROR16 without expanding the Java Vector API graph.
-
-E019 validates that compiler target. A custom JDK 28 lowers packed-int ROR8 and
-ROR16 to one `vpshufb` each on AVX2 while leaving ROR12/ROR7 as
-shift/shift/OR. All 542 forced SIMD tests pass with normal OSR, and allocation
-remains at the profiler floor. On the N97 the exact four-chunk kernel drops from
-4385 to 3601 ns and from 12,207 to 10,138 cycles; a diagnostic 8 MiB run improves
-one-shot from 817 to 941 MiB/s and streaming from 788 to 932 MiB/s. Java is now
-about 56% of pinned Rust on contiguous input and 87% on streaming. The change
-is still an experimental HotSpot patch, not part of the shipped library; E020
-below retests the 256-bit kernel under the new lowering.
-
-E020 completes that retest. In an exact load/compress/extract probe, the
-eight-lane kernel is 4.7% faster per byte than four lanes on the patched VM;
-the same comparison is already 5.2% faster on the unmodified VM. The rotate
-patch improves both widths by about 20%, rather than uniquely unlocking YMM.
-A longer diagnostic reaches 1020 MiB/s one-shot at eight lanes, about 62% of
-Rust, but this is not a public-library result: it requires the private VM, and
-the only stock-JDK source expression tried for `vpshufb` allocated 205 MB per
-8 MiB hash when integrated. Production therefore does not select either SIMD
-kernel. E019/E020 are retained as evidence for an upstream HotSpot improvement;
-FastBlake continues to require a stock-JDK, allocation-free win before
-promotion.
-
-E021 rules out missing x86 memory-operand folding as the explanation for the
-remaining N97 gap. In both stock and E019-patched C2 code, 8 of the compact
-round body's 16 static message loads fold into `vpaddd` and 8 remain separate
-`vmovdqu` instructions: 56/56 dynamically per block. Folding the remaining
-half could remove only 2.36% of the stock exact kernel's instructions and 2.7%
-of the measured 8 MiB Java/Rust instruction excess. The N97's 4.28× instruction
-ratio would still be about 4.19×. This x86 result says nothing about the Apple
-M5 gap, which still needs its own AArch64 counters and disassembly.
-
-E022 supplied that M5 audit, using a locally built OpenJDK 28 with a working
-`hsdis-aarch64` — the project's first mnemonic AArch64 disassembly. The
-four-chunk round body is 245 instructions, of which the vector arithmetic is
-already at the exact theoretical minimum (48 add, 32 eor, 64 rotate as
-`ushr`+`sli`, 16 loads), with **zero** vector spill traffic. AArch64's 32 vector
-registers mean the register pressure that shapes every N97 result simply does
-not exist here. The remaining 85 instructions are scalar index arithmetic and
-per-load bounds checks. A flat pre-multiplied schedule with a masked index,
-intended to let C2 hoist those checks, removed exactly one of them and moved
-throughput 0.5% — inside the inconclusive band. Rejected and reverted: masking
-does not reach the range check that `IntVector.fromArray` emits inside its own
-intrinsic.
-
-E023 then asked whether those 85 instructions were worth attacking at all, with
-a probe that keeps the vector arithmetic identical but replaces every message
-operand with a loop-invariant vector, deleting all loads, index arithmetic and
-bounds checks. **Removing 35% of the round body's instructions bought 0.7%.**
-The M5 kernel is latency-bound on the vector dependency chain, not issue-bound.
-That retires instruction-count reduction as a direction on this architecture and
-explains E022's null result completely — the experiment had a 0.7% ceiling
-before it was written. The protocol now requires proving a loop is issue-bound
-*before* optimising its instruction count, alongside the allocation gate.
-
-E024 acts on the corrected model. A latency-bound loop goes faster only with
-more independent work in flight, so `Blake3ChunkVectorDual` runs two independent
-four-chunk groups — eight chunks, 8192 bytes — through one interleaved round
-body, doubling instruction-level parallelism from four independent G chains per
-half-round to eight. Lanes stay at 128-bit: on NEON parallelism comes from more
-batches, not wider vectors, so this is not E013's width experiment repeated. It
-passes equivalence against two sequential four-chunk batches, the full 542-test
-official-vector suite, and the allocation gate at 0.00 B per input byte —
-doubling the round body did not cross the escape-analysis cliff. At 8 MiB it
-measures **2149 MiB/s one-shot and reused, 1.36× the four-chunk kernel and 85.6%
-of Rust**, up from 63%; the 2-fork long run in the Results table above confirms
-this at 2148 one-shot and 2149 reused; the final post-E025 sweep in the Results
-table measures 2135 one-shot and 2159 reused, or 85% of Rust, and selects this
-kernel automatically on AArch64. Forcing it explicitly still works with
-`-Dfastblake.experimental.dualChunkVector=true`.
-
-The generated code is the interesting part: the dual kernel executes **8.8% more
-instructions** than two sequential four-chunk batches and **does spill** (30
-vector spill instructions, since 32 state vectors plus message operands exceed
-AArch64's 32 registers) — and is 36% faster anyway. In a latency-bound loop,
-instruction count and spill traffic are nearly free while independent work in
-flight is everything. The same 30 spills in an issue-bound loop would have been
-a regression, which is precisely why this kernel must be validated on the
-issue-bound, register-starved N97 before any promotion. Streaming is also still
-untouched at 905 MiB/s, since the dual kernel has no equivalent of E016's
-pending-batch retention; with one-shot at 85% of Rust and streaming at 39%, that
-gap is now worth more than any further compression work.
-
-The primitive probe found that C2 does intrinsify the Vector API, but endian
-MemorySegment vector loads are about 25× slower than direct heap ByteVector
-loads plus reinterpretation on this runtime. E008 applied that load change alone
-to the best four-chunk layout. Correctness passed and the isolated loads stayed
-about 25× faster, but the complete kernel allocated roughly 159 bytes per input
-byte, invalidating its throughput as a SIMD comparison. It remains available
-behind `-Dfastblake.experimental.heapChunkVector=true` on little-endian systems;
-the production dispatch remains scalar. Details are in the experiment ledger.
-
-E025 re-ranked the work and closed its first item. The 2-fork sweep showed the
-remaining gaps were no longer in compression: one-shot at 8 MiB sits within 15%
-of Rust, while streaming is 61% behind and the 64-byte one-shot was *behind
-Commons*. P0 fixed the last of those in two measured steps. P0a made `cvStack`,
-the vector scratch and the streaming batch lazily allocated instead of
-constructor-time, which took 64-byte one-shot from 199 to 408 MiB/s and cut
-allocation from 3,400 to 1,656 bytes per call; enabling a vector kernel had been
-adding 800 bytes per hasher even for inputs that could never reach one. P0b then
-added a single-chunk path: an input of at most 1 KiB is its own root node, so it
-needs no chaining-value stack, no 1 KiB chunk copy and no hasher instance, and
-is hashed straight from the caller's array. That reached 527 MiB/s at 256 bytes
-allocated — **2.7× overall, and 1.01× Commons**, with nothing above one chunk
-moving. The remaining items are P1 streaming batching for the eight-chunk
-kernel, P2 a size ladder so mid-sized inputs fall back through four-chunk to
-scalar instead of all-or-nothing, and P3 the capability-based dispatch that lets
-a kernel be default-on where it wins and off where it does not.
-
-E025 also closed a gap in the method, not just the code. The allocation gate has
-been mandatory since E010 but had only ever been run at 8 MiB, where 3.4 KB of
-fixed setup divides away to 0.0007 bytes per input byte and cannot fail. The
-same code was at 53 bytes per input byte at 64 bytes, unnoticed across fifteen
-experiments. The gate now runs at 64 B and 1 KiB as well.
-
-The GPU contender comes later. BLAKE3 suits a GPU well — the tree structure
-makes every 1 KiB chunk independent, so a large input decomposes into thousands
-of parallel chunk compressions with only a small parent-node merge left. Expect
-the mirror image of the CPU contenders: badly beaten on small inputs where
-kernel launch and host-to-device transfer dominate, competitive only once the
-input amortises both. Transfer cost stays inside the measured region — a number
-that excludes it would not describe anything a caller can actually get.
-
-[crate]: https://crates.io/crates/blake3
+See [LICENSE](LICENSE).
