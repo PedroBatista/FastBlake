@@ -9,7 +9,7 @@ plugins {
 }
 
 group 'eu.pedrobatista'
-version '0.1.0'
+version '0.1.1'
 
 base {
     archivesName = 'fastblake'
@@ -26,6 +26,21 @@ repositories {
     mavenCentral()
 }
 
+// The lowest JVM the published library runs on. This is a *compile-time*
+// contract, enforced by options.release below: sourceCompatibility and
+// targetCompatibility would set the class-file version without checking that
+// the code stays inside the 21 API, which is how a too-new API call reaches a
+// consumer's runtime as a NoSuchMethodError instead of a build failure.
+//
+// --release also constrains jdk.incubator.vector, not just java.base: javac's
+// ct.sym carries historical incubator signatures, so a Vector API method that
+// only exists in a later JDK fails the build here rather than at the consumer.
+def baselineJava = 21
+
+// The toolchain is deliberately *not* lowered to match. src/experiment,
+// src/harness and src/jmh use java.lang.foreign, which is a preview API in 21
+// and only final in 22; building them on 21 fails. Only the library jar carries
+// the 21 promise, so only compileJava gets --release.
 java {
     withSourcesJar()
     withJavadocJar()
@@ -38,8 +53,34 @@ tasks.withType(JavaCompile).configureEach {
     options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
 }
 
+// compileJava carries the library's baseline promise. compileConsumerTestJava
+// stands in for a downstream build, so it compiles at the baseline too —
+// otherwise the smoke test's own class files are too new to load on the very
+// JVM they are meant to prove the library works on.
+// Matched lazily: consumerTest is created by the sourceSets block further down,
+// so its compile task does not exist yet at this point in evaluation.
+tasks.withType(JavaCompile)
+        .matching { it.name in ['compileJava', 'compileConsumerTestJava'] }
+        .configureEach {
+            options.release = baselineJava
+        }
+
+// Consumers resolve against Gradle module metadata, not the class-file version.
+// Without this attribute the metadata advertises the toolchain (25) and a 21
+// consumer is told the library is incompatible.
+configurations.matching { it.name in ['apiElements', 'runtimeElements'] }.configureEach {
+    attributes {
+        attribute(org.gradle.api.attributes.java.TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE,
+                baselineJava)
+    }
+}
+
 tasks.withType(Javadoc).configureEach {
     options.addStringOption('-add-modules', 'jdk.incubator.vector')
+}
+
+tasks.named('javadoc') {
+    options.addStringOption('-release', baselineJava.toString())
 }
 
 ext {
@@ -463,6 +504,12 @@ tasks.register('verifyLibraryJar') {
         ].collect { "eu/pedrobatista/fastblake/${it}.class" }
         def forbiddenSuffixes = ['test_vectors.json']
         def leaked = []
+        // Class-file major version is the only artefact-level proof that the
+        // baseline held: 44 + feature release, so 21 -> 65. Checked per entry
+        // because a single stray class compiled by another task is enough to
+        // break a 21 consumer at class-load time.
+        def expectedMajor = 44 + baselineJava
+        def wrongVersion = [:]
         new java.util.zip.ZipFile(jarFile).withCloseable { zip ->
             zip.entries().each { entry ->
                 def name = entry.name
@@ -471,12 +518,34 @@ tasks.register('verifyLibraryJar') {
                         || forbiddenSuffixes.any { name.endsWith(it) }) {
                     leaked << name
                 }
+                if (name.endsWith('.class')) {
+                    zip.getInputStream(entry).withCloseable { input ->
+                        def header = new java.io.DataInputStream(input)
+                        // Masked to unsigned: Groovy widens 0xCAFEBABE to a
+                        // positive Long, which never equals the negative int
+                        // that readInt() returns.
+                        if ((header.readInt() & 0xFFFFFFFFL) != 0xCAFEBABEL) {
+                            throw new GradleException("Not a class file: ${name}")
+                        }
+                        header.readUnsignedShort()          // minor
+                        def major = header.readUnsignedShort()
+                        if (major != expectedMajor) {
+                            wrongVersion[name] = major
+                        }
+                    }
+                }
             }
         }
         if (!leaked.isEmpty()) {
             throw new GradleException("Library jar contains non-library entries: ${leaked}")
         }
+        if (!wrongVersion.isEmpty()) {
+            throw new GradleException(
+                    "Library jar targets the wrong JVM. Expected class-file major ${expectedMajor} " +
+                            "(Java ${baselineJava}); found: ${wrongVersion}")
+        }
         logger.lifecycle("verifyLibraryJar: ${jarFile.name} contains no harness, benchmark, or test-vector entries.")
+        logger.lifecycle("verifyLibraryJar: all classes are class-file major ${expectedMajor} (Java ${baselineJava}).")
     }
 }
 
@@ -545,7 +614,7 @@ tasks.register('releaseCheck') {
     description = 'Runs correctness and verifies the consumer-facing library artifact.'
     dependsOn tasks.named('test'), tasks.named('verifyLibraryJar'),
             tasks.named('generatePomFileForMavenJavaPublication'),
-            tasks.named('consumerSmokeTest')
+            tasks.named('consumerSmokeTest'), tasks.named('consumerSmokeTestCurrent')
 }
 
 def centralGroupVersionDir = "${project.group.toString().replace('.', '/')}/fastblake/${project.version}"
@@ -632,7 +701,7 @@ tasks.register('centralStaging', Sync) {
 // Builds the archive uploaded through central.sonatype.com.
 tasks.register('centralBundle', Zip) {
     group = 'publishing'
-    description = 'Creates the signed Maven Central Portal bundle for 0.1.0.'
+    description = "Creates the signed Maven Central Portal bundle for ${project.version}."
     dependsOn tasks.named('centralStaging')
     onlyIf {
         if (!project.hasProperty('release')) {
@@ -654,10 +723,29 @@ tasks.register('centralBundle', Zip) {
 // A consumer-style smoke test deliberately runs without --add-modules. This
 // proves the published jar can still use its scalar fallback on a JVM where
 // the incubating Vector API is not resolved.
+//
+// It runs on a real baseline JVM, not the build toolchain. Compiling with
+// --release 21 proves the API surface; only executing on 21 proves the class
+// files actually load there. Running this on 25 would pass no matter what the
+// baseline was set to, which is the failure mode this whole guard exists for.
 tasks.register('consumerSmokeTest', JavaExec) {
     group = 'verification'
-    description = 'Compiles and runs a downstream-style program against the jar.'
+    description = "Runs a downstream-style program against the jar on Java ${baselineJava}."
     dependsOn tasks.named('compileConsumerTestJava')
     mainClass = 'eu.pedrobatista.fastblake.consumer.LibraryConsumerSmokeTest'
     classpath = sourceSets.consumerTest.runtimeClasspath
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(baselineJava)
+    }
+}
+
+// The same program on the build toolchain: one jar, both ends of the supported
+// range. Catches a baseline artefact that a newer JVM refuses to load.
+tasks.register('consumerSmokeTestCurrent', JavaExec) {
+    group = 'verification'
+    description = 'Runs the downstream-style program on the build toolchain JVM.'
+    dependsOn tasks.named('compileConsumerTestJava')
+    mainClass = 'eu.pedrobatista.fastblake.consumer.LibraryConsumerSmokeTest'
+    classpath = sourceSets.consumerTest.runtimeClasspath
+    javaLauncher = javaToolchains.launcherFor(java.toolchain)
 }

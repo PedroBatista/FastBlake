@@ -3,7 +3,7 @@
 A fast, dependency-free BLAKE3 hash for the JVM.
 
 ```
-eu.pedrobatista:fastblake:0.1.0
+eu.pedrobatista:fastblake:0.1.1
 ```
 
 - **Fast.** 3.9× Apache Commons Codec on Apple M5, 5.8× on a Ryzen 3200G, and
@@ -17,7 +17,12 @@ eu.pedrobatista:fastblake:0.1.0
   at startup. If the Vector API is unavailable, it falls back to scalar and
   produces identical digests.
 
-Requires **Java 25 or newer**.
+Requires **Java 21 or newer**.
+
+The SIMD kernels need the incubating Vector API, so start your JVM with
+`--add-modules jdk.incubator.vector`. Without it FastBlake still runs and
+returns identical digests, but on the scalar kernel — it logs a warning at
+startup saying so. Silence that warning with `-Dfastblake.quiet=true`.
 
 ## Get it
 
@@ -25,7 +30,7 @@ Requires **Java 25 or newer**.
 
 ```groovy
 dependencies {
-    implementation 'eu.pedrobatista:fastblake:0.1.0'
+    implementation 'eu.pedrobatista:fastblake:0.1.1'
 }
 ```
 
@@ -35,7 +40,7 @@ dependencies {
 <dependency>
     <groupId>eu.pedrobatista</groupId>
     <artifactId>fastblake</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.1</version>
 </dependency>
 ```
 
@@ -66,7 +71,7 @@ public class Example {
 ```
 
 ```console
-$ java --add-modules jdk.incubator.vector -cp fastblake-0.1.0.jar Example.java
+$ java --add-modules jdk.incubator.vector -cp fastblake-0.1.1.jar Example.java
 d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24
 ```
 
@@ -190,7 +195,7 @@ Full protocol, per-machine detail and size sweeps are in
 
 ## Status
 
-FastBlake is at **0.1.0** and the API is not frozen yet. Until 1.0, public API
+FastBlake is at **0.1.1** and the API is not frozen yet. Until 1.0, public API
 changes are allowed but documented; digest bytes never change. GPU offload and
 intra-hash threading are planned.
 
