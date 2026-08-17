@@ -22,11 +22,18 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@v4
 
+      # Two JDKs, both required. 25 is the build toolchain and becomes
+      # JAVA_HOME by being listed last; 21 is the published baseline and is
+      # installed so Gradle toolchain detection can find a real 21 launcher for
+      # consumerSmokeTest. Without it that task fails rather than silently
+      # falling back to running the baseline check on 25.
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '25'
+          java-version: |
+            21
+            25
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -52,11 +59,18 @@ jobs:
       - name: Check out tagged source
         uses: actions/checkout@v4
 
+      # Two JDKs, both required. 25 is the build toolchain and becomes
+      # JAVA_HOME by being listed last; 21 is the published baseline and is
+      # installed so Gradle toolchain detection can find a real 21 launcher for
+      # consumerSmokeTest. Without it that task fails rather than silently
+      # falling back to running the baseline check on 25.
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '25'
+          java-version: |
+            21
+            25
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

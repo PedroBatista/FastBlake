@@ -30,6 +30,10 @@ final class CpuCapabilities {
     static final String VECTOR_UNAVAILABLE_REASON = PREFERRED_VECTOR_BITS == 0
             ? probeFailureReason() : null;
 
+    static {
+        warnIfVectorApiMissing();
+    }
+
     static final boolean IS_AARCH64 = ARCH.equals("aarch64") || ARCH.equals("arm64");
     static final boolean IS_X86_64 = ARCH.equals("x86_64") || ARCH.equals("amd64");
 
@@ -73,6 +77,31 @@ final class CpuCapabilities {
         } catch (Throwable notAvailable) {
             return 0;
         }
+    }
+
+    /**
+     * Warns once, at class-initialisation time, when the SIMD kernels are
+     * unreachable because the incubating Vector API was not resolved.
+     *
+     * <p>Silence here is the expensive failure: FastBlake keeps working and
+     * keeps returning correct digests, so a deployment that simply forgot the
+     * flag looks healthy while running the scalar kernel. The flag cannot be
+     * set programmatically — the module graph is fixed before any library code
+     * runs — so telling the operator is the only available remedy.
+     *
+     * <p>Routed through {@link System.Logger} so a host application's logging
+     * backend can capture it; with no backend installed it reaches stderr.
+     * Set {@code -Dfastblake.quiet=true} to suppress it.
+     */
+    private static void warnIfVectorApiMissing() {
+        if (PREFERRED_VECTOR_BITS != 0
+                || Boolean.getBoolean("fastblake.quiet")) {
+            return;
+        }
+        System.getLogger("eu.pedrobatista.fastblake").log(System.Logger.Level.WARNING,
+                "FastBlake: Vector API unavailable, falling back to the scalar kernel. "
+                        + "Add --add-modules jdk.incubator.vector to the JVM command line "
+                        + "to enable SIMD. Suppress with -Dfastblake.quiet=true.");
     }
 
     private static String probeFailureReason() {
