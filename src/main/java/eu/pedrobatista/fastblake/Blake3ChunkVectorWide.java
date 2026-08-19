@@ -31,9 +31,11 @@ import jdk.incubator.vector.VectorSpecies;
  * and rejected it. E024 then changed the question: the objective is eight
  * chunks in flight, and on AVX2 the register-equivalent way to reach it is
  * eight lanes wide rather than two interleaved four-lane batches, which spill
- * 32 state vectors into 16 YMM registers. E028 records that retest as pending;
- * see {@link KernelSelector} for why automatic selection does not yet choose
- * this kernel on any machine.
+ * 32 state vectors into 16 YMM registers. AVX2 remains opt-in pending that
+ * retest. AVX-512 is different: its 32 ZMM registers hold this kernel's
+ * sixteen live state vectors plus the round temporaries, and its native
+ * sixteen lanes hash sixteen chunks per batch; {@link KernelSelector} selects
+ * this kernel automatically for that configuration.
  *
  * <h2>Lane width is overridable, for experiments and for tests</h2>
  *

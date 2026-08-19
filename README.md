@@ -159,6 +159,11 @@ All three call shapes are close together — on the M5, streaming 4 KiB at a tim
 costs 2.5% against one-shot. FastBlake matches or beats Commons Codec at every
 measured size and shape, from 64 bytes up.
 
+On an x86-64 JVM whose preferred Vector API width is 512 bits, FastBlake
+automatically hashes 16 complete chunks in parallel using the AVX-512 wide
+kernel. The selection follows the JVM's effective vector configuration, so
+starting HotSpot with AVX-512 disabled safely selects a narrower kernel instead.
+
 Allocation is fixed per call, not proportional to input: a 8 MiB hash allocates
 about 0.002 bytes per input byte, with zero collections. A hasher that has
 streamed 8 MiB retains 12 KiB, most of it the batch buffer that makes streaming
@@ -169,7 +174,31 @@ Measure it yourself on your own hardware:
 ```bash
 ./gradlew jmh          # full comparison against Commons Codec and Rust
 ./gradlew dispatchAudit # confirm the kernel picked here is the fastest available
+./gradlew testWide512  # conformance gate for the sixteen-lane AVX-512 shape
+./gradlew testJar      # build a standalone benchmark/test fat JAR
+./gradlew testBundleZip # build a Gradle-free transferable bundle
 ```
+
+The test artifact is `build/libs/fastblake-<version>-test.jar`. Run it with
+`java -jar build/libs/fastblake-<version>-test.jar -p size=8388608`; it detects
+the effective CPU/vector ISA (including the AVX2 versus AVX-512 distinction),
+prints the normal JMH output, and writes a timestamped JSON report such as
+`fastblake-benchmark-20260819T143012.417Z.json` in the current directory.
+Use `--json-output-dir DIR` or `--json-output FILE` to control the report path.
+
+For a computer without Gradle, build `build/distributions/fastblake-test-<version>.zip`
+and copy it to the target machine. Extract it and provide the JDK directory to
+the launcher:
+
+```bash
+./run-fastblake-benchmark.sh --jdk /opt/jdk-25 -p impl=java-cpu -p size=8388608
+```
+
+On Windows, use `run-fastblake-benchmark.bat --jdk C:\\JDK\\jdk-25 ...`. The
+launcher validates the supplied `bin/java` and passes the Vector API module and
+native-access flags required by the benchmark harness. A JDK is still required
+at runtime; the current benchmark harness requires JDK 25 or newer. The bundle
+removes the Gradle requirement but does not embed or redistribute a JDK.
 
 Full protocol, per-machine detail and size sweeps are in
 [`reference/performance/results/`](reference/performance/results/).
@@ -182,6 +211,9 @@ Full protocol, per-machine detail and size sweeps are in
 ./gradlew jmh           # benchmarks
 ./gradlew releaseCheck  # conformance + jar boundary + downstream consumer smoke test
 ```
+
+See [TESTING.md](TESTING.md) for the complete test procedure and the portable
+benchmark bundle instructions.
 
 ## Documentation
 

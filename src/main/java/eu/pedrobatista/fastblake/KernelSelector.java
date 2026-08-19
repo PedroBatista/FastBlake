@@ -33,10 +33,12 @@ import java.util.Locale;
  * kernel switches belong to the experiment source set and are intentionally not
  * interpreted by the shipped library.
  *
- * <p>{@code wide} is shipped, conformance-tested and reachable, but is not
- * selected automatically anywhere: no machine has measured it as the winner
- * yet. That is the table's rule working as intended rather than an oversight —
- * see {@link #selectAutomatically()}.
+ * <p>{@code wide} is shipped and conformance-tested. On x86-64 the selector
+ * uses it automatically only when the JVM exposes a native AVX-512-width
+ * species: sixteen independent BLAKE3 chunks then occupy the sixteen lanes of
+ * each ZMM vector while the 32-register AVX-512 file leaves room for the
+ * compressor's live state. AVX2 remains conservative until it has a measured
+ * winner.
  */
 final class KernelSelector {
 
@@ -52,7 +54,8 @@ final class KernelSelector {
          * E013/E028 one chunk per lane at the machine's preferred width.
          *
          * <p>Batch size is the lane count, so this is four chunks on NEON or
-         * SSE, eight on AVX2 and sixteen on AVX-512. Reachable only through
+         * SSE, eight on AVX2 and sixteen on AVX-512. It is selected
+         * automatically for native AVX-512 and is otherwise reachable through
          * {@code -Dfastblake.kernel=wide}: see {@link #selectAutomatically}.
          */
         WIDE(CpuCapabilities.WIDE_LANES);
@@ -131,6 +134,19 @@ final class KernelSelector {
         if (CpuCapabilities.IS_AARCH64 && CpuCapabilities.VECTOR_REGISTERS >= 32) {
             return Kernel.EIGHT_CHUNK;
         }
+        // AVX-512 has 32 ZMM registers and a native 512-bit species has
+        // sixteen int lanes. WIDE maps one complete BLAKE3 chunk to each lane,
+        // so it processes sixteen independent chunks per batch with the full
+        // vector width. Unlike the dual kernel, it has only 16 persistent
+        // state vectors, leaving half the register file for the round's
+        // temporaries and message loads.
+        //
+        // This is deliberately based on the Vector API's preferred species,
+        // not raw CPUID: a JVM started with AVX-512 disabled must keep using
+        // the best shape it can actually compile.
+        if (CpuCapabilities.HAS_NATIVE_AVX512) {
+            return Kernel.WIDE;
+        }
         // MEASURED: E024, Ryzen 3 3200G (Zen+, AVX2, 16 YMM registers). The
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
         // registers spills more than the added parallelism buys. E011/E014's
@@ -162,6 +178,10 @@ final class KernelSelector {
         if (CpuCapabilities.IS_AARCH64 && CpuCapabilities.VECTOR_REGISTERS >= 32) {
             return "AArch64 with 32 vector registers; E024 measured eight chunks "
                     + "in flight at +36% over four";
+        }
+        if (CpuCapabilities.HAS_NATIVE_AVX512) {
+            return "x86-64 with native 512-bit Vector API species and 32 ZMM registers; "
+                    + "using the sixteen-lane AVX-512 wide kernel";
         }
         if (CpuCapabilities.IS_X86_64) {
             return "x86-64 with " + CpuCapabilities.VECTOR_REGISTERS + " vector registers; "

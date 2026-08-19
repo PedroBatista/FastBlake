@@ -80,7 +80,9 @@ public final class FastBlake {
     private final int[] scratchState = new int[16];
     private final int[] scratchWords = new int[16];
     private final int[] scratchCv = new int[8];
-    // Sized for the production four- and eight-chunk kernels.
+    // Lazily sized for the selected production kernel. Native AVX-512 selects
+    // the wide kernel, whose 16 lanes need 256 packed message words and 128
+    // output words per batch.
     private int[] vectorPacked;
     private int[] vectorCvs;
 

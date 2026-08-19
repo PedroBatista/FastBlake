@@ -278,6 +278,26 @@ test {
     }
 }
 
+// Exercises the native AVX-512 batch shape even on a narrower development
+// machine. The Vector API splits SPECIES_512 when necessary, so this is a
+// correctness gate only -- never a performance measurement. A genuine
+// AVX-512 host selects the same wide kernel automatically without these
+// properties.
+tasks.register('testWide512', Test) {
+    group = 'verification'
+    description = 'Runs the full suite through the sixteen-lane AVX-512 wide kernel.'
+    dependsOn tasks.named('testClasses')
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    configureNativeAccess(it)
+    systemProperty 'fastblake.kernel', 'wide'
+    systemProperty 'fastblake.wideBits', '512'
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
 // ./gradlew jmh                                     -> every available contender
 // ./gradlew jmh -P'jmh.args=oneShot -p size=1024'   -> raw JMH args
 // ./gradlew jmh -P'jmh.args=-p impl=rust,commons'   -> pick contenders explicitly
@@ -290,6 +310,55 @@ tasks.register('jmh', JavaExec) {
     configureNativeAccess(it)
     def rawArgs = (project.findProperty('jmh.args') ?: '').toString().trim()
     args = rawArgs.isEmpty() ? [] : rawArgs.split('\\s+').toList()
+}
+
+// A portable executable benchmark artifact for machines where invoking the
+// Gradle build is inconvenient. It contains the library, harness, generated
+// JMH benchmarks and their runtime dependencies, with a small JSON-producing
+// entry point as its Main-Class. Native Rust is intentionally not embedded:
+// the harness reports it unavailable unless the caller supplies a staged
+// library through the normal fastblake.native.dir property.
+tasks.register('testJar', Jar) {
+    group = 'build'
+    description = 'Builds the standalone benchmark/test fat JAR.'
+    dependsOn tasks.named('jmhClasses')
+    archiveClassifier = 'test'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes('Main-Class': 'eu.pedrobatista.fastblake.TestBenchmarkMain')
+    }
+    from(sourceSets.main.output)
+    from(sourceSets.harness.output)
+    from(sourceSets.jmh.output)
+    from({ configurations.jmhRuntimeClasspath
+            .filter { it.isFile() }
+            .collect { zipTree(it) } }) {
+        exclude 'META-INF/*.SF', 'META-INF/*.RSA', 'META-INF/*.DSA'
+    }
+}
+
+// Transferable bundle for machines that do not have Gradle. The recipient
+// supplies a compatible JDK path to the launcher; the bundle itself remains
+// small and architecture-neutral, while the JVM selects AVX2/AVX-512/NEON at
+// startup on the destination machine.
+tasks.register('testBundleZip', Zip) {
+    group = 'distribution'
+    description = 'Packages the standalone benchmark JAR with JDK-path launchers.'
+    dependsOn tasks.named('testJar')
+    destinationDirectory = layout.buildDirectory.dir('distributions')
+    archiveFileName = "fastblake-test-${project.version}.zip"
+    from(tasks.named('testJar')) {
+        rename { 'fastblake-test.jar' }
+    }
+    from(layout.projectDirectory.dir('tools')) {
+        include 'run-fastblake-benchmark.sh'
+        filePermissions {
+            unix('rwxr-xr-x')
+        }
+    }
+    from(layout.projectDirectory.dir('tools')) {
+        include 'run-fastblake-benchmark.bat'
+    }
 }
 
 // Reports which contenders this machine can actually run, and why any are out.

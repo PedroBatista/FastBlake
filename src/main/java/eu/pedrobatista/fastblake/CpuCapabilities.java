@@ -68,6 +68,38 @@ final class CpuCapabilities {
     /** Chunks the preferred-width kernel consumes per batch, or 0 if unavailable. */
     static final int WIDE_LANES = WIDE_VECTOR_BITS / Integer.SIZE;
 
+    /**
+     * Whether the JVM selected a native 512-bit preferred species on x86-64.
+     *
+     * <p>This is intentionally a JVM capability rather than an attempt to
+     * parse OS-specific CPU feature files. The Vector API honours startup
+     * restrictions such as {@code -XX:UseAVX} and {@code -XX:MaxVectorSize};
+     * using its preferred species therefore means FastBlake never emits a
+     * 512-bit shape the running JVM has elected not to use. On HotSpot x86-64,
+     * a 512-bit preferred integer species is the usable AVX-512 configuration.
+     */
+    static final boolean HAS_NATIVE_AVX512 = IS_X86_64 && PREFERRED_VECTOR_BITS >= 512;
+
+    /** The ISA shape the running JVM can actually use for integer vectors. */
+    static String effectiveIsa() {
+        if (PREFERRED_VECTOR_BITS == 0) {
+            return "scalar";
+        }
+        if (IS_X86_64) {
+            if (PREFERRED_VECTOR_BITS >= 512) {
+                return "avx512";
+            }
+            if (PREFERRED_VECTOR_BITS >= 256) {
+                return "avx2";
+            }
+            return "x86-vector-128";
+        }
+        if (IS_AARCH64) {
+            return "neon";
+        }
+        return "vector-" + PREFERRED_VECTOR_BITS;
+    }
+
     private CpuCapabilities() {
     }
 
@@ -150,7 +182,8 @@ final class CpuCapabilities {
             return sb.append(", no Vector API (").append(VECTOR_UNAVAILABLE_REASON)
                     .append(')').toString();
         }
-        sb.append(", preferred vector width ").append(PREFERRED_VECTOR_BITS).append(" bits");
+        sb.append(", effective ISA ").append(effectiveIsa())
+                .append(", preferred vector width ").append(PREFERRED_VECTOR_BITS).append(" bits");
         if (WIDE_VECTOR_BITS != PREFERRED_VECTOR_BITS) {
             // A pinned width is a correctness lever that silently changes what
             // any throughput number means, so it is never left implicit.
