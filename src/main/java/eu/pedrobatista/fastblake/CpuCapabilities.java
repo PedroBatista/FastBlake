@@ -30,12 +30,67 @@ final class CpuCapabilities {
     static final String VECTOR_UNAVAILABLE_REASON = PREFERRED_VECTOR_BITS == 0
             ? probeFailureReason() : null;
 
+    /**
+     * Widest <em>integer</em> vector this JVM will compile to real instructions,
+     * or 0 when the Vector API is unavailable.
+     *
+     * <p>{@link #PREFERRED_VECTOR_BITS} cannot answer this question, because
+     * the preferred shape is the width every lane type supports — the minimum
+     * across {@code byte} through {@code double}. When one lane type is
+     * narrower than the rest, the preferred shape reports the narrow width and
+     * says nothing about which type caused it.
+     *
+     * <p>That distinction is exactly AVX1: it widened the floating-point
+     * datapath to 256 bits and left integer operations at 128. BLAKE3 is
+     * integer-only, so this field, not the preferred width, is the ceiling on
+     * anything FastBlake can emit.
+     */
+    static final int MAX_INT_VECTOR_BITS = probeLargestBits(int.class);
+
+    /**
+     * Widest floating-point vector this JVM will compile, or 0 when the Vector
+     * API is unavailable.
+     *
+     * <p>Useless for hashing; kept solely because the gap between it and
+     * {@link #MAX_INT_VECTOR_BITS} is what identifies an AVX1 machine.
+     */
+    static final int MAX_FP_VECTOR_BITS = probeLargestBits(double.class);
+
     static {
         warnIfVectorApiMissing();
     }
 
-    static final boolean IS_AARCH64 = ARCH.equals("aarch64") || ARCH.equals("arm64");
-    static final boolean IS_X86_64 = ARCH.equals("x86_64") || ARCH.equals("amd64");
+    static final boolean IS_AARCH64 = isAarch64(ARCH);
+    static final boolean IS_X86_64 = isX86_64(ARCH);
+
+    /**
+     * Whether this is an AVX1 machine: 256-bit floating point, 128-bit integer.
+     *
+     * <p>Sandy Bridge and Ivy Bridge, including the Ivy Bridge-EP Xeons in the
+     * 2013 Mac Pro, implement AVX without AVX2. AVX2 is what widened integer
+     * SIMD to 256 bits; AVX1 widened only the floating-point datapath. HotSpot
+     * encodes that limit directly — with {@code UseAVX=1} it allows 32-byte
+     * vectors for {@code float} and {@code double} and 16-byte vectors for
+     * every integral type — so an AVX1 host reports a 128-bit preferred shape
+     * and a 256-bit largest floating-point shape.
+     *
+     * <p><b>The consequence for FastBlake is that AVX1 is a 128-bit target.</b>
+     * BLAKE3's compression function is add, xor and rotate on 32-bit words;
+     * there is no floating-point work to put in the wide half of a YMM
+     * register. Asking for {@code IntVector.SPECIES_256} here does not fail —
+     * it silently stops being intrinsified and runs the Vector API's Java
+     * fallback, which is far slower than the 128-bit kernel it replaced. So
+     * this flag exists to make the 128-bit choice explicit and explainable
+     * rather than to unlock a wider one: see {@code KernelSelector}.
+     *
+     * <p>AVX1 is not merely SSE, and FastBlake does benefit from the
+     * difference without asking: at {@code UseAVX >= 1} HotSpot emits the
+     * VEX-encoded, three-operand forms of the same 128-bit integer
+     * instructions, which removes the register-copy that the two-operand SSE
+     * encoding forces ahead of every destructive operation.
+     */
+    static final boolean HAS_AVX1_ONLY = IS_X86_64 && PREFERRED_VECTOR_BITS != 0
+            && MAX_INT_VECTOR_BITS <= 128 && MAX_FP_VECTOR_BITS >= 256;
 
     /**
      * Architectural vector register count, or 0 when unknown.
@@ -82,22 +137,58 @@ final class CpuCapabilities {
 
     /** The ISA shape the running JVM can actually use for integer vectors. */
     static String effectiveIsa() {
-        if (PREFERRED_VECTOR_BITS == 0) {
+        return classifyIsa(ARCH, PREFERRED_VECTOR_BITS, MAX_INT_VECTOR_BITS, MAX_FP_VECTOR_BITS);
+    }
+
+    /**
+     * The ISA classification, as a pure function of the four probed numbers.
+     *
+     * <p>Kept separate from the static fields so the table below can be tested
+     * on any machine. Every profile FastBlake claims to distinguish is a case
+     * in {@code CpuCapabilitiesIsaTest}; without this seam the AVX1 row could
+     * only be checked by owning an Ivy Bridge.
+     *
+     * <table>
+     *   <caption>x86-64 profiles</caption>
+     *   <tr><th>preferred</th><th>max int</th><th>max fp</th><th>result</th></tr>
+     *   <tr><td>512</td><td>512</td><td>512</td><td>{@code avx512}</td></tr>
+     *   <tr><td>256</td><td>256</td><td>256</td><td>{@code avx2}</td></tr>
+     *   <tr><td>128</td><td>128</td><td>256</td><td>{@code avx}</td></tr>
+     *   <tr><td>128</td><td>128</td><td>128</td><td>{@code x86-vector-128}</td></tr>
+     * </table>
+     */
+    static String classifyIsa(String arch, int preferredBits, int maxIntBits, int maxFpBits) {
+        if (preferredBits == 0) {
             return "scalar";
         }
-        if (IS_X86_64) {
-            if (PREFERRED_VECTOR_BITS >= 512) {
+        if (isX86_64(arch)) {
+            if (preferredBits >= 512) {
                 return "avx512";
             }
-            if (PREFERRED_VECTOR_BITS >= 256) {
+            if (preferredBits >= 256) {
                 return "avx2";
             }
-            return "x86-vector-128";
+            // AVX1: the floating-point datapath is wide and the integer one is
+            // not. Reported distinctly because "x86-vector-128" would otherwise
+            // make an Ivy Bridge indistinguishable from a Core 2, and the two
+            // differ in the VEX encoding FastBlake's kernel is compiled to.
+            if (maxIntBits <= 128 && maxFpBits >= 256) {
+                return "avx";
+            }
+            return "x86-vector-" + preferredBits;
         }
-        if (IS_AARCH64) {
+        if (isAarch64(arch)) {
             return "neon";
         }
-        return "vector-" + PREFERRED_VECTOR_BITS;
+        return "vector-" + preferredBits;
+    }
+
+    private static boolean isAarch64(String arch) {
+        return arch.equals("aarch64") || arch.equals("arm64");
+    }
+
+    private static boolean isX86_64(String arch) {
+        return arch.equals("x86_64") || arch.equals("amd64");
     }
 
     private CpuCapabilities() {
@@ -106,6 +197,27 @@ final class CpuCapabilities {
     private static int probePreferredVectorBits() {
         try {
             return jdk.incubator.vector.IntVector.SPECIES_PREFERRED.vectorBitSize();
+        } catch (Throwable notAvailable) {
+            return 0;
+        }
+    }
+
+    /**
+     * The widest species of one lane type this JVM will actually intrinsify.
+     *
+     * <p>{@code ofLargestShape} is the per-lane-type counterpart of
+     * {@code ofPreferred}: it reports the JVM's own {@code max_vector_size}
+     * for that type rather than the minimum across all types. Probed through
+     * the same defensive {@link Throwable} catch as everything else here, so a
+     * JVM without {@code jdk.incubator.vector} yields 0 instead of failing
+     * class initialisation.
+     */
+    private static int probeLargestBits(Class<?> laneType) {
+        if (PREFERRED_VECTOR_BITS == 0) {
+            return 0;
+        }
+        try {
+            return jdk.incubator.vector.VectorSpecies.ofLargestShape(laneType).vectorBitSize();
         } catch (Throwable notAvailable) {
             return 0;
         }
@@ -184,11 +296,28 @@ final class CpuCapabilities {
         }
         sb.append(", effective ISA ").append(effectiveIsa())
                 .append(", preferred vector width ").append(PREFERRED_VECTOR_BITS).append(" bits");
+        if (HAS_AVX1_ONLY) {
+            // Without this line a 128-bit width on a machine advertising AVX
+            // looks like a dispatch bug. It is not: AVX1 has no 256-bit integer
+            // datapath, and BLAKE3 is integer-only.
+            sb.append(" (AVX1: ").append(MAX_FP_VECTOR_BITS)
+                    .append("-bit floating point but only ").append(MAX_INT_VECTOR_BITS)
+                    .append("-bit integer vectors, so 128 bits is the whole machine here)");
+        }
         if (WIDE_VECTOR_BITS != PREFERRED_VECTOR_BITS) {
             // A pinned width is a correctness lever that silently changes what
             // any throughput number means, so it is never left implicit.
             sb.append(" (wide kernel pinned to ").append(WIDE_VECTOR_BITS)
-                    .append(" bits by -Dfastblake.wideBits; not a valid measurement)");
+                    .append(" bits by -Dfastblake.wideBits; not a valid measurement");
+            if (MAX_INT_VECTOR_BITS > 0 && WIDE_VECTOR_BITS > MAX_INT_VECTOR_BITS) {
+                // Distinct from an ordinary pin: above this ceiling the kernel
+                // is not merely running on a split species, it has left the
+                // intrinsics entirely and is executing the Vector API's Java
+                // fallback. Correct, and orders of magnitude slower.
+                sb.append(", and above the ").append(MAX_INT_VECTOR_BITS)
+                        .append("-bit integer vectors this JVM intrinsifies");
+            }
+            sb.append(')');
         }
         if (VECTOR_REGISTERS > 0) {
             sb.append(", ~").append(VECTOR_REGISTERS).append(" vector registers");

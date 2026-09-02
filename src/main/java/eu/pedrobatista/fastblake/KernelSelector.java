@@ -39,6 +39,24 @@ import java.util.Locale;
  * each ZMM vector while the 32-register AVX-512 file leaves room for the
  * compressor's live state. AVX2 remains conservative until it has a measured
  * winner.
+ *
+ * <h2>x86-64 is three profiles, not one</h2>
+ *
+ * {@code os.arch} reports {@code x86_64} for all of them, so the selector
+ * distinguishes them by what the JVM says it will compile:
+ *
+ * <table>
+ *   <caption>x86-64 dispatch</caption>
+ *   <tr><th>Profile</th><th>Widest integer vector</th><th>Kernel</th></tr>
+ *   <tr><td>AVX-512</td><td>512 bits</td><td>{@code WIDE}, sixteen lanes</td></tr>
+ *   <tr><td>AVX2</td><td>256 bits</td><td>{@code FOUR_CHUNK}, pending E028</td></tr>
+ *   <tr><td>AVX1 / SSE</td><td>128 bits</td><td>{@code FOUR_CHUNK}, at full width</td></tr>
+ * </table>
+ *
+ * <p>The last row is the only one that is settled rather than provisional:
+ * AVX1 widened the floating-point datapath and not the integer one, so a
+ * 128-bit kernel already uses everything an AVX1 core has for this workload.
+ * See {@link CpuCapabilities#HAS_AVX1_ONLY}.
  */
 final class KernelSelector {
 
@@ -147,6 +165,35 @@ final class KernelSelector {
         if (CpuCapabilities.HAS_NATIVE_AVX512) {
             return Kernel.WIDE;
         }
+        // AVX1 (Sandy Bridge, Ivy Bridge, and the Ivy Bridge-EP Xeons in the
+        // 2013 Mac Pro). Handled before the general x86-64 branch because it
+        // reaches the same kernel for a different and permanent reason.
+        //
+        // AVX2, not AVX1, is what widened integer SIMD to 256 bits. AVX1's
+        // 256-bit half is floating point only, and BLAKE3 is add/xor/rotate on
+        // 32-bit words with no floating-point work to put there. The 128-bit
+        // four-chunk kernel is therefore not a conservative placeholder here,
+        // as it is on AVX2 below -- it is the entire machine, and there is no
+        // measurement that could change it. Kernel.WIDE resolves to the same
+        // four lanes on this profile anyway, since the preferred species is
+        // 128-bit; forcing a wider one leaves the intrinsics for the Vector
+        // API's Java fallback and loses badly.
+        //
+        // What AVX1 does buy is free: at UseAVX >= 1 HotSpot emits the
+        // VEX-encoded three-operand forms of these same 128-bit instructions,
+        // dropping the register copy the two-operand SSE encoding needs before
+        // each destructive operation. No kernel change is required to get it.
+        //
+        // OPEN, and the one thing worth measuring on such a machine: EIGHT_CHUNK
+        // lost 12-14% on Zen+, which is why the x86-64 default is four. Ivy
+        // Bridge-EP is a different microarchitecture with the same 16-register
+        // file, so whether that result transfers is unknown rather than
+        // decided. Rule 1 of this table admits no extrapolation, so it stays on
+        // FOUR_CHUNK until `./gradlew dispatchAudit` on an AVX1 host says
+        // otherwise.
+        if (CpuCapabilities.HAS_AVX1_ONLY) {
+            return Kernel.FOUR_CHUNK;
+        }
         // MEASURED: E024, Ryzen 3 3200G (Zen+, AVX2, 16 YMM registers). The
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
         // registers spills more than the added parallelism buys. E011/E014's
@@ -182,6 +229,12 @@ final class KernelSelector {
         if (CpuCapabilities.HAS_NATIVE_AVX512) {
             return "x86-64 with native 512-bit Vector API species and 32 ZMM registers; "
                     + "using the sixteen-lane AVX-512 wide kernel";
+        }
+        if (CpuCapabilities.HAS_AVX1_ONLY) {
+            return "x86-64 with AVX1 but not AVX2: " + CpuCapabilities.MAX_FP_VECTOR_BITS
+                    + "-bit floating-point vectors and only " + CpuCapabilities.MAX_INT_VECTOR_BITS
+                    + "-bit integer vectors, and BLAKE3 is integer-only. The four-chunk "
+                    + "128-bit kernel is the full width of this machine";
         }
         if (CpuCapabilities.IS_X86_64) {
             return "x86-64 with " + CpuCapabilities.VECTOR_REGISTERS + " vector registers; "

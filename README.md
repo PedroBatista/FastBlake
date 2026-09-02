@@ -164,6 +164,14 @@ automatically hashes 16 complete chunks in parallel using the AVX-512 wide
 kernel. The selection follows the JVM's effective vector configuration, so
 starting HotSpot with AVX-512 disabled safely selects a narrower kernel instead.
 
+Older x86-64 parts are handled the same way, from the other end. On an **AVX1**
+CPU — Sandy Bridge, Ivy Bridge, the Ivy Bridge-EP Xeons in a 2013 Mac Pro —
+FastBlake runs the 128-bit four-chunk kernel and reports its ISA as `avx`. That
+is not a fallback: AVX2, not AVX1, widened integer SIMD to 256 bits, and BLAKE3
+is integer-only, so 128 bits is the entire machine for this workload. The
+VEX-encoded three-operand instructions AVX1 does add are emitted by HotSpot
+without any change on FastBlake's side.
+
 Allocation is fixed per call, not proportional to input: a 8 MiB hash allocates
 about 0.002 bytes per input byte, with zero collections. A hasher that has
 streamed 8 MiB retains 12 KiB, most of it the batch buffer that makes streaming
@@ -181,7 +189,7 @@ Measure it yourself on your own hardware:
 
 The test artifact is `build/libs/fastblake-<version>-test.jar`. Run it with
 `java -jar build/libs/fastblake-<version>-test.jar -p size=8388608`; it detects
-the effective CPU/vector ISA (including the AVX2 versus AVX-512 distinction),
+the effective CPU/vector ISA (including the AVX1, AVX2 and AVX-512 distinctions),
 prints the normal JMH output, and writes a timestamped JSON report such as
 `fastblake-benchmark-20260819T143012.417Z.json` in the current directory.
 Use `--json-output-dir DIR` or `--json-output FILE` to control the report path.

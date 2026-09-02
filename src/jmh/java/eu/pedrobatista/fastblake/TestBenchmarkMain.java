@@ -114,6 +114,13 @@ public final class TestBenchmarkMain {
         field(json, "vectorApiAvailable", CpuCapabilities.PREFERRED_VECTOR_BITS != 0).append(',');
         field(json, "preferredVectorBits", CpuCapabilities.PREFERRED_VECTOR_BITS).append(',');
         field(json, "vectorRegisters", CpuCapabilities.VECTOR_REGISTERS).append(',');
+        // The preferred width is the minimum across all lane types, so it
+        // cannot by itself tell an AVX1 host (wide floating point, 128-bit
+        // integer) from a plain SSE one. Both widths are recorded so a report
+        // from an unfamiliar machine stays classifiable after the fact.
+        field(json, "maxIntVectorBits", CpuCapabilities.MAX_INT_VECTOR_BITS).append(',');
+        field(json, "maxFpVectorBits", CpuCapabilities.MAX_FP_VECTOR_BITS).append(',');
+        field(json, "avx1Effective", CpuCapabilities.HAS_AVX1_ONLY).append(',');
         field(json, "avx2Effective", CpuCapabilities.IS_X86_64
                 && CpuCapabilities.PREFERRED_VECTOR_BITS >= 256).append(',');
         field(json, "avx512Effective", CpuCapabilities.HAS_NATIVE_AVX512).append(',');

@@ -146,7 +146,8 @@ The report includes:
 - run timestamp and the JMH arguments;
 - architecture and effective ISA;
 - preferred Vector API width and estimated vector-register count;
-- effective AVX2 and AVX-512 flags;
+- widest intrinsified integer and floating-point vector widths;
+- effective AVX1, AVX2 and AVX-512 flags;
 - the selected FastBlake kernel and dispatch reason;
 - each benchmark's parameters, score, score unit, error, sample count, and
   BLAKE3 throughput in MiB/s where an input size is available.
@@ -154,22 +155,45 @@ The report includes:
 ## CPU capability detection
 
 `os.arch` identifies the broad architecture, but it is not enough to distinguish
-AVX2 and AVX-512: both are commonly reported as `x86_64`. FastBlake therefore
-also probes `IntVector.SPECIES_PREFERRED` after the JVM starts and reports the
-effective configuration:
+SSE, AVX1, AVX2 and AVX-512: all are reported as `x86_64`. FastBlake therefore
+probes the Vector API after the JVM starts and reports the effective
+configuration from two numbers:
 
-| Preferred integer vector width | Reported effective ISA | Typical x86 meaning |
-|---:|---|---|
-| unavailable | `scalar` | Vector API not enabled/available |
-| 128 bits | `x86-vector-128` | SSE-width effective configuration |
-| 256 bits | `avx2` | AVX2-width effective configuration |
-| 512 bits | `avx512` | AVX-512-width effective configuration |
+- `IntVector.SPECIES_PREFERRED` — the width shared by *every* lane type, and the
+  width the kernels are built at;
+- `VectorSpecies.ofLargestShape(int.class)` and `ofLargestShape(double.class)` —
+  the widest integer and floating-point vectors this JVM will actually compile.
+
+| Preferred | Max int | Max FP | Reported effective ISA | Typical x86 meaning |
+|---:|---:|---:|---|---|
+| unavailable | — | — | `scalar` | Vector API not enabled/available |
+| 128 bits | 128 | 128 | `x86-vector-128` | SSE-width effective configuration |
+| 128 bits | 128 | 256 | `avx` | **AVX1**: 256-bit FP, 128-bit integer |
+| 256 bits | 256 | 256 | `avx2` | AVX2-width effective configuration |
+| 512 bits | 512 | 512 | `avx512` | AVX-512-width effective configuration |
+
+The AVX1 row is why the second and third columns exist. AVX2, not AVX1, widened
+*integer* SIMD to 256 bits; AVX1 widened only the floating-point datapath.
+HotSpot encodes that limit directly (`UseAVX=1` permits 32-byte `float`/`double`
+vectors and 16-byte integral ones), so on a Sandy Bridge or Ivy Bridge part —
+including the Ivy Bridge-EP Xeons in a 2013 Mac Pro — the preferred shape is
+128 bits. BLAKE3 is add/xor/rotate on 32-bit words with no floating-point work,
+so **128 bits is the full width of an AVX1 machine** and the four-chunk kernel
+is the right and final answer there, not a placeholder. `describe()` says so
+explicitly rather than leaving a 128-bit width on an "AVX" CPU looking like a
+dispatch bug.
+
+Forcing a wider integer species anyway (`-Dfastblake.wideBits=256`) does not
+fail. It stops being intrinsified and runs the Vector API's Java fallback:
+still correct, dramatically slower. `describe()` calls that case out by name.
 
 On AArch64, a 128-bit preferred species is reported as `neon`. The probe uses
-the JVM's effective vector settings, so startup restrictions such as
-`-XX:MaxVectorSize` are respected. A CPU may physically support AVX-512 while a
-JVM configured to use only 256-bit vectors reports and runs as effective AVX2;
+the JVM's effective vector settings, so startup restrictions such as `-XX:UseAVX`
+and `-XX:MaxVectorSize` are respected. A CPU may physically support AVX-512 while
+a JVM configured to use only 256-bit vectors reports and runs as effective AVX2;
 that is the safe behavior for the process actually executing the benchmark.
+Likewise `-XX:UseAVX=1` on a modern part reports and runs as `avx`, which is the
+correct answer for that process.
 
 The first lines of every portable run print the same capability summary that is
 stored in JSON, making it easy to verify that a remote machine selected the
