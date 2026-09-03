@@ -93,7 +93,7 @@ That creates several problems:
 
 Production should only recognize:
 
-fastblake.kernel=auto|scalar|four|eight|wide
+fastblake.kernel=auto|scalar|four|avx1|eight|wide
 
 Experiments should be selected by an experiment-specific runner or factory under the experiment source set. Historical properties can remain there so recorded commands stay
 reproducible.
@@ -169,7 +169,7 @@ test should remain fast enough for ordinary development. releaseCheck should inc
 - XOF behavior.
 - Repeated finalization.
 - Reset and offsets.
-- Forced scalar/four/eight kernels.
+- Forced scalar/four/avx1/eight kernels.
 - Vector API absent/fallback behavior.
 - Jar-content inspection.
 - Consumer smoke tests.
@@ -308,4 +308,3 @@ A production release should require:
 
 The key principle is: experiments remain first-class citizens of the repository, but they are no longer first-class citizens of the distributed artifact. That preserves
 FastBlake’s performance laboratory without making downstream users carry its entire history.
-

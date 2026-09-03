@@ -179,12 +179,13 @@ vectors and 16-byte integral ones), so on a Sandy Bridge or Ivy Bridge part —
 including the Ivy Bridge-EP Xeons in a 2013 Mac Pro — the preferred shape is
 128 bits. BLAKE3 is add/xor/rotate on 32-bit words with no floating-point work,
 so 128 bits is the widest useful vector shape on an AVX1 machine. Width is not
-the same as profitability, however. E029 measured the production four-chunk
+the same as profitability, however. E029 measured the ordinary four-chunk
 kernel on a 2013 Mac Pro with Temurin JDK 25.0.4: C2 materialised Vector API
-wrappers, allocating about 714 MB per 8 MiB hash, while the scalar path remained
-allocation-safe and about five times faster. Automatic dispatch therefore uses
-the scalar kernel for effective AVX1 while continuing to report the ISA as
-`avx`.
+wrappers, allocating about 714 MB per 8 MiB hash. E030 isolated the composite
+`VectorOperators.ROR` lowering and recovered allocation-free SIMD by textually
+inlining shift/OR rotations. Automatic dispatch therefore uses the dedicated
+AVX1 kernel while continuing to report the ISA as `avx`; consumers need no JVM
+flags.
 
 Forcing a wider integer species anyway (`-Dfastblake.wideBits=256`) does not
 fail. It stops being intrinsified and runs the Vector API's Java fallback:

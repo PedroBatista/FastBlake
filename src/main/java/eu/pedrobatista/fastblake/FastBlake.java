@@ -28,6 +28,8 @@ public final class FastBlake {
     // machine that does not ask for it by property.
     private static final boolean WIDE_KERNEL =
             KernelSelector.selected() == KernelSelector.Kernel.WIDE;
+    private static final boolean AVX1_KERNEL =
+            KernelSelector.selected() == KernelSelector.Kernel.AVX1_CHUNK;
 
     /** The kernel this JVM selected, and why. For diagnostics and the harness. */
     public static String selectedKernel() {
@@ -326,7 +328,7 @@ public final class FastBlake {
 
             if (VECTOR_STREAM_CHUNKS == 4 && chunkLength == 0
                     && remaining > 4 * CHUNK_LEN) {
-                Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
+                hashFourChunks(input, position, chunksCompressed,
                         key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(4);
                 position += 4 * CHUNK_LEN;
@@ -378,7 +380,7 @@ public final class FastBlake {
             // kernel is already the rung above.
             if (VECTOR_STREAM_CHUNKS > 4 && vectorPendingLength == 0
                     && remaining > 4 * CHUNK_LEN) {
-                Blake3ChunkVectorScratch.hashChunks(input, position, chunksCompressed,
+                hashFourChunks(input, position, chunksCompressed,
                         key, modeFlags, vectorPacked(), vectorCvs());
                 pushVectorChunkCvs(4);
                 position += 4 * CHUNK_LEN;
@@ -405,7 +407,7 @@ public final class FastBlake {
             Blake3ChunkVectorDual.hashChunks(source, sourceOffset, chunksCompressed,
                     key, modeFlags, vectorPacked(), vectorCvs());
         } else {
-            Blake3ChunkVectorScratch.hashChunks(source, sourceOffset, chunksCompressed,
+            hashFourChunks(source, sourceOffset, chunksCompressed,
                     key, modeFlags, vectorPacked(), vectorCvs());
         }
         pushVectorChunkCvs(VECTOR_STREAM_CHUNKS);
@@ -455,7 +457,7 @@ public final class FastBlake {
             // instead -- which is why streaming stayed flat while one-shot
             // gained 21%. This is the path that shape actually takes.
             while (chunksBeforeLast - pending >= 4) {
-                Blake3ChunkVectorScratch.hashChunks(retainedBuffer(), pending * CHUNK_LEN,
+                hashFourChunks(retainedBuffer(), pending * CHUNK_LEN,
                         finalChunkCounter, key, modeFlags, vectorPacked(), vectorCvs());
                 for (int lane = 0; lane < 4; lane++) {
                     System.arraycopy(vectorCvs(), lane * 8, rightCv, 0, 8);
@@ -495,6 +497,18 @@ public final class FastBlake {
         }
         root.rootBytes(output, offset, length, state);
         return this;
+    }
+
+    /** Keeps the AVX1 rotate workaround isolated from every other architecture. */
+    private static void hashFourChunks(byte[] input, int offset, long firstCounter,
+                                       int[] key, int flags, int[] messages, int[] output) {
+        if (AVX1_KERNEL) {
+            Blake3ChunkVectorAvx1.hashChunks(input, offset, firstCounter,
+                    key, flags, messages, output);
+        } else {
+            Blake3ChunkVectorScratch.hashChunks(input, offset, firstCounter,
+                    key, flags, messages, output);
+        }
     }
 
     /**

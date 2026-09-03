@@ -154,7 +154,7 @@ competitor.
 | Apple M5 (NEON) | 537 | **2,116** | 3.9× | 2,480 | 85% |
 | AMD Ryzen 3 3200G (AVX2) | 155 | **893** | 5.8× | 1,922 | 46% |
 | Intel N97 (AVX2) | 157 | **716** | 4.6× | 1,429 | 50% |
-| Mac Pro 2013 (AVX1) | 178 | **330** | 1.9× | 1,682 | 20% |
+| Mac Pro 2013 (AVX1) | 166 | **867** | 5.2× | 1,680 | 52% |
 
 All three call shapes are close together — on the M5, streaming 4 KiB at a time
 costs 2.5% against one-shot. FastBlake matches or beats Commons Codec at every
@@ -167,12 +167,13 @@ starting HotSpot with AVX-512 disabled safely selects a narrower kernel instead.
 
 Older x86-64 parts are handled the same way, from the other end. On an **AVX1**
 CPU — Sandy Bridge, Ivy Bridge, the Ivy Bridge-EP Xeons in a 2013 Mac Pro —
-FastBlake reports its ISA as `avx` but selects the scalar kernel. AVX2, not AVX1,
-widened integer SIMD to 256 bits, and the 128-bit Vector API kernel is not a win
-on the measured Ivy Bridge-EP/JDK 25 combination: HotSpot materialises vector
-wrappers in proportion to input size. The allocation-safe scalar path measured
-about five times faster. AVX2, AVX-512 and AArch64 retain their independently
-measured vector selections.
+FastBlake reports its ISA as `avx` and selects a dedicated four-chunk AVX1
+kernel. AVX2, not AVX1, widened integer SIMD to 256 bits, and the ordinary
+128-bit Vector API kernel is not a win on the measured Ivy Bridge-EP/JDK 25
+combination: HotSpot materialises vector wrappers in proportion to input size.
+The AVX1 kernel instead uses textually inlined shift/OR rotations, which
+eliminates the wrappers and reaches 867 MiB/s without CPU/JIT tuning flags.
+AVX2, AVX-512 and AArch64 retain their independently measured kernels.
 
 Allocation is fixed per call, not proportional to input: a 8 MiB hash allocates
 about 0.002 bytes per input byte, with zero collections. A hasher that has

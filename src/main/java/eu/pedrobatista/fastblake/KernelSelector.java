@@ -28,7 +28,7 @@ import java.util.Locale;
  *
  * <h2>Overriding</h2>
  *
- * {@code -Dfastblake.kernel=auto|scalar|four|eight|wide} forces a production
+ * {@code -Dfastblake.kernel=auto|scalar|four|avx1|eight|wide} forces a production
  * choice, for benchmarking and for embedders who know their fleet. Historical
  * kernel switches belong to the experiment source set and are intentionally not
  * interpreted by the shipped library.
@@ -50,16 +50,17 @@ import java.util.Locale;
  *   <tr><th>Profile</th><th>Widest integer vector</th><th>Kernel</th></tr>
  *   <tr><td>AVX-512</td><td>512 bits</td><td>{@code WIDE}, sixteen lanes</td></tr>
  *   <tr><td>AVX2</td><td>256 bits</td><td>{@code FOUR_CHUNK}, pending E028</td></tr>
- *   <tr><td>AVX1</td><td>128 bits</td><td>{@code SCALAR}, measured on Ivy Bridge-EP</td></tr>
+ *   <tr><td>AVX1</td><td>128 bits</td><td>{@code AVX1_CHUNK}, measured on Ivy Bridge-EP</td></tr>
  *   <tr><td>SSE</td><td>128 bits</td><td>{@code FOUR_CHUNK}, conservative default</td></tr>
  * </table>
  *
  * <p>AVX1 widened the floating-point datapath and not the integer one, so
  * BLAKE3 cannot use its 256-bit half. That fact limits useful integer vectors
  * to 128 bits; it does not prove that a 128-bit Vector API kernel beats scalar
- * code. E029 measured the opposite on a 2013 Mac Pro: C2 materialised vector
- * wrappers in proportion to input size, and the allocation-free scalar kernel
- * was about five times faster. See {@link CpuCapabilities#HAS_AVX1_ONLY}.
+ * code. E029 found that C2 materialised wrappers for the composite Vector API
+ * rotate operator on a 2013 Mac Pro. E030 recovered allocation-free SIMD with
+ * textually inlined primitive shift/OR rotations. See
+ * {@link CpuCapabilities#HAS_AVX1_ONLY}.
  */
 final class KernelSelector {
 
@@ -69,6 +70,8 @@ final class KernelSelector {
         SCALAR(0),
         /** E011/E014 four independent chunks in 128-bit lanes. */
         FOUR_CHUNK(4),
+        /** E030 AVX1 kernel with inlined shift/OR rotations. */
+        AVX1_CHUNK(4),
         /** E024 two interleaved four-chunk batches, eight chunks in flight. */
         EIGHT_CHUNK(8),
         /**
@@ -99,6 +102,7 @@ final class KernelSelector {
         Kernel forced = switch (override) {
             case "scalar" -> Kernel.SCALAR;
             case "four", "four-chunk" -> Kernel.FOUR_CHUNK;
+            case "avx1", "avx1-chunk" -> Kernel.AVX1_CHUNK;
             case "eight", "eight-chunk", "dual" -> Kernel.EIGHT_CHUNK;
             case "wide", "preferred" -> Kernel.WIDE;
             default -> null;
@@ -204,16 +208,15 @@ final class KernelSelector {
         // dropping the register copy the two-operand SSE encoding needs before
         // each destructive operation. No kernel change is required to get it.
         //
-        // MEASURED: E029, Ivy Bridge-EP in a 2013 Mac Pro, Temurin JDK 25.0.4.
-        // The four-chunk kernel allocated about 714 MB per 8 MiB hash because
-        // C2 did not scalar-replace its Vector API wrappers. It measured
-        // 55-67 MiB/s against 330-332 MiB/s for the allocation-safe scalar
-        // path. Two dispatch audits measured scalar at 315-324 MiB/s and four
-        // at 65 MiB/s. Select scalar for the AVX1 profile; AVX2, AVX-512,
-        // AArch64 and the unmeasured SSE profile retain their existing branches
-        // below.
+        // MEASURED: E029/E030, Ivy Bridge-EP in a 2013 Mac Pro, Temurin JDK
+        // 25.0.4. The ordinary four-chunk kernel allocated about 714 MB per
+        // 8 MiB hash because C2 boxed the composite VectorOperators.ROR path.
+        // E030's dedicated kernel expresses each rotate as inlined primitive
+        // shifts plus OR, restoring fixed allocation and more than doubling
+        // scalar throughput. AVX2, AVX-512, AArch64 and the unmeasured SSE
+        // profile retain their existing branches below.
         if (avx1Only) {
-            return Kernel.SCALAR;
+            return Kernel.AVX1_CHUNK;
         }
         // MEASURED: E024, Ryzen 3 3200G (Zen+, AVX2, 16 YMM registers). The
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
@@ -254,8 +257,8 @@ final class KernelSelector {
         if (CpuCapabilities.HAS_AVX1_ONLY) {
             return "x86-64 with AVX1 but not AVX2: " + CpuCapabilities.MAX_FP_VECTOR_BITS
                     + "-bit floating-point vectors and only " + CpuCapabilities.MAX_INT_VECTOR_BITS
-                    + "-bit integer vectors. E029 measured Vector API wrapper allocation "
-                    + "proportional to input and selected the allocation-safe scalar kernel";
+                    + "-bit integer vectors. E030 uses an allocation-safe four-chunk kernel "
+                    + "with inlined shift/OR rotations because composite ROR boxed on this profile";
         }
         if (CpuCapabilities.IS_X86_64) {
             return "x86-64 with " + CpuCapabilities.VECTOR_REGISTERS + " vector registers; "

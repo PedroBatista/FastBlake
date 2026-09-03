@@ -15,8 +15,8 @@ Threads: 1
 
 `./gradlew test` passed the complete conformance suite. Capability detection
 reported effective ISA `avx`, correctly distinguishing AVX1 from SSE and AVX2.
-The full suite also passed with `FOUR_CHUNK` and `EIGHT_CHUNK` forced, confirming
-that the selector policy changed without invalidating either diagnostic kernel.
+The full suite also passed with `FOUR_CHUNK`, `AVX1_CHUNK` and `EIGHT_CHUNK`
+forced, confirming that selector changes did not invalidate another kernel.
 
 The production selector initially chose `FOUR_CHUNK`. Its isolated allocation
 gate was repeated and failed consistently:
@@ -74,9 +74,35 @@ four was 79.4-79.9% below scalar (scalar was 4.85-4.98x as fast), well outside
 the 3% inconclusive band. The post-change audit reported `SCALAR` as both
 selected and fastest, with `VERDICT: OK`.
 
-The final no-override allocation gate confirmed that automatic dispatch now
-has fixed call-shape allocation and no collections: 5,263 B/op for one-shot and
-2,103 B/op for reused/streaming. It measured 332/329/330 MiB/s.
+That made scalar the safe initial fix, but E030 subsequently isolated and
+removed the compiler failure. A direct `VectorOperators.ROR` dependency chain
+allocated 12,336 B/op for 256 rotates, almost exactly one 48-byte wrapper per
+rotation. Expressing the same rotations as shifts plus OR allocated effectively
+zero. Critically, a helper-based BLAKE3 G still allocated 49,248 B/op, while
+textually inlining those expressions into the G allocated effectively zero.
+
+The resulting dedicated `AVX1_CHUNK` kernel passed the complete forced and
+automatic conformance suites. Its automatic 8 MiB allocation gate reported no
+collections and fixed costs of 12,860 B/op one-shot and about 4,786 B/op for
+reused/streaming—approximately 0.0015 and 0.0006 bytes per input byte.
+
+A separate consumer-style probe loaded the Java 21-compatible library jar on
+Temurin 21.0.12.1 with the Vector API resolved. Zero-configuration selection
+chose `AVX1_CHUNK`, measured about 875 MiB/s, and allocated 12,792 B/op. This
+validates both the library's minimum Java version and the JDK 25 benchmark JVM;
+neither run used performance flags.
+
+Long confirmation, two forks with five warmup and five measurement iterations:
+
+| shape | Commons Codec | Rust | FastBlake AVX1 |
+|---|---:|---:|---:|
+| `oneShot` | 166 | 1,680 | 867 |
+| `reusedInstance` | 180 | 1,694 | 886 |
+| `streaming4k` | 177 | 1,517 | 829 |
+
+The repeated five-kernel dispatch audit measured scalar/four/AVX1/eight/wide
+at 329/65/863/42/63 MiB/s and reported `AVX1_CHUNK` as both selected and fastest
+with `VERDICT: OK`.
 
 ## Commands
 
@@ -86,6 +112,7 @@ has fixed call-shape allocation and no collections: 5,263 B/op for one-shot and
 ./gradlew jmh -P'jmh.args=Blake3Benchmark -p impl=java-cpu -p size=8388608 -f1 -wi 3 -i 3 -prof gc'
 ./gradlew dispatchAudit
 JAVA_TOOL_OPTIONS='-Dfastblake.kernel=four' ./gradlew test --rerun
+JAVA_TOOL_OPTIONS='-Dfastblake.kernel=avx1' ./gradlew test --rerun
 JAVA_TOOL_OPTIONS='-Dfastblake.kernel=eight' ./gradlew test --rerun
 JAVA_TOOL_OPTIONS='-Dfastblake.kernel=scalar' \
   ./gradlew jmh -P'jmh.args=Blake3Benchmark -p impl=commons,rust,java-cpu -p size=8388608 -f2 -wi 5 -i 5'
@@ -93,9 +120,11 @@ JAVA_TOOL_OPTIONS='-Dfastblake.kernel=scalar' \
 
 ## Decision
 
-Select `SCALAR` automatically when the effective JVM profile is AVX1
-(`HAS_AVX1_ONLY`). This is deliberately narrower than changing all 128-bit x86
-profiles: SSE remains on the existing conservative four-chunk default because
-it has not been measured, and the AVX2, AVX-512 and AArch64 branches are
-unchanged. The ISA remains reported as `avx`; capability classification and
-profitable kernel selection are separate decisions.
+Select the dedicated `AVX1_CHUNK` automatically when the effective JVM profile
+is AVX1 (`HAS_AVX1_ONLY`). It uses four 128-bit integer lanes and textually
+inlined shift/OR rotations; no CPU-specific or kernel-selection flags are
+required from consumers. Resolving the incubating Vector API module remains the
+library's existing opt-in, with scalar fallback when it is absent. This is
+deliberately narrower than changing all 128-bit x86 profiles: SSE retains its
+existing conservative four-chunk default, while AVX2, AVX-512 and AArch64 keep
+their independently selected kernels. The ISA remains reported as `avx`.

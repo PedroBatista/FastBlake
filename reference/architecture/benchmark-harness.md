@@ -85,7 +85,7 @@ typical workload.
 ./gradlew jmh -P'jmh.args=-p impl=rust,commons'        # pick contenders
 ./gradlew jmh -P'jmh.args=-rf json -rff build/x.json'  # machine-readable
 ./gradlew footprint                                    # retained bytes per hasher (JOL)
-./gradlew dispatchAudit                                # measure scalar/four/eight/wide and judge
+./gradlew dispatchAudit                                # measure scalar/four/avx1/eight/wide and judge
 ```
 
 JMH prints ns/op; the runner appends a MiB/s table with speedups against the

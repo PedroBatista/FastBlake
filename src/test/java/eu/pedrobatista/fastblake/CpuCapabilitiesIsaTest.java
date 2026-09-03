@@ -92,15 +92,15 @@ class CpuCapabilitiesIsaTest {
         }
     }
 
-    /** E029's measured AVX1 default; explicit diagnostic overrides remain valid. */
+    /** E030's measured AVX1 default; explicit diagnostic overrides remain valid. */
     @Test
-    void anAvx1HostSelectsTheMeasuredScalarKernel() {
+    void anAvx1HostSelectsTheMeasuredDedicatedKernel() {
         if (!CpuCapabilities.HAS_AVX1_ONLY
                 || System.getProperty("fastblake.kernel") != null) {
             return;
         }
-        assertEquals(KernelSelector.Kernel.SCALAR, KernelSelector.selected(),
-                "E029 rejected the Vector API kernels on AVX1; " + KernelSelector.describe());
+        assertEquals(KernelSelector.Kernel.AVX1_CHUNK, KernelSelector.selected(),
+                "E030 recovered allocation-free AVX1 SIMD; " + KernelSelector.describe());
     }
 
     @Test
@@ -120,9 +120,9 @@ class CpuCapabilitiesIsaTest {
         assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
                 KernelSelector.selectAutomaticallyForProfile(true, false, 16,
                         false, false, true), "AVX2 remains on the measured four-chunk default");
-        assertEquals(KernelSelector.Kernel.SCALAR,
+        assertEquals(KernelSelector.Kernel.AVX1_CHUNK,
                 KernelSelector.selectAutomaticallyForProfile(true, false, 16,
-                        false, true, true), "E029 measured AVX1 scalar as the winner");
+                        false, true, true), "E030 measured the dedicated AVX1 kernel as the winner");
         assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
                 KernelSelector.selectAutomaticallyForProfile(true, false, 16,
                         false, false, true), "the unmeasured SSE profile is unchanged");

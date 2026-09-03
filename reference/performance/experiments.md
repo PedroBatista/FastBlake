@@ -8,7 +8,7 @@ Historical commands in this file describe the JVM/source layout at the time of
 each experiment. Candidate kernels now live under `src/experiment` and are
 compiled with `./gradlew experimentClasses`; the shipped `FastBlake` class no
 longer interprets `fastblake.experimental.*` properties. New production dispatch
-measurements use `-Dfastblake.kernel=auto|scalar|four|eight`.
+measurements use `-Dfastblake.kernel=auto|scalar|four|avx1|eight|wide`.
 
 Entries below refer to "the README's Results table" and similar. The README is
 now a consumer-facing document; those full size sweeps moved to
@@ -2975,3 +2975,93 @@ on `FOUR_CHUNK`, AVX-512 remains on `WIDE`, register-rich AArch64 remains on
 conservative `FOUR_CHUNK` choice. A pure policy seam and architecture matrix
 test lock those unaffected branches. Detailed machine record:
 `reference/performance/results/mac-pro-2013.md`.
+
+Superseded by E030: scalar was the correct safe response to the allocating
+kernel, but it was not the final AVX1 ceiling.
+
+## E030 — allocation-free AVX1 with inlined primitive rotates
+
+Date: 2026-09-03
+
+Environment C, unchanged from E029. Goal: recover profitable zero-configuration
+SIMD on effective AVX1 without changing any other architecture's kernel and
+without requiring consumers to set CPU/JIT tuning or kernel-selection flags.
+
+The E011 allocation ladder was first rerun unchanged. Every vector-compute rung
+allocated on this profile, including one BLAKE3 G, while the primitive scalar
+transpose remained effectively allocation-free. Forcing `-XX:UseAVX=0` produced
+the same allocation and timings, ruling out that startup flag as a workaround.
+
+The primitive rotate ladder isolated the first compiler failure:
+
+| 256-operation dependency chain | time | allocated | collections |
+|---|---:|---:|---:|
+| scalar, four lanes | 150 ns | 0.001 B/op | zero |
+| `VectorOperators.ROR`, four lanes | 3,114 ns | 12,336 B/op | 21 total |
+| shift/OR ROR7 | 216 ns | 0.002 B/op | zero |
+| shift/OR ROR8 | 217 ns | 0.002 B/op | zero |
+| shift/OR ROR12 | 217 ns | 0.002 B/op | zero |
+| shift/OR ROR16 | 216 ns | 0.002 B/op | zero |
+
+12,336 bytes is a 48-byte wrapper for every rotation plus fixed boundary cost.
+Byte-shuffle ROR8/ROR16 also passed in isolation at about 71 ns, but did not
+improve the integrated G.
+
+The second boundary was source-shape sensitive:
+
+| one G, 256 repetitions | time | allocated |
+|---|---:|---:|
+| composite `ROR` | 15,907 ns | 98,400 B/op |
+| shift/OR through helper | 9,180 ns | 49,248 B/op |
+| hybrid shuffle + shift/OR helper | 8,240 ns | 49,248 B/op |
+| textually inlined shift/OR | 1,611 ns | 0.011 B/op |
+
+The helper and inline forms are mathematically identical. C2 scalar-replaced
+the vectors only when each rotate expression was present directly in the G
+body. This is compiler graph/escape-analysis sensitivity, not a hardware
+limitation.
+
+Implementation: add `Blake3ChunkVectorAvx1`, a copy-isolated four-chunk kernel
+whose 32 rotate sites use inlined logical shift plus OR expressions. Add
+`AVX1_CHUNK` to the internal selector and diagnostic override, and route only
+effective `HAS_AVX1_ONLY` profiles to it. The existing four/eight/wide classes
+and every non-AVX1 automatic branch are unchanged. Consumers set no flags.
+
+Correctness: complete forced-AVX1 conformance passed, followed by the complete
+automatic suite after promotion.
+
+Baseline-JVM validation: a consumer-style probe loaded the `--release 21`
+library jar on Temurin 21.0.12.1 with `jdk.incubator.vector` resolved. Automatic
+dispatch chose `AVX1_CHUNK`; thirty measured 8 MiB hashes ran at about 875 MiB/s
+and allocated 12,792 B/op. Java 21 and Java 25 therefore both pass the
+allocation and profitability checks without application-supplied tuning flags.
+
+Allocation gate, automatic dispatch, 8 MiB:
+
+| shape | allocated bytes/op | bytes/input byte | collections |
+|---|---:|---:|---:|
+| one-shot | 12,860 | 0.00153 | zero |
+| reused | 4,784 | 0.00057 | zero |
+| streaming 4 KiB | 4,787 | 0.00057 | zero |
+
+These are fixed call-shape costs. The rejected helper-based full kernel still
+allocated roughly 582 MB per 8 MiB operation, proving that primitive rotate
+expressions alone were insufficient; textual integration was part of the fix.
+
+Full comparison, two forks x five warmup x five measurement iterations:
+
+| 8 MiB shape | Commons | Rust | FastBlake AVX1 |
+|---|---:|---:|---:|
+| one-shot | 166 | 1,680 | 867 |
+| reused | 180 | 1,694 | 886 |
+| streaming 4 KiB | 177 | 1,517 | 829 |
+
+The repeated dispatch audit measured scalar/four/AVX1/eight/wide at
+329/65/863/42/63 MiB/s. It identified `AVX1_CHUNK` as selected and fastest and
+reported `VERDICT: OK`.
+
+Decision: ship automatic `AVX1_CHUNK` for effective AVX1. It is 2.5-2.7x the
+scalar path, reaches roughly 49-52% of the native Rust ceiling, and removes the
+85-bytes-per-input-byte allocation failure. Keep the allocation gate mandatory:
+Vector API allocation remains a JIT property and this source shape must be
+rechecked on each supported JDK generation.
