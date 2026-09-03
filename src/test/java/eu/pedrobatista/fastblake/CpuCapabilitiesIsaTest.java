@@ -92,21 +92,42 @@ class CpuCapabilitiesIsaTest {
         }
     }
 
-    /**
-     * AVX1 must never <em>choose</em> a kernel wider than the integer datapath.
-     *
-     * <p>Scoped to automatic selection. {@code -Dfastblake.kernel} is a
-     * deliberate override — {@code testWide512} uses it to exercise the
-     * sixteen-lane shape on hardware that has no AVX-512 — and this assertion
-     * is about the selector's judgement, not about forbidding that lever.
-     */
+    /** E029's measured AVX1 default; explicit diagnostic overrides remain valid. */
     @Test
-    void anAvx1HostNeverSelectsAWiderThanNativeKernel() {
+    void anAvx1HostSelectsTheMeasuredScalarKernel() {
         if (!CpuCapabilities.HAS_AVX1_ONLY
                 || System.getProperty("fastblake.kernel") != null) {
             return;
         }
-        assertEquals(4, KernelSelector.selected().chunksPerBatch,
-                "AVX1 has no 256-bit integer datapath; " + KernelSelector.describe());
+        assertEquals(KernelSelector.Kernel.SCALAR, KernelSelector.selected(),
+                "E029 rejected the Vector API kernels on AVX1; " + KernelSelector.describe());
+    }
+
+    @Test
+    void automaticDispatchChangesOnlyTheMeasuredAvx1Profile() {
+        assertEquals(KernelSelector.Kernel.SCALAR,
+                KernelSelector.selectAutomaticallyForProfile(false, false, 0,
+                        false, false, true));
+        assertEquals(KernelSelector.Kernel.EIGHT_CHUNK,
+                KernelSelector.selectAutomaticallyForProfile(true, true, 32,
+                        false, false, false));
+        assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
+                KernelSelector.selectAutomaticallyForProfile(true, true, 16,
+                        false, false, false));
+        assertEquals(KernelSelector.Kernel.WIDE,
+                KernelSelector.selectAutomaticallyForProfile(true, false, 32,
+                        true, false, true));
+        assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
+                KernelSelector.selectAutomaticallyForProfile(true, false, 16,
+                        false, false, true), "AVX2 remains on the measured four-chunk default");
+        assertEquals(KernelSelector.Kernel.SCALAR,
+                KernelSelector.selectAutomaticallyForProfile(true, false, 16,
+                        false, true, true), "E029 measured AVX1 scalar as the winner");
+        assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
+                KernelSelector.selectAutomaticallyForProfile(true, false, 16,
+                        false, false, true), "the unmeasured SSE profile is unchanged");
+        assertEquals(KernelSelector.Kernel.FOUR_CHUNK,
+                KernelSelector.selectAutomaticallyForProfile(true, false, 0,
+                        false, false, false), "unknown vector architectures are unchanged");
     }
 }

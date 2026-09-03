@@ -50,13 +50,16 @@ import java.util.Locale;
  *   <tr><th>Profile</th><th>Widest integer vector</th><th>Kernel</th></tr>
  *   <tr><td>AVX-512</td><td>512 bits</td><td>{@code WIDE}, sixteen lanes</td></tr>
  *   <tr><td>AVX2</td><td>256 bits</td><td>{@code FOUR_CHUNK}, pending E028</td></tr>
- *   <tr><td>AVX1 / SSE</td><td>128 bits</td><td>{@code FOUR_CHUNK}, at full width</td></tr>
+ *   <tr><td>AVX1</td><td>128 bits</td><td>{@code SCALAR}, measured on Ivy Bridge-EP</td></tr>
+ *   <tr><td>SSE</td><td>128 bits</td><td>{@code FOUR_CHUNK}, conservative default</td></tr>
  * </table>
  *
- * <p>The last row is the only one that is settled rather than provisional:
- * AVX1 widened the floating-point datapath and not the integer one, so a
- * 128-bit kernel already uses everything an AVX1 core has for this workload.
- * See {@link CpuCapabilities#HAS_AVX1_ONLY}.
+ * <p>AVX1 widened the floating-point datapath and not the integer one, so
+ * BLAKE3 cannot use its 256-bit half. That fact limits useful integer vectors
+ * to 128 bits; it does not prove that a 128-bit Vector API kernel beats scalar
+ * code. E029 measured the opposite on a 2013 Mac Pro: C2 materialised vector
+ * wrappers in proportion to input size, and the allocation-free scalar kernel
+ * was about five times faster. See {@link CpuCapabilities#HAS_AVX1_ONLY}.
  */
 final class KernelSelector {
 
@@ -143,13 +146,34 @@ final class KernelSelector {
     }
 
     private static Kernel selectAutomatically() {
-        if (CpuCapabilities.PREFERRED_VECTOR_BITS == 0) {
+        return selectAutomaticallyForProfile(
+                CpuCapabilities.PREFERRED_VECTOR_BITS != 0,
+                CpuCapabilities.IS_AARCH64,
+                CpuCapabilities.VECTOR_REGISTERS,
+                CpuCapabilities.HAS_NATIVE_AVX512,
+                CpuCapabilities.HAS_AVX1_ONLY,
+                CpuCapabilities.IS_X86_64);
+    }
+
+    /**
+     * Pure dispatch table used by production selection and architecture tests.
+     * Keeping the probed host values outside this method lets every profile be
+     * checked on every development machine instead of testing only the host's
+     * one reachable branch.
+     */
+    static Kernel selectAutomaticallyForProfile(boolean vectorApiAvailable,
+                                                boolean aarch64,
+                                                int vectorRegisters,
+                                                boolean nativeAvx512,
+                                                boolean avx1Only,
+                                                boolean x86_64) {
+        if (!vectorApiAvailable) {
             return Kernel.SCALAR;
         }
         // MEASURED: E024, Apple M5. Eight chunks in flight across 32 NEON
         // registers is +36% over four; spill traffic exists but is nearly free
         // in a latency-bound loop (E023).
-        if (CpuCapabilities.IS_AARCH64 && CpuCapabilities.VECTOR_REGISTERS >= 32) {
+        if (aarch64 && vectorRegisters >= 32) {
             return Kernel.EIGHT_CHUNK;
         }
         // AVX-512 has 32 ZMM registers and a native 512-bit species has
@@ -162,37 +186,34 @@ final class KernelSelector {
         // This is deliberately based on the Vector API's preferred species,
         // not raw CPUID: a JVM started with AVX-512 disabled must keep using
         // the best shape it can actually compile.
-        if (CpuCapabilities.HAS_NATIVE_AVX512) {
+        if (nativeAvx512) {
             return Kernel.WIDE;
         }
         // AVX1 (Sandy Bridge, Ivy Bridge, and the Ivy Bridge-EP Xeons in the
-        // 2013 Mac Pro). Handled before the general x86-64 branch because it
-        // reaches the same kernel for a different and permanent reason.
+        // 2013 Mac Pro). Handled before the general x86-64 branch because this
+        // is a measured exception to that branch's four-chunk default.
         //
         // AVX2, not AVX1, is what widened integer SIMD to 256 bits. AVX1's
         // 256-bit half is floating point only, and BLAKE3 is add/xor/rotate on
         // 32-bit words with no floating-point work to put there. The 128-bit
-        // four-chunk kernel is therefore not a conservative placeholder here,
-        // as it is on AVX2 below -- it is the entire machine, and there is no
-        // measurement that could change it. Kernel.WIDE resolves to the same
-        // four lanes on this profile anyway, since the preferred species is
-        // 128-bit; forcing a wider one leaves the intrinsics for the Vector
-        // API's Java fallback and loses badly.
+        // four-chunk kernel therefore uses the widest integer species, but ISA
+        // width alone does not make that Java call graph profitable.
         //
         // What AVX1 does buy is free: at UseAVX >= 1 HotSpot emits the
         // VEX-encoded three-operand forms of these same 128-bit instructions,
         // dropping the register copy the two-operand SSE encoding needs before
         // each destructive operation. No kernel change is required to get it.
         //
-        // OPEN, and the one thing worth measuring on such a machine: EIGHT_CHUNK
-        // lost 12-14% on Zen+, which is why the x86-64 default is four. Ivy
-        // Bridge-EP is a different microarchitecture with the same 16-register
-        // file, so whether that result transfers is unknown rather than
-        // decided. Rule 1 of this table admits no extrapolation, so it stays on
-        // FOUR_CHUNK until `./gradlew dispatchAudit` on an AVX1 host says
-        // otherwise.
-        if (CpuCapabilities.HAS_AVX1_ONLY) {
-            return Kernel.FOUR_CHUNK;
+        // MEASURED: E029, Ivy Bridge-EP in a 2013 Mac Pro, Temurin JDK 25.0.4.
+        // The four-chunk kernel allocated about 714 MB per 8 MiB hash because
+        // C2 did not scalar-replace its Vector API wrappers. It measured
+        // 55-67 MiB/s against 330-332 MiB/s for the allocation-safe scalar
+        // path. Two dispatch audits measured scalar at 315-324 MiB/s and four
+        // at 65 MiB/s. Select scalar for the AVX1 profile; AVX2, AVX-512,
+        // AArch64 and the unmeasured SSE profile retain their existing branches
+        // below.
+        if (avx1Only) {
+            return Kernel.SCALAR;
         }
         // MEASURED: E024, Ryzen 3 3200G (Zen+, AVX2, 16 YMM registers). The
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
@@ -211,7 +232,7 @@ final class KernelSelector {
         // because rule 1 of this table admits no extrapolation. Running
         // `./gradlew dispatchAudit` on an AVX2 or AVX-512 machine is the whole
         // experiment; a MISMATCH verdict there is what flips this branch.
-        if (CpuCapabilities.IS_X86_64) {
+        if (x86_64) {
             return Kernel.FOUR_CHUNK;
         }
         // UNMEASURED profile. Take the conservative measured-good kernel.
@@ -233,8 +254,8 @@ final class KernelSelector {
         if (CpuCapabilities.HAS_AVX1_ONLY) {
             return "x86-64 with AVX1 but not AVX2: " + CpuCapabilities.MAX_FP_VECTOR_BITS
                     + "-bit floating-point vectors and only " + CpuCapabilities.MAX_INT_VECTOR_BITS
-                    + "-bit integer vectors, and BLAKE3 is integer-only. The four-chunk "
-                    + "128-bit kernel is the full width of this machine";
+                    + "-bit integer vectors. E029 measured Vector API wrapper allocation "
+                    + "proportional to input and selected the allocation-safe scalar kernel";
         }
         if (CpuCapabilities.IS_X86_64) {
             return "x86-64 with " + CpuCapabilities.VECTOR_REGISTERS + " vector registers; "

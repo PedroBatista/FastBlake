@@ -2915,3 +2915,63 @@ preference:
 3. On AVX-512, `wide` wins by more than width alone accounts for, because
    `VPRORD` collapses each rotation to one instruction and removes the penalty
    E019 measured at ~20%.
+
+## E029 — AVX1 dispatch: scalar beats four-chunk on Ivy Bridge-EP
+
+Date: 2026-09-03
+
+Environment C: 2013 Mac Pro, Intel Xeon E5-1680 v2 (Ivy Bridge-EP), 8 cores / 16
+threads, macOS 12.7.6, Temurin JDK 25.0.4+7-LTS, effective AVX1 (128-bit maximum
+integer vectors, 256-bit maximum floating-point vectors), JMH 1.37, one thread.
+
+Question: does AVX1's native 128-bit integer width make the production
+four-chunk Vector API kernel the right automatic choice?
+
+Correctness: the complete `./gradlew test` suite passed. The capability probe
+reported `avx` and automatic dispatch selected `FOUR_CHUNK` before this change.
+The complete suite also passed after the change with `FOUR_CHUNK` and
+`EIGHT_CHUNK` forced, so those kernels remain valid explicit overrides.
+
+Allocation gate, 8 MiB and 1 fork x 3 warmup x 3 measurement with `-prof gc`:
+
+| path | one-shot B/op | reused B/op | streaming B/op | GC |
+|---|---:|---:|---:|---:|
+| automatic four-chunk | 714,334,920 | 714,326,626 | 714,326,659 | 3-5 collections/iteration |
+| forced scalar | 5,384 | 2,222 | 2,222 | zero |
+
+The vector path allocates about 85 bytes per input byte. This is E010's known
+failure mode: C2 did not scalar-replace Vector API wrappers in the integrated
+kernel on this CPU/JVM. Its throughput is rejected as evidence under rule 0.
+
+Full scalar comparison, repeated with 2 forks x 5x1s warmup x 5x1s measurement:
+
+| 8 MiB shape | Commons | Rust | FastBlake scalar |
+|---|---:|---:|---:|
+| one-shot | 178 | 1,683 | 331 |
+| reused | 178 | 1,688 | 332 |
+| streaming 4 KiB | 178 | 1,522 | 330 |
+
+The prior identical run measured 330/331/332 MiB/s for FastBlake. This confirms
+the scalar result and places it at 1.85-1.87x Commons. The automatic four-chunk
+path measured only 55-67 MiB/s.
+
+Corroboration: the initial `./gradlew dispatchAudit` measured
+scalar/four/eight/wide at 315/65/24/23 MiB/s. After changing the selector, a
+second audit measured 324/65/43/65 MiB/s and reported `SCALAR` as both selected
+and fastest with `VERDICT: OK`. The first audit's eight/wide cells did not
+reproduce and are not used for a mechanism claim. The decision-driving
+scalar/four comparison did reproduce: four was 79.4-79.9% below scalar, and
+scalar was 4.85-4.98x as fast.
+
+The final automatic, no-override allocation gate reported 5,263 B/op for
+one-shot and 2,103 B/op for reused/streaming, with zero collections and
+332/329/330 MiB/s. That confirms the production path now inherits scalar's
+fixed allocation rather than the rejected vector path's input-proportional
+wrapper allocation.
+
+Decision: automatic effective-AVX1 dispatch now selects `SCALAR`. AVX2 remains
+on `FOUR_CHUNK`, AVX-512 remains on `WIDE`, register-rich AArch64 remains on
+`EIGHT_CHUNK`, and the unmeasured SSE/unknown profiles retain their existing
+conservative `FOUR_CHUNK` choice. A pure policy seam and architecture matrix
+test lock those unaffected branches. Detailed machine record:
+`reference/performance/results/mac-pro-2013.md`.

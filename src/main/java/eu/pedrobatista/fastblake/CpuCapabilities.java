@@ -74,14 +74,15 @@ final class CpuCapabilities {
      * every integral type — so an AVX1 host reports a 128-bit preferred shape
      * and a 256-bit largest floating-point shape.
      *
-     * <p><b>The consequence for FastBlake is that AVX1 is a 128-bit target.</b>
+     * <p><b>The integer-vector ceiling on AVX1 is 128 bits.</b>
      * BLAKE3's compression function is add, xor and rotate on 32-bit words;
      * there is no floating-point work to put in the wide half of a YMM
      * register. Asking for {@code IntVector.SPECIES_256} here does not fail —
      * it silently stops being intrinsified and runs the Vector API's Java
-     * fallback, which is far slower than the 128-bit kernel it replaced. So
-     * this flag exists to make the 128-bit choice explicit and explainable
-     * rather than to unlock a wider one: see {@code KernelSelector}.
+     * fallback. Whether the native 128-bit Vector API kernel beats scalar code
+     * remains a measurement question: E029 found that it does not on Ivy
+     * Bridge-EP because C2 materialises vector wrappers. See
+     * {@code KernelSelector}.
      *
      * <p>AVX1 is not merely SSE, and FastBlake does benefit from the
      * difference without asking: at {@code UseAVX >= 1} HotSpot emits the
@@ -298,11 +299,11 @@ final class CpuCapabilities {
                 .append(", preferred vector width ").append(PREFERRED_VECTOR_BITS).append(" bits");
         if (HAS_AVX1_ONLY) {
             // Without this line a 128-bit width on a machine advertising AVX
-            // looks like a dispatch bug. It is not: AVX1 has no 256-bit integer
-            // datapath, and BLAKE3 is integer-only.
+            // Distinguish AVX1 from SSE without implying that the available
+            // 128-bit Vector API kernel is necessarily the fastest choice.
             sb.append(" (AVX1: ").append(MAX_FP_VECTOR_BITS)
                     .append("-bit floating point but only ").append(MAX_INT_VECTOR_BITS)
-                    .append("-bit integer vectors, so 128 bits is the whole machine here)");
+                    .append("-bit integer vectors)");
         }
         if (WIDE_VECTOR_BITS != PREFERRED_VECTOR_BITS) {
             // A pinned width is a correctness lever that silently changes what
