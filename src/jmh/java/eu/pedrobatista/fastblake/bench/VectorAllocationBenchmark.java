@@ -1,8 +1,10 @@
 package eu.pedrobatista.fastblake.bench;
 
 import java.util.concurrent.TimeUnit;
+import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.IntVector;
 import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorShuffle;
 import jdk.incubator.vector.VectorSpecies;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -24,6 +26,11 @@ import org.openjdk.jmh.annotations.Warmup;
 public class VectorAllocationBenchmark {
 
     private static final VectorSpecies<Integer> S = IntVector.SPECIES_128;
+    private static final VectorSpecies<Byte> BS = ByteVector.SPECIES_128;
+    private static final VectorShuffle<Byte> ROR_8_BYTES = VectorShuffle.fromArray(BS,
+            new int[]{1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12}, 0);
+    private static final VectorShuffle<Byte> ROR_16_BYTES = VectorShuffle.fromArray(BS,
+            new int[]{2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13}, 0);
     private static final int REPETITIONS = 256;
     private static final int[][] SCHEDULE = {
         {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
@@ -107,6 +114,90 @@ public class VectorAllocationBenchmark {
             b = b.lanewise(VectorOperators.XOR, c).lanewise(VectorOperators.ROR, 7);
         }
         return a.lane(0) ^ b.lane(0) ^ c.lane(0) ^ d.lane(0);
+    }
+
+    /** AVX1 diagnostic: one G with primitive shift/OR rotations. */
+    @Benchmark
+    public int oneBlakeGShiftOr() {
+        IntVector a = IntVector.fromArray(S, initialState, 0);
+        IntVector b = IntVector.fromArray(S, initialState, 16);
+        IntVector c = IntVector.fromArray(S, initialState, 32);
+        IntVector d = IntVector.fromArray(S, initialState, 48);
+        for (int i = 0; i < REPETITIONS; i++) {
+            IntVector mx = IntVector.fromArray(S, messages, (i & 15) * 4);
+            IntVector my = IntVector.fromArray(S, messages, ((i + 1) & 15) * 4);
+            a = a.add(b).add(mx);
+            d = rotateRightShiftOr(d.lanewise(VectorOperators.XOR, a), 16);
+            c = c.add(d);
+            b = rotateRightShiftOr(b.lanewise(VectorOperators.XOR, c), 12);
+            a = a.add(b).add(my);
+            d = rotateRightShiftOr(d.lanewise(VectorOperators.XOR, a), 8);
+            c = c.add(d);
+            b = rotateRightShiftOr(b.lanewise(VectorOperators.XOR, c), 7);
+        }
+        return a.lane(0) ^ b.lane(0) ^ c.lane(0) ^ d.lane(0);
+    }
+
+    /** AVX1 diagnostic: the same shift/OR G with no helper return boundary. */
+    @Benchmark
+    public int oneBlakeGShiftOrInline() {
+        IntVector a = IntVector.fromArray(S, initialState, 0);
+        IntVector b = IntVector.fromArray(S, initialState, 16);
+        IntVector c = IntVector.fromArray(S, initialState, 32);
+        IntVector d = IntVector.fromArray(S, initialState, 48);
+        for (int i = 0; i < REPETITIONS; i++) {
+            IntVector mx = IntVector.fromArray(S, messages, (i & 15) * 4);
+            IntVector my = IntVector.fromArray(S, messages, ((i + 1) & 15) * 4);
+            a = a.add(b).add(mx);
+            d = d.lanewise(VectorOperators.XOR, a);
+            d = d.lanewise(VectorOperators.LSHR, 16)
+                    .or(d.lanewise(VectorOperators.LSHL, 16));
+            c = c.add(d);
+            b = b.lanewise(VectorOperators.XOR, c);
+            b = b.lanewise(VectorOperators.LSHR, 12)
+                    .or(b.lanewise(VectorOperators.LSHL, 20));
+            a = a.add(b).add(my);
+            d = d.lanewise(VectorOperators.XOR, a);
+            d = d.lanewise(VectorOperators.LSHR, 8)
+                    .or(d.lanewise(VectorOperators.LSHL, 24));
+            c = c.add(d);
+            b = b.lanewise(VectorOperators.XOR, c);
+            b = b.lanewise(VectorOperators.LSHR, 7)
+                    .or(b.lanewise(VectorOperators.LSHL, 25));
+        }
+        return a.lane(0) ^ b.lane(0) ^ c.lane(0) ^ d.lane(0);
+    }
+
+    private static IntVector rotateRightShiftOr(IntVector value, int distance) {
+        return value.lanewise(VectorOperators.LSHR, distance)
+                .or(value.lanewise(VectorOperators.LSHL, 32 - distance));
+    }
+
+    /** AVX1 diagnostic: byte shuffles for 8/16 and shift/OR for 7/12. */
+    @Benchmark
+    public int oneBlakeGHybridRotate() {
+        IntVector a = IntVector.fromArray(S, initialState, 0);
+        IntVector b = IntVector.fromArray(S, initialState, 16);
+        IntVector c = IntVector.fromArray(S, initialState, 32);
+        IntVector d = IntVector.fromArray(S, initialState, 48);
+        for (int i = 0; i < REPETITIONS; i++) {
+            IntVector mx = IntVector.fromArray(S, messages, (i & 15) * 4);
+            IntVector my = IntVector.fromArray(S, messages, ((i + 1) & 15) * 4);
+            a = a.add(b).add(mx);
+            d = rotateRightByteShuffle(d.lanewise(VectorOperators.XOR, a), ROR_16_BYTES);
+            c = c.add(d);
+            b = rotateRightShiftOr(b.lanewise(VectorOperators.XOR, c), 12);
+            a = a.add(b).add(my);
+            d = rotateRightByteShuffle(d.lanewise(VectorOperators.XOR, a), ROR_8_BYTES);
+            c = c.add(d);
+            b = rotateRightShiftOr(b.lanewise(VectorOperators.XOR, c), 7);
+        }
+        return a.lane(0) ^ b.lane(0) ^ c.lane(0) ^ d.lane(0);
+    }
+
+    private static IntVector rotateRightByteShuffle(IntVector value,
+                                                     VectorShuffle<Byte> shuffle) {
+        return value.reinterpretAsBytes().rearrange(shuffle).reinterpretAsInts();
     }
 
     @Benchmark

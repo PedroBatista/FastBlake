@@ -38,6 +38,12 @@ class WideChunkKernelTest {
                 "wide kernel lane count must be a multiple of four, was " + LANES);
         assertEquals(16 * LANES, Blake3ChunkVectorWide.packedWordsLength());
         assertEquals(8 * LANES, Blake3ChunkVectorWide.outputLength());
+        // `testWide512` uses the Vector API's split-species implementation on
+        // non-AVX-512 machines. Make that task prove it exercised the intended
+        // sixteen-lane batch rather than merely another valid width.
+        if (CpuCapabilities.WIDE_VECTOR_BITS == 512) {
+            assertEquals(16, LANES);
+        }
     }
 
     @Test

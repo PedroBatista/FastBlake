@@ -28,15 +28,39 @@ import java.util.Locale;
  *
  * <h2>Overriding</h2>
  *
- * {@code -Dfastblake.kernel=auto|scalar|four|eight|wide} forces a production
+ * {@code -Dfastblake.kernel=auto|scalar|four|avx1|eight|wide} forces a production
  * choice, for benchmarking and for embedders who know their fleet. Historical
  * kernel switches belong to the experiment source set and are intentionally not
  * interpreted by the shipped library.
  *
- * <p>{@code wide} is shipped, conformance-tested and reachable, but is not
- * selected automatically anywhere: no machine has measured it as the winner
- * yet. That is the table's rule working as intended rather than an oversight —
- * see {@link #selectAutomatically()}.
+ * <p>{@code wide} is shipped and conformance-tested. On x86-64 the selector
+ * uses it automatically only when the JVM exposes a native AVX-512-width
+ * species: sixteen independent BLAKE3 chunks then occupy the sixteen lanes of
+ * each ZMM vector while the 32-register AVX-512 file leaves room for the
+ * compressor's live state. AVX2 remains conservative until it has a measured
+ * winner.
+ *
+ * <h2>x86-64 is three profiles, not one</h2>
+ *
+ * {@code os.arch} reports {@code x86_64} for all of them, so the selector
+ * distinguishes them by what the JVM says it will compile:
+ *
+ * <table>
+ *   <caption>x86-64 dispatch</caption>
+ *   <tr><th>Profile</th><th>Widest integer vector</th><th>Kernel</th></tr>
+ *   <tr><td>AVX-512</td><td>512 bits</td><td>{@code WIDE}, sixteen lanes</td></tr>
+ *   <tr><td>AVX2</td><td>256 bits</td><td>{@code FOUR_CHUNK}, pending E028</td></tr>
+ *   <tr><td>AVX1</td><td>128 bits</td><td>{@code AVX1_CHUNK}, measured on Ivy Bridge-EP</td></tr>
+ *   <tr><td>SSE</td><td>128 bits</td><td>{@code FOUR_CHUNK}, conservative default</td></tr>
+ * </table>
+ *
+ * <p>AVX1 widened the floating-point datapath and not the integer one, so
+ * BLAKE3 cannot use its 256-bit half. That fact limits useful integer vectors
+ * to 128 bits; it does not prove that a 128-bit Vector API kernel beats scalar
+ * code. E029 found that C2 materialised wrappers for the composite Vector API
+ * rotate operator on a 2013 Mac Pro. E030 recovered allocation-free SIMD with
+ * textually inlined primitive shift/OR rotations. See
+ * {@link CpuCapabilities#HAS_AVX1_ONLY}.
  */
 final class KernelSelector {
 
@@ -46,13 +70,16 @@ final class KernelSelector {
         SCALAR(0),
         /** E011/E014 four independent chunks in 128-bit lanes. */
         FOUR_CHUNK(4),
+        /** E030 AVX1 kernel with inlined shift/OR rotations. */
+        AVX1_CHUNK(4),
         /** E024 two interleaved four-chunk batches, eight chunks in flight. */
         EIGHT_CHUNK(8),
         /**
          * E013/E028 one chunk per lane at the machine's preferred width.
          *
          * <p>Batch size is the lane count, so this is four chunks on NEON or
-         * SSE, eight on AVX2 and sixteen on AVX-512. Reachable only through
+         * SSE, eight on AVX2 and sixteen on AVX-512. It is selected
+         * automatically for native AVX-512 and is otherwise reachable through
          * {@code -Dfastblake.kernel=wide}: see {@link #selectAutomatically}.
          */
         WIDE(CpuCapabilities.WIDE_LANES);
@@ -75,6 +102,7 @@ final class KernelSelector {
         Kernel forced = switch (override) {
             case "scalar" -> Kernel.SCALAR;
             case "four", "four-chunk" -> Kernel.FOUR_CHUNK;
+            case "avx1", "avx1-chunk" -> Kernel.AVX1_CHUNK;
             case "eight", "eight-chunk", "dual" -> Kernel.EIGHT_CHUNK;
             case "wide", "preferred" -> Kernel.WIDE;
             default -> null;
@@ -122,14 +150,73 @@ final class KernelSelector {
     }
 
     private static Kernel selectAutomatically() {
-        if (CpuCapabilities.PREFERRED_VECTOR_BITS == 0) {
+        return selectAutomaticallyForProfile(
+                CpuCapabilities.PREFERRED_VECTOR_BITS != 0,
+                CpuCapabilities.IS_AARCH64,
+                CpuCapabilities.VECTOR_REGISTERS,
+                CpuCapabilities.HAS_NATIVE_AVX512,
+                CpuCapabilities.HAS_AVX1_ONLY,
+                CpuCapabilities.IS_X86_64);
+    }
+
+    /**
+     * Pure dispatch table used by production selection and architecture tests.
+     * Keeping the probed host values outside this method lets every profile be
+     * checked on every development machine instead of testing only the host's
+     * one reachable branch.
+     */
+    static Kernel selectAutomaticallyForProfile(boolean vectorApiAvailable,
+                                                boolean aarch64,
+                                                int vectorRegisters,
+                                                boolean nativeAvx512,
+                                                boolean avx1Only,
+                                                boolean x86_64) {
+        if (!vectorApiAvailable) {
             return Kernel.SCALAR;
         }
         // MEASURED: E024, Apple M5. Eight chunks in flight across 32 NEON
         // registers is +36% over four; spill traffic exists but is nearly free
         // in a latency-bound loop (E023).
-        if (CpuCapabilities.IS_AARCH64 && CpuCapabilities.VECTOR_REGISTERS >= 32) {
+        if (aarch64 && vectorRegisters >= 32) {
             return Kernel.EIGHT_CHUNK;
+        }
+        // AVX-512 has 32 ZMM registers and a native 512-bit species has
+        // sixteen int lanes. WIDE maps one complete BLAKE3 chunk to each lane,
+        // so it processes sixteen independent chunks per batch with the full
+        // vector width. Unlike the dual kernel, it has only 16 persistent
+        // state vectors, leaving half the register file for the round's
+        // temporaries and message loads.
+        //
+        // This is deliberately based on the Vector API's preferred species,
+        // not raw CPUID: a JVM started with AVX-512 disabled must keep using
+        // the best shape it can actually compile.
+        if (nativeAvx512) {
+            return Kernel.WIDE;
+        }
+        // AVX1 (Sandy Bridge, Ivy Bridge, and the Ivy Bridge-EP Xeons in the
+        // 2013 Mac Pro). Handled before the general x86-64 branch because this
+        // is a measured exception to that branch's four-chunk default.
+        //
+        // AVX2, not AVX1, is what widened integer SIMD to 256 bits. AVX1's
+        // 256-bit half is floating point only, and BLAKE3 is add/xor/rotate on
+        // 32-bit words with no floating-point work to put there. The 128-bit
+        // four-chunk kernel therefore uses the widest integer species, but ISA
+        // width alone does not make that Java call graph profitable.
+        //
+        // What AVX1 does buy is free: at UseAVX >= 1 HotSpot emits the
+        // VEX-encoded three-operand forms of these same 128-bit instructions,
+        // dropping the register copy the two-operand SSE encoding needs before
+        // each destructive operation. No kernel change is required to get it.
+        //
+        // MEASURED: E029/E030, Ivy Bridge-EP in a 2013 Mac Pro, Temurin JDK
+        // 25.0.4. The ordinary four-chunk kernel allocated about 714 MB per
+        // 8 MiB hash because C2 boxed the composite VectorOperators.ROR path.
+        // E030's dedicated kernel expresses each rotate as inlined primitive
+        // shifts plus OR, restoring fixed allocation and more than doubling
+        // scalar throughput. AVX2, AVX-512, AArch64 and the unmeasured SSE
+        // profile retain their existing branches below.
+        if (avx1Only) {
+            return Kernel.AVX1_CHUNK;
         }
         // MEASURED: E024, Ryzen 3 3200G (Zen+, AVX2, 16 YMM registers). The
         // same kernel is 12-14% *slower* there: 32 state vectors into 16
@@ -148,7 +235,7 @@ final class KernelSelector {
         // because rule 1 of this table admits no extrapolation. Running
         // `./gradlew dispatchAudit` on an AVX2 or AVX-512 machine is the whole
         // experiment; a MISMATCH verdict there is what flips this branch.
-        if (CpuCapabilities.IS_X86_64) {
+        if (x86_64) {
             return Kernel.FOUR_CHUNK;
         }
         // UNMEASURED profile. Take the conservative measured-good kernel.
@@ -162,6 +249,16 @@ final class KernelSelector {
         if (CpuCapabilities.IS_AARCH64 && CpuCapabilities.VECTOR_REGISTERS >= 32) {
             return "AArch64 with 32 vector registers; E024 measured eight chunks "
                     + "in flight at +36% over four";
+        }
+        if (CpuCapabilities.HAS_NATIVE_AVX512) {
+            return "x86-64 with native 512-bit Vector API species and 32 ZMM registers; "
+                    + "using the sixteen-lane AVX-512 wide kernel";
+        }
+        if (CpuCapabilities.HAS_AVX1_ONLY) {
+            return "x86-64 with AVX1 but not AVX2: " + CpuCapabilities.MAX_FP_VECTOR_BITS
+                    + "-bit floating-point vectors and only " + CpuCapabilities.MAX_INT_VECTOR_BITS
+                    + "-bit integer vectors. E030 uses an allocation-safe four-chunk kernel "
+                    + "with inlined shift/OR rotations because composite ROR boxed on this profile";
         }
         if (CpuCapabilities.IS_X86_64) {
             return "x86-64 with " + CpuCapabilities.VECTOR_REGISTERS + " vector registers; "

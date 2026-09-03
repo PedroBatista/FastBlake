@@ -18,7 +18,7 @@ import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Warmup;
 
-/** Diagnostic microbenchmarks for the AArch64 Vector API lowering used by BLAKE3. */
+/** Diagnostic microbenchmarks for Vector API lowering used by BLAKE3. */
 @State(Scope.Thread)
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
@@ -84,6 +84,51 @@ public class VectorPrimitiveBenchmark {
             value = value.lanewise(VectorOperators.ROR, 16);
         }
         return value.lane(0);
+    }
+
+    /** AVX1 diagnostic: express rotate without the composite ROR operator. */
+    @Benchmark
+    public int vectorShiftOrRotate7DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = rotateRightShiftOr(value, 7);
+        }
+        return value.lane(0);
+    }
+
+    /** AVX1 diagnostic: express rotate without the composite ROR operator. */
+    @Benchmark
+    public int vectorShiftOrRotate8DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = rotateRightShiftOr(value, 8);
+        }
+        return value.lane(0);
+    }
+
+    /** AVX1 diagnostic: express rotate without the composite ROR operator. */
+    @Benchmark
+    public int vectorShiftOrRotate12DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = rotateRightShiftOr(value, 12);
+        }
+        return value.lane(0);
+    }
+
+    /** AVX1 diagnostic: express rotate without the composite ROR operator. */
+    @Benchmark
+    public int vectorShiftOrRotate16DependencyChain() {
+        IntVector value = IntVector.fromArray(S, ints, 0);
+        for (int i = 0; i < REPETITIONS; i++) {
+            value = rotateRightShiftOr(value, 16);
+        }
+        return value.lane(0);
+    }
+
+    private static IntVector rotateRightShiftOr(IntVector value, int distance) {
+        return value.lanewise(VectorOperators.LSHR, distance)
+                .or(value.lanewise(VectorOperators.LSHL, 32 - distance));
     }
 
     @Benchmark

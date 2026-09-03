@@ -68,7 +68,7 @@ the production **scalar** kernel and every SIMD kernel was opt-in behind an
 project's independent x86-64 re-measurement and the origin of the E024
 architecture split. The properties they name are no longer interpreted by the
 shipped `FastBlake` class; current dispatch experiments use
-`-Dfastblake.kernel=auto|scalar|four|eight|wide`.
+`-Dfastblake.kernel=auto|scalar|four|avx1|eight|wide`.
 
 This machine had no Rust toolchain at first, so the earliest runs covered only
 `commons`/`java-cpu` (2 of 4, with `rust` and `java-gpu` reporting why they were

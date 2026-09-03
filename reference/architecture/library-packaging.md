@@ -23,8 +23,9 @@ experiment classpath.
 
 New rejected and diagnostic kernels go into `src/experiment`. Their switches
 must remain in experiment-only runners. Production dispatch retains only the
-measured scalar, four-chunk, eight-chunk and preferred-width choices and the
-single diagnostic override `fastblake.kernel=auto|scalar|four|eight|wide`.
+measured scalar, four-chunk, AVX1, eight-chunk and preferred-width choices and
+the single diagnostic override
+`fastblake.kernel=auto|scalar|four|avx1|eight|wide`.
 
 E028 added `wide` and, with it, the only case where a kernel ships without any
 machine selecting it automatically. That is not a loophole in the rule above: it
@@ -43,7 +44,7 @@ flags, benchmark dependencies, or machine-specific behavior.
 Before publishing an artifact:
 
 1. Run `./gradlew releaseCheck`.
-2. Run forced scalar/four/eight conformance where the Vector API is available.
+2. Run forced scalar/four/avx1/eight conformance where the Vector API is available.
 3. Inspect `build/libs/FastBlake-*.jar` through `verifyLibraryJar`.
 4. Run `consumerSmokeTest` against the generated jar rather than project
    classes.
