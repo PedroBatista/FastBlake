@@ -35,6 +35,23 @@ public final class LibraryConsumerSmokeTest {
             throw new AssertionError("Commons-compatible keyedHash API mismatch");
         }
 
+        // Public tree operations must also load and work without the Vector API.
+        byte[] treeInput = new byte[65537];
+        for (int i = 0; i < treeInput.length; i++) {
+            treeInput[i] = (byte) (i * 131 + (i >>> 8) * 17 + 29);
+        }
+        byte[] left = FastBlake.subtreeCv(treeInput, 0, 65536, 0);
+        byte[] right = FastBlake.subtreeCv(treeInput, 65536, 1, 64);
+        String treeRoot = HexFormat.of().formatHex(FastBlake.parentRootHash(left, right));
+        // Generated independently by the official Rust reference harness.
+        if (!treeRoot.equals("c8e5bdd3348ea1df006f19f63a1620c451f1457e1bc06ea68270d32a21b18bff")) {
+            throw new AssertionError("tree root mismatch without Vector API: " + treeRoot);
+        }
+        if (java.util.Arrays.equals(FastBlake.parentCv(left, right),
+                FastBlake.parentRootHash(left, right))) {
+            throw new AssertionError("tree CV incorrectly includes ROOT");
+        }
+
         FastBlake hasher = FastBlake.initHash();
         hasher.update(new byte[] {1, 2, 3, 4}).doFinalize(new byte[32], 0, 32);
         hasher.reset();

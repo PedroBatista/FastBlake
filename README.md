@@ -3,7 +3,7 @@
 A fast, dependency-free BLAKE3 hash for the JVM.
 
 ```
-eu.pedrobatista:fastblake:0.1.1
+eu.pedrobatista:fastblake:0.1.3
 ```
 
 - **Fast.** 3.9× Apache Commons Codec on Apple M5, 5.8× on a Ryzen 3200G, and
@@ -30,7 +30,7 @@ startup saying so. Silence that warning with `-Dfastblake.quiet=true`.
 
 ```groovy
 dependencies {
-    implementation 'eu.pedrobatista:fastblake:0.1.1'
+    implementation 'eu.pedrobatista:fastblake:0.1.3'
 }
 ```
 
@@ -40,7 +40,7 @@ dependencies {
 <dependency>
     <groupId>eu.pedrobatista</groupId>
     <artifactId>fastblake</artifactId>
-    <version>0.1.1</version>
+    <version>0.1.3</version>
 </dependency>
 ```
 
@@ -71,7 +71,7 @@ public class Example {
 ```
 
 ```console
-$ java --add-modules jdk.incubator.vector -cp fastblake-0.1.1.jar Example.java
+$ java --add-modules jdk.incubator.vector -cp fastblake-0.1.3.jar Example.java
 d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24
 ```
 
@@ -118,6 +118,30 @@ always a prefix of a longer one.
 byte[] stream = FastBlake.initHash().update(data).doFinalize(1024);
 FastBlake.initHash().update(data).doFinalize(out, 0, out.length);  // into your array
 ```
+
+**Unkeyed tree operations** (since 0.1.3) expose intermediate chaining values
+for callers that build BLAKE3 trees or proofs:
+
+```java
+byte[] leftCv = FastBlake.subtreeCv(data, 0, 65536, 0);
+byte[] rightCv = FastBlake.subtreeCv(data, 65536, data.length - 65536, 64);
+byte[] root = FastBlake.parentRootHash(leftCv, rightCv); // data length 65537..131072
+byte[] nonRootParent = FastBlake.parentCv(leftCv, rightCv);
+```
+
+Each result owns a new 32-byte array. CVs contain eight little-endian words
+and exclude ROOT; they differ from ordinary message digests. `firstChunk`
+is the absolute index of the first **1,024-byte chunk**, so 64 KiB blocks start
+at 0, 64, 128, etc. The slice must have positive length and valid bounds;
+its first and final chunk counters must fit in a nonnegative Java `long`.
+Subtree merges use the local leaf count, including partial final chunks and
+non-power-of-two leaf counts. No alignment or 64 KiB size restriction is imposed.
+Parent operations require two exactly 32-byte CVs and preserve child order.
+For larger trees, merge non-root parents in canonical BLAKE3 shape and use
+`parentRootHash` only for the final merge. A complete input contained in one
+subtree uses `FastBlake.hash`, because a finished CV cannot recover root output.
+All three static operations preserve inputs and support concurrent independent
+calls. Scratch stays bounded, and full chunk batches use the selected kernel.
 
 **Reuse** — `doFinalize` does not consume the state, so you can finalize twice
 or keep reading XOF output. `reset()` returns to the initial state, keeping the
@@ -238,7 +262,7 @@ benchmark bundle instructions.
 
 ## Status
 
-FastBlake is at **0.1.1** and the API is not frozen yet. Until 1.0, public API
+FastBlake is at **0.1.3** and the API is not frozen yet. Until 1.0, public API
 changes are allowed but documented; digest bytes never change. GPU offload and
 intra-hash threading are planned.
 

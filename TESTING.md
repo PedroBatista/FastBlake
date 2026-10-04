@@ -202,3 +202,16 @@ correct answer for that process.
 The first lines of every portable run print the same capability summary that is
 stored in JSON, making it easy to verify that a remote machine selected the
 expected kernel before trusting its measurements.
+
+## Tree API interoperability
+
+`./gradlew releaseCheck` includes `TreeApiTest` in the normal suite and in
+separate scalar, four, AVX1, eight, and wide 512-bit JVMs. Run just these checks
+with `./gradlew testTreeScalar testTreeFour testTreeAvx1 testTreeEight testTreeWide`.
+The tests consume checked-in fixtures from the official Rust reference, so Rust
+is unnecessary for the tree checks. To regenerate the fixtures with `rustc`, run
+`python3 tools/tree-reference/generate.py`; see
+[the reference harness documentation](tools/tree-reference/README.md) for its
+pinned source, licenses, input pattern, and allocation measurement limits.
+Consumer smoke tests also reconstruct a tree root without the Vector API on
+Java 21 and the build JVM.

@@ -9,7 +9,7 @@ plugins {
 }
 
 group 'eu.pedrobatista'
-version '0.1.2'
+version '0.1.3'
 
 base {
     archivesName = 'fastblake'
@@ -295,6 +295,24 @@ tasks.register('testWide512', Test) {
     systemProperty 'fastblake.wideBits', '512'
     testLogging {
         events 'passed', 'skipped', 'failed'
+    }
+}
+
+// Run the public tree API against the same independent Rust fixtures in
+// separate JVMs: kernel selection is static and cannot change within a test.
+def treeKernelTests = ['scalar', 'four', 'avx1', 'eight', 'wide'].collect { kernel ->
+    tasks.register("testTree${kernel.capitalize()}", Test) {
+        group = 'verification'
+        description = "Verifies tree interoperability with the ${kernel} kernel."
+        dependsOn tasks.named('testClasses')
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform()
+        configureNativeAccess(it)
+        systemProperty 'fastblake.kernel', kernel
+        if (kernel == 'wide') systemProperty 'fastblake.wideBits', '512'
+        filter { includeTestsMatching 'eu.pedrobatista.fastblake.TreeApiTest' }
+        testLogging { events 'failed', 'skipped' }
     }
 }
 
@@ -682,6 +700,7 @@ tasks.named('check') {
 tasks.register('releaseCheck') {
     group = 'verification'
     description = 'Runs correctness and verifies the consumer-facing library artifact.'
+    dependsOn treeKernelTests
     dependsOn tasks.named('test'), tasks.named('verifyLibraryJar'),
             tasks.named('generatePomFileForMavenJavaPublication'),
             tasks.named('consumerSmokeTest'), tasks.named('consumerSmokeTestCurrent')

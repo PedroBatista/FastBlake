@@ -250,6 +250,136 @@ public final class FastBlake {
     }
 
     /**
+     * Returns the unkeyed, non-root chaining value of a positive byte slice.
+     *
+     * <p>The result is a new 32-byte array containing eight little-endian words.
+     * {@code firstChunk} is the absolute counter of the first 1,024-byte chunk.
+     * Tree merges use the slice's local leaf count, with the largest power of
+     * two strictly below the leaf count on the left. No padding leaves or ROOT
+     * flag are added. The caller is responsible for positioning the subtree in
+     * a complete input. Use {@link #hash(byte[])} for a complete single-subtree
+     * blob: a finished CV cannot be converted into its root hash.
+     *
+     * <p>Scratch is bounded independently of input length. Complete batches
+     * use the selected SIMD kernel, with the existing scalar fallback when the
+     * Vector API is unavailable. Independent calls may run concurrently.
+     *
+     * @param input source bytes, never modified
+     * @param offset first byte in the slice
+     * @param length positive number of bytes in the slice
+     * @param firstChunk nonnegative absolute chunk counter
+     * @return a new non-root chaining value
+     * @throws NullPointerException if input is null
+     * @throws IndexOutOfBoundsException if the slice is outside input
+     * @throws IllegalArgumentException if length is zero, firstChunk is negative,
+     *         or the final chunk counter would exceed Long.MAX_VALUE
+     * @since 0.1.3
+     */
+    public static byte[] subtreeCv(byte[] input, int offset, int length, long firstChunk) {
+        Objects.requireNonNull(input, "input");
+        Objects.checkFromIndexSize(offset, length, input.length);
+        if (length == 0) {
+            throw new IllegalArgumentException("subtree length must be positive");
+        }
+        long lastRelativeChunk = (length - 1L) / CHUNK_LEN;
+        if (firstChunk < 0 || firstChunk > Long.MAX_VALUE - lastRelativeChunk) {
+            throw new IllegalArgumentException("invalid or overflowing chunk counter");
+        }
+
+        FastBlake tree = initHash();
+        int position = offset;
+        int remaining = length;
+        while (remaining > 0) {
+            int batch = VECTOR_STREAM_CHUNKS;
+            if (batch > 0 && remaining >= batch * CHUNK_LEN) {
+                tree.hashBatch(input, position, firstChunk + tree.chunksCompressed);
+                tree.pushVectorChunkCvs(batch);
+                position += batch * CHUNK_LEN;
+                remaining -= batch * CHUNK_LEN;
+            } else if (batch > 4 && remaining >= 4 * CHUNK_LEN) {
+                hashFourChunks(input, position, firstChunk + tree.chunksCompressed,
+                        tree.key, 0, tree.vectorPacked(), tree.vectorCvs());
+                tree.pushVectorChunkCvs(4);
+                position += 4 * CHUNK_LEN;
+                remaining -= 4 * CHUNK_LEN;
+            } else {
+                int take = Math.min(remaining, CHUNK_LEN);
+                chunkChainingValue(input, position, take, firstChunk + tree.chunksCompressed,
+                        tree.key, 0, tree.scratchCv, tree.scratchWords, tree.scratchState);
+                tree.chunksCompressed++;
+                tree.pushChunkCv(tree.scratchCv, tree.chunksCompressed);
+                position += take;
+                remaining -= take;
+            }
+        }
+        int[] stack = tree.cvStack;
+        System.arraycopy(stack, --tree.cvStackLength * 8, tree.scratchCv, 0, 8);
+        while (tree.cvStackLength > 0) {
+            parentCv(stack, --tree.cvStackLength * 8, tree.scratchCv, tree.key, 0,
+                    tree.scratchCv, tree.scratchWords, tree.scratchState);
+        }
+        byte[] result = new byte[OUT_LEN];
+        wordsToBytes(tree.scratchCv, result, 0, OUT_LEN);
+        return result;
+    }
+
+    /**
+     * Combines two unkeyed non-root CVs in child order, without ROOT.
+     * Each child must contain exactly eight little-endian words (32 bytes).
+     * Inputs are never modified and may be the same array.
+     *
+     * @param leftCv left child CV
+     * @param rightCv right child CV
+     * @return a new 32-byte little-endian non-root CV
+     * @throws NullPointerException if either child is null
+     * @throws IllegalArgumentException if either child is not exactly 32 bytes
+     * @since 0.1.3
+     */
+    public static byte[] parentCv(byte[] leftCv, byte[] rightCv) {
+        Output parent = unkeyedParentOutput(leftCv, rightCv);
+        int[] cv = new int[8];
+        parent.chainingValue(cv, new int[16]);
+        byte[] result = new byte[OUT_LEN];
+        wordsToBytes(cv, result, 0, OUT_LEN);
+        return result;
+    }
+
+    /**
+     * Returns the first 32 root-output bytes of an unkeyed parent of two CVs.
+     * Uses PARENT | ROOT and output block counter zero; this is different from
+     * {@link #parentCv(byte[], byte[])} and from hashing the child serialization.
+     * Each child is exactly 32 bytes, encoded as eight little-endian words.
+     * Inputs are never modified and may be the same array.
+     *
+     * @param leftCv left child non-root CV
+     * @param rightCv right child non-root CV
+     * @return a new 32-byte root hash
+     * @throws NullPointerException if either child is null
+     * @throws IllegalArgumentException if either child is not exactly 32 bytes
+     * @since 0.1.3
+     */
+    public static byte[] parentRootHash(byte[] leftCv, byte[] rightCv) {
+        Output parent = unkeyedParentOutput(leftCv, rightCv);
+        byte[] result = new byte[OUT_LEN];
+        parent.rootBytes(result, 0, OUT_LEN, new int[16]);
+        return result;
+    }
+
+    private static Output unkeyedParentOutput(byte[] leftCv, byte[] rightCv) {
+        Objects.requireNonNull(leftCv, "leftCv");
+        Objects.requireNonNull(rightCv, "rightCv");
+        if (leftCv.length != OUT_LEN || rightCv.length != OUT_LEN) {
+            throw new IllegalArgumentException("child CVs must each contain exactly 32 bytes");
+        }
+        int[] words = new int[16];
+        for (int i = 0; i < 8; i++) {
+            words[i] = (int) LITTLE_ENDIAN_INT.get(leftCv, i * 4);
+            words[i + 8] = (int) LITTLE_ENDIAN_INT.get(rightCv, i * 4);
+        }
+        return new Output(IV_WORDS, words, 0, BLOCK_LEN, PARENT);
+    }
+
+    /**
      * Hashes at most one chunk straight from the caller's array.
      *
      * <p>Allocates only the three small scratch arrays and the result. No
@@ -400,17 +530,21 @@ public final class FastBlake {
 
     /** Runs one complete batch through the selected kernel and pushes its CVs. */
     private void hashStreamBatch(byte[] source, int sourceOffset) {
+        hashBatch(source, sourceOffset, chunksCompressed);
+        pushVectorChunkCvs(VECTOR_STREAM_CHUNKS);
+    }
+
+    private void hashBatch(byte[] source, int sourceOffset, long firstChunk) {
         if (WIDE_KERNEL) {
-            Blake3ChunkVectorWide.hashChunks(source, sourceOffset, chunksCompressed,
+            Blake3ChunkVectorWide.hashChunks(source, sourceOffset, firstChunk,
                     key, modeFlags, vectorPacked(), vectorCvs());
         } else if (VECTOR_STREAM_CHUNKS == 8) {
-            Blake3ChunkVectorDual.hashChunks(source, sourceOffset, chunksCompressed,
+            Blake3ChunkVectorDual.hashChunks(source, sourceOffset, firstChunk,
                     key, modeFlags, vectorPacked(), vectorCvs());
         } else {
-            hashFourChunks(source, sourceOffset, chunksCompressed,
+            hashFourChunks(source, sourceOffset, firstChunk,
                     key, modeFlags, vectorPacked(), vectorCvs());
         }
-        pushVectorChunkCvs(VECTOR_STREAM_CHUNKS);
     }
 
     /**
@@ -612,14 +746,20 @@ public final class FastBlake {
     private static void chunkChainingValue(byte[] input, int length, long chunkCounter,
                                            int[] key, int flags, int[] output,
                                            int[] words, int[] state) {
+        chunkChainingValue(input, 0, length, chunkCounter, key, flags, output, words, state);
+    }
+
+    private static void chunkChainingValue(byte[] input, int offset, int length, long chunkCounter,
+                                           int[] key, int flags, int[] output,
+                                           int[] words, int[] state) {
         // This path is invoked once per non-final chunk, so it must remain
         // allocation-free. Finalization uses chunkOutput instead because it
         // needs to retain the last compression input for ROOT/XOF output.
         System.arraycopy(key, 0, output, 0, 8);
         int blocks = (length + BLOCK_LEN - 1) / BLOCK_LEN;
         for (int block = 0; block < blocks; block++) {
-            int blockOffset = block * BLOCK_LEN;
-            int blockLength = Math.min(BLOCK_LEN, length - blockOffset);
+            int blockOffset = offset + block * BLOCK_LEN;
+            int blockLength = Math.min(BLOCK_LEN, length - block * BLOCK_LEN);
             if (blockLength == BLOCK_LEN) {
                 bytesToWords(input, blockOffset, words, 16);
             } else {
