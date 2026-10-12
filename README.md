@@ -54,6 +54,30 @@ Without it FastBlake still works, still returns the same digests, and just uses
 the scalar kernel. Nothing in the public API exposes vector types, so you never
 need this flag at compile time.
 
+**Setting the flag.** It is a JVM option of the application that uses FastBlake,
+not of FastBlake's build, so it has to be added wherever your app is launched:
+
+```groovy
+// Gradle: run and test tasks
+tasks.withType(JavaExec).configureEach { jvmArgs '--add-modules=jdk.incubator.vector' }
+tasks.withType(Test).configureEach { jvmArgs '--add-modules=jdk.incubator.vector' }
+```
+
+For a packaged app, put it on the `java` command line, or in the
+`JAVA_TOOL_OPTIONS` environment variable. IDE run configurations need it under
+"VM options".
+
+**Checking it took effect.** Print the selected kernel:
+
+```java
+System.out.println(FastBlake.selectedKernel());
+```
+
+A line ending in `-> SCALAR (jdk.incubator.vector is not available ...)` means
+the flag did not reach the JVM. On an AVX1-only x86-64 CPU (Sandy/Ivy Bridge)
+a working setup reports `AVX1_CHUNK`; AVX2 CPUs report `FOUR_CHUNK`, and
+AVX-512 CPUs `WIDE`.
+
 ## Quick start
 
 Copy this into `Example.java` and run it:
